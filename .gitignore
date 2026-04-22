@@ -1,0 +1,94 @@
+# Dependencies
+node_modules/
+.yarn-cache/
+
+# Build outputs
+dist/
+build/
+.output/
+target/
+.next/
+
+# Tauri
+apps/desktop/src-tauri/target/
+*.dmg
+*.app
+
+# Chrome Extension
+apps/extension/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+apikeys.txt
+config/unified.secrets.json
+apps/desktop/.env.local
+apps/desktop/.build-release.env
+apps/client/.build-release.env
+apps/client/.env.local
+apps/happy-server/.deploy.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test
+coverage/
+
+# TypeScript
+*.tsbuildinfo
+
+# Local data (for development)
+*.db
+*.db-journal
+tmp/
+
+# Models (too large for git)
+models/
+
+# Trash (deleted skills/agents)
+.trash/
+**/.trash/
+anthropic-skills/
+
+.env.dev
+.env.production
+
+# iOS signing credentials
+apps/desktop/credentials.json
+apps/desktop/credentials/
+apps/client/desktop/credentials.json
+apps/client/desktop/credentials/
+
+# multi-agent-runtime test workspace artifacts (runtime-generated)
+.multi-agent-runtime/
+packages/multi-agent-runtime/.multi-agent-runtime/
+
+# Task-gate runtime state (lockfiles per task list, not source of truth)
+
+# Claude Code harness-managed agent worktrees
+.claude/worktrees/
+
+# Local/shared agent skill bundles
+.agents/
+
+# All runtime task-gate state, reviews, QA reports, shared lessons, etc.
+00-management/
+
+# Cteno agent runtime state (per-session memory scratch)
+.cteno/
+packages/multi-agent-runtime/pnpm-lock.yaml

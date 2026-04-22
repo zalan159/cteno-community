@@ -1,0 +1,41 @@
+{
+  "name": "cteno",
+  "version": "0.1.0",
+  "private": true,
+  "description": "智能的起点 | Where intelligence begins - macOS 社交媒体自动发布工具",
+  "author": "Cteno Team",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "secrets:sync": "node scripts/sync-unified-secrets.mjs --profile production",
+    "secrets:sync:dev": "node scripts/sync-unified-secrets.mjs --profile dev",
+    "dev:client": "cd apps/client && yarn tauri:dev",
+    "dev:desktop": "yarn dev:client",
+    "dev:extension": "cd apps/extension && yarn dev",
+    "build:client": "cd apps/client && yarn tauri:build",
+    "build:desktop": "yarn build:client",
+    "build:extension": "cd apps/extension && yarn build",
+    "lint": "eslint . --ext .ts,.tsx,.vue",
+    "lint:fix": "eslint . --ext .ts,.tsx,.vue --fix",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.12.0",
+    "@typescript-eslint/eslint-plugin": "^8.22.0",
+    "@typescript-eslint/parser": "^8.22.0",
+    "eslint": "^9.19.0",
+    "eslint-config-prettier": "^10.0.1",
+    "eslint-plugin-vue": "^9.32.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "yarn": "^1.22.22"
+  },
+  "packageManager": "yarn@1.22.22",
+  "dependencies": {
+    "puppeteer-core": "^24.40.0"
+  }
+}

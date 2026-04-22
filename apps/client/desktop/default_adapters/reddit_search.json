@@ -1,0 +1,39 @@
+{
+  "name": "reddit/search",
+  "domain": "www.reddit.com",
+  "description": "搜索 Reddit 帖子",
+  "args": [
+    {
+      "name": "query",
+      "description": "Search query",
+      "required": true
+    },
+    {
+      "name": "subreddit",
+      "description": "Limit search to a subreddit (without r/ prefix)",
+      "required": false
+    },
+    {
+      "name": "sort",
+      "description": "Sort order: relevance (default), hot, top, new, comments",
+      "required": false
+    },
+    {
+      "name": "time",
+      "description": "Time filter: all (default), hour, day, week, month, year",
+      "required": false
+    },
+    {
+      "name": "count",
+      "description": "Number of results (default 25, max 100)",
+      "required": false
+    },
+    {
+      "name": "after",
+      "description": "Fullname of the last item for pagination",
+      "required": false
+    }
+  ],
+  "script": "if (!args.query) return {error: 'Missing argument: query', hint: 'Provide a search query'};\n\n  const count = Math.min(parseInt(args.count) || 25, 100);\n  const sort = args.sort || 'relevance';\n  const time = args.time || 'all';\n\n  let url;\n  if (args.subreddit) {\n    url = '/r/' + args.subreddit + '/search.json?restrict_sr=on&q=' + encodeURIComponent(args.query);\n  } else {\n    url = '/search.json?q=' + encodeURIComponent(args.query);\n  }\n  url += '&sort=' + sort + '&t=' + time + '&limit=' + count + '&raw_json=1';\n  if (args.after) url += '&after=' + args.after;\n\n  const resp = await fetch(url);\n  if (!resp.ok) return {error: 'HTTP ' + resp.status, hint: resp.status === 404 ? 'Subreddit not found' : 'API error'};\n  const d = await resp.json();\n  if (!d.data?.children) return {error: 'Unexpected response', hint: 'Reddit may be rate-limiting or returning a login page'};\n\n  const posts = d.data.children.map(c => ({\n    id: c.data.name,\n    title: c.data.title,\n    author: c.data.author,\n    subreddit: c.data.subreddit_name_prefixed,\n    score: c.data.score,\n    num_comments: c.data.num_comments,\n    created_utc: c.data.created_utc,\n    url: c.data.url,\n    permalink: 'https://www.reddit.com' + c.data.permalink,\n    selftext_preview: (c.data.selftext || '').substring(0, 200),\n    is_self: c.data.is_self,\n    link_flair_text: c.data.link_flair_text || null\n  }));\n\n  return {\n    query: args.query,\n    subreddit: args.subreddit || null,\n    sort,\n    time,\n    count: posts.length,\n    after: d.data.after || null,\n    posts\n  };",
+  "read_only": true
+}

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIconName</key>
+    <string>Cteno</string>
+
+    <!-- Privacy Permission Descriptions -->
+    <!-- Required for AppleScript automation to send iMessages -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Cteno 需要自动化权限来通过 iMessage 发送消息和控制其他应用。</string>
+
+    <!-- Required for accessing contacts to resolve iMessage recipients -->
+    <key>NSContactsUsageDescription</key>
+    <string>Cteno 需要访问通讯录来识别 iMessage 联系人。</string>
+
+    <!-- Required for microphone access (speech-to-text) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Cteno 需要访问麦克风来进行语音识别输入。</string>
+
+    <!-- Required for accessibility features (optional, for future use) -->
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Cteno 需要辅助功能权限来执行自动化任务。</string>
+
+    <!-- Disable App Nap to prevent macOS from suspending the app -->
+    <key>NSAppSleepDisabled</key>
+    <true/>
+
+    <!-- Prevent automatic termination -->
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+
+    <!-- Indicate this app performs background tasks -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>processing</string>
+        <string>fetch</string>
+    </array>
+
+    <!-- Keep the app running for background processing -->
+    <key>LSBackgroundOnly</key>
+    <false/>
+</dict>
+</plist>

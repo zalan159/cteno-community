@@ -1,0 +1,48 @@
+# MCP Servers Configuration
+#
+# Configure MCP (Model Context Protocol) servers here.
+# Each server provides tools that Cteno can use.
+
+servers:
+  # Filesystem MCP Server
+  # Provides: read_file, write_file, list_directory, etc.
+  - name: filesystem
+    url: http://localhost:3000
+    enabled: false
+
+  # Brave Search MCP Server
+  # Provides: web_search, news_search, etc.
+  - name: brave_search
+    url: http://localhost:3001
+    enabled: false
+
+  # GitHub MCP Server
+  # Provides: search_repositories, get_file_contents, create_issue, etc.
+  - name: github
+    url: http://localhost:3002
+    enabled: false
+
+  # PostgreSQL MCP Server
+  # Provides: query, list_tables, describe_table, etc.
+  - name: postgres
+    url: http://localhost:3003
+    enabled: false
+
+  # SQLite MCP Server
+  # Provides: query, list_tables, describe_table, etc.
+  - name: sqlite
+    url: http://localhost:3004
+    enabled: false
+
+# How to use:
+# 1. Start an MCP server (see https://github.com/anthropics/mcp-servers)
+# 2. Set enabled: true for that server
+# 3. Restart Cteno
+# 4. MCP tools will be available to the agent
+
+# Example MCP servers:
+# - @modelcontextprotocol/server-filesystem
+# - @modelcontextprotocol/server-brave-search
+# - @modelcontextprotocol/server-github
+# - @modelcontextprotocol/server-postgres
+# - @modelcontextprotocol/server-sqlite

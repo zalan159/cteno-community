@@ -1,0 +1,32 @@
+import React from 'react';
+import { useRouter } from 'expo-router';
+
+import { BrowserAuthEntry } from '@/auth/account';
+import { useAuth } from '@/auth/AuthContext';
+
+export default function Login() {
+    const router = useRouter();
+    const auth = useAuth();
+
+    // Once auth.login() flips isAuthenticated, leave this page; the root
+    // route owner (app/(app)/index.tsx) renders the signed-in Main view.
+    // We intentionally watch `isAuthenticated` (not `hasAppAccess`) so that
+    // local-mode users — who already have `hasAppAccess=true` — can still
+    // navigate into /login to sign in.
+    React.useEffect(() => {
+        if (auth.isAuthenticated) {
+            if (router.canGoBack()) {
+                router.back();
+            } else {
+                router.replace('/');
+            }
+        }
+    }, [auth.isAuthenticated, router]);
+
+    return (
+        <BrowserAuthEntry
+            title="登录 / 注册"
+            subtitle="登录 Cteno 账号以使用内置模型、多端同步与代付功能。"
+        />
+    );
+}

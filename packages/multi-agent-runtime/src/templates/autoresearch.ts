@@ -1,0 +1,221 @@
+import type { WorkspaceTemplate } from '../core/templates.js';
+
+export function createAutoresearchTemplate(): WorkspaceTemplate {
+  return {
+    templateId: 'autoresearch',
+    templateName: 'Autoresearch',
+    description: 'A research-oriented workspace for scouting and synthesis.',
+    provider: 'claude-agent-sdk',
+    defaultRoleId: 'lead',
+    coordinatorRoleId: 'lead',
+    orchestratorPrompt:
+      'You orchestrate an autonomous research workspace. Keep hypotheses explicit, separate evidence from interpretation, and favor compact research artifacts that can feed later evaluation loops.',
+    claimPolicy: {
+      mode: 'claim',
+      claimTimeoutMs: 30000,
+      maxAssignees: 2,
+      allowSupportingClaims: true,
+      fallbackRoleId: 'lead',
+    },
+    activityPolicy: {
+      publishUserMessages: true,
+      publishCoordinatorMessages: true,
+      publishDispatchLifecycle: true,
+      publishMemberMessages: true,
+      defaultVisibility: 'public',
+    },
+    workflow: {
+      mode: 'loop',
+      entryNodeId: 'frame_hypothesis',
+      stages: [
+        {
+          id: 'research',
+          name: 'Research',
+          description: 'Frame hypothesis, gather evidence, and design the next experiment.',
+          entryNodeId: 'frame_hypothesis',
+          exitNodeIds: ['decide_outcome'],
+        },
+        {
+          id: 'iteration',
+          name: 'Iteration',
+          description: 'Keep improvements, discard regressions, and loop.',
+          entryNodeId: 'decide_outcome',
+          exitNodeIds: ['loop_next', 'discard'],
+        },
+      ],
+      nodes: [
+        {
+          id: 'frame_hypothesis',
+          type: 'assign',
+          title: 'Frame the current hypothesis',
+          roleId: 'lead',
+          producesArtifacts: ['research_brief'],
+          stageId: 'research',
+        },
+        {
+          id: 'claim_evidence',
+          type: 'claim',
+          title: 'Claim evidence gathering',
+          candidateRoleIds: ['scout', 'critic'],
+          stageId: 'research',
+        },
+        {
+          id: 'collect_evidence',
+          type: 'assign',
+          title: 'Collect evidence',
+          roleId: 'scout',
+          requiresArtifacts: ['research_brief'],
+          producesArtifacts: ['evidence_pack'],
+          stageId: 'research',
+        },
+        {
+          id: 'run_experiment',
+          type: 'shell',
+          title: 'Run experiment',
+          roleId: 'experimenter',
+          command: 'uv run train.py > run.log 2>&1',
+          timeoutMs: 600000,
+          requiresArtifacts: ['evidence_pack'],
+          producesArtifacts: ['run_log'],
+          stageId: 'research',
+        },
+        {
+          id: 'evaluate_results',
+          type: 'evaluate',
+          title: 'Evaluate experiment metrics',
+          evaluator: 'parse_autoresearch_run_log',
+          requiresArtifacts: ['run_log'],
+          producesArtifacts: ['experiment_result'],
+          stageId: 'research',
+        },
+        {
+          id: 'decide_outcome',
+          type: 'review',
+          title: 'Decide keep or discard',
+          reviewerRoleId: 'lead',
+          requiresArtifacts: ['experiment_result'],
+          stageId: 'iteration',
+        },
+        {
+          id: 'keep',
+          type: 'commit',
+          title: 'Keep winning experiment',
+          stageId: 'iteration',
+        },
+        {
+          id: 'discard',
+          type: 'revert',
+          title: 'Discard regression',
+          stageId: 'iteration',
+        },
+        {
+          id: 'loop_next',
+          type: 'loop',
+          title: 'Advance to next iteration',
+          retry: { maxAttempts: 100 },
+          stageId: 'iteration',
+        },
+      ],
+      edges: [
+        { from: 'frame_hypothesis', to: 'claim_evidence', when: 'success' },
+        { from: 'claim_evidence', to: 'collect_evidence', when: 'success' },
+        { from: 'collect_evidence', to: 'run_experiment', when: 'success' },
+        { from: 'run_experiment', to: 'evaluate_results', when: 'success' },
+        { from: 'run_experiment', to: 'discard', when: 'failure' },
+        { from: 'run_experiment', to: 'discard', when: 'timeout' },
+        { from: 'evaluate_results', to: 'keep', when: 'improved' },
+        { from: 'evaluate_results', to: 'discard', when: 'equal_or_worse' },
+        { from: 'evaluate_results', to: 'discard', when: 'crash' },
+        { from: 'keep', to: 'loop_next', when: 'success' },
+        { from: 'discard', to: 'loop_next', when: 'success' },
+        { from: 'loop_next', to: 'frame_hypothesis', when: 'retry' },
+      ],
+    },
+    artifacts: [
+      {
+        id: 'research_brief',
+        kind: 'doc',
+        path: 'research/00-lead/',
+        ownerRoleId: 'lead',
+        required: true,
+        description: 'Current hypothesis and success criteria.',
+      },
+      {
+        id: 'evidence_pack',
+        kind: 'evidence',
+        path: 'research/10-scout/',
+        ownerRoleId: 'scout',
+        required: true,
+        description: 'Evidence pack with cited sources and observations.',
+      },
+      {
+        id: 'run_log',
+        kind: 'result',
+        path: 'run.log',
+        ownerRoleId: 'experimenter',
+        required: true,
+        description: 'Raw experiment log from the latest run.',
+      },
+      {
+        id: 'experiment_result',
+        kind: 'metric',
+        path: 'results.tsv',
+        ownerRoleId: 'lead',
+        required: true,
+        description: 'Parsed outcome used to decide keep or discard.',
+      },
+    ],
+    completionPolicy: {
+      successNodeIds: ['keep'],
+      failureNodeIds: ['discard'],
+      maxIterations: 100,
+      defaultStatus: 'done',
+    },
+    roles: [
+      {
+        id: 'lead',
+        name: 'Lead',
+        outputRoot: 'research/00-lead/',
+        agent: {
+          description: 'Frames the research question and decides what evidence is worth collecting next.',
+          prompt:
+            'You are a research lead. Turn vague topics into testable questions, define success criteria, and keep each loop scoped tightly.',
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep'],
+        },
+      },
+      {
+        id: 'scout',
+        name: 'Scout',
+        outputRoot: 'research/10-scout/',
+        agent: {
+          description: 'Collects outside signals, references, and raw observations.',
+          prompt:
+            'You are a web research scout. Gather high-signal evidence, cite sources inline, and keep notes concise enough for downstream synthesis.',
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep', 'web_search', 'web_fetch'],
+        },
+      },
+      {
+        id: 'experimenter',
+        name: 'Experimenter',
+        outputRoot: 'research/20-experiments/',
+        agent: {
+          description: 'Turns a hypothesis into a measurable experiment design.',
+          prompt:
+            'You design small, measurable experiments. Define variables, success metrics, instrumentation, and stopping criteria with minimal ceremony.',
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep', 'shell'],
+        },
+      },
+      {
+        id: 'critic',
+        name: 'Critic',
+        outputRoot: 'research/30-critic/',
+        agent: {
+          description: 'Challenges assumptions, spots confounders, and tightens reasoning.',
+          prompt:
+            'You are a skeptical research critic. Look for weak evidence, missing controls, and untested assumptions before the team moves on.',
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep'],
+        },
+      },
+    ],
+  };
+}

@@ -1,0 +1,30 @@
+[package]
+name = "multi-agent-runtime-cteno"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+description = "Cteno adapter traits and bootstrap flow for the multi-agent runtime."
+
+[dependencies]
+async-trait = "0.1"
+chrono.workspace = true
+cteno-agent-runtime = { path = "../../../../agents/rust/crates/cteno-agent-runtime" }
+cteno-host-runtime = { path = "../../../../host/rust/crates/cteno-host-runtime" }
+futures-core = "0.3"
+futures-util = "0.3"
+log = "0.4"
+multi-agent-protocol = { path = "../multi-agent-protocol" }
+multi-agent-runtime-core = { path = "../multi-agent-runtime-core" }
+multi-agent-runtime-local = { path = "../multi-agent-runtime-local" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }

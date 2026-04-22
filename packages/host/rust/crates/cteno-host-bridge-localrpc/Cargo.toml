@@ -1,0 +1,17 @@
+[package]
+name = "cteno-host-bridge-localrpc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Cteno Team"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cteno-host-rpc-core = { path = "../cteno-host-rpc-core" }
+async-trait = "0.1"
+dirs = "6"
+log = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,9 @@
+{
+  "source_repo": "(internal monorepo)",
+  "source_commit": "111984e62cf250067243232b54cd8e604cd40ca8",
+  "exported_at": "2026-04-22T07:48:21Z",
+  "exported_by": "scripts/export-community-snapshot.sh",
+  "edition": "community",
+  "desktop_cargo_features": "--no-default-features --features community",
+  "note": "Auto-exported from internal monorepo. Official Cteno Cloud / Happy Server, landing/console, billing, hosted sync, and production operations are NOT included."
+}

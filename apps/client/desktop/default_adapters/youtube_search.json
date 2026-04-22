@@ -1,0 +1,19 @@
+{
+  "name": "youtube/search",
+  "domain": "www.youtube.com",
+  "description": "Search YouTube videos",
+  "args": [
+    {
+      "name": "query",
+      "description": "Search query string",
+      "required": true
+    },
+    {
+      "name": "max",
+      "description": "Max results to return (default: 20)",
+      "required": false
+    }
+  ],
+  "script": "if (!args.query) return {error: 'Missing argument: query', hint: 'Provide a search query'};\n\n  const cfg = window.ytcfg?.data_ || {};\n  const apiKey = cfg.INNERTUBE_API_KEY;\n  const context = cfg.INNERTUBE_CONTEXT;\n  if (!apiKey || !context) return {error: 'YouTube config not found', hint: 'Make sure you are on youtube.com'};\n\n  const max = Math.min(parseInt(args.max) || 20, 50);\n\n  const resp = await fetch('/youtubei/v1/search?key=' + apiKey + '&prettyPrint=false', {\n    method: 'POST',\n    \n    headers: {'Content-Type': 'application/json'},\n    body: JSON.stringify({context, query: args.query})\n  });\n\n  if (!resp.ok) return {error: 'Search API returned HTTP ' + resp.status, hint: 'YouTube API error'};\n\n  const data = await resp.json();\n  const contents = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];\n\n  const videos = [];\n  for (const section of contents) {\n    const items = section.itemSectionRenderer?.contents || [];\n    for (const item of items) {\n      if (item.videoRenderer && videos.length < max) {\n        const v = item.videoRenderer;\n        videos.push({\n          videoId: v.videoId,\n          title: v.title?.runs?.[0]?.text,\n          channel: v.ownerText?.runs?.[0]?.text,\n          channelId: v.ownerText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId,\n          views: v.viewCountText?.simpleText || v.shortViewCountText?.simpleText || '',\n          duration: v.lengthText?.simpleText || 'LIVE',\n          publishedTime: v.publishedTimeText?.simpleText || '',\n          description: (v.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map(r => r.text).join('') || '').substring(0, 200),\n          url: 'https://www.youtube.com/watch?v=' + v.videoId\n        });\n      }\n    }\n  }\n\n  return {\n    query: args.query,\n    resultCount: videos.length,\n    videos\n  };",
+  "read_only": true
+}

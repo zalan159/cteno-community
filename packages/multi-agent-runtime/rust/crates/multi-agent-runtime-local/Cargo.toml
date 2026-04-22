@@ -1,0 +1,17 @@
+[package]
+name = "multi-agent-runtime-local"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+description = "Local filesystem persistence helpers for multi-agent workspaces."
+
+[dependencies]
+chrono.workspace = true
+multi-agent-protocol = { path = "../multi-agent-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

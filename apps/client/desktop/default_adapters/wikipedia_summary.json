@@ -1,0 +1,14 @@
+{
+  "name": "wikipedia/summary",
+  "domain": "en.wikipedia.org",
+  "description": "获取维基百科页面摘要",
+  "args": [
+    {
+      "name": "title",
+      "description": "页面标题 (用下划线替换空格)",
+      "required": true
+    }
+  ],
+  "script": "const title = args.title || args._input;\n  if (!title) return {error: 'Missing title parameter'};\n  const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;\n  const resp = await fetch(url);\n  if (!resp.ok) return {error: 'HTTP ' + resp.status};\n  const data = await resp.json();\n  return {\n    title: data.title,\n    description: data.description,\n    extract: data.extract,\n    thumbnail: data.thumbnail?.source,\n    url: data.content_urls?.desktop?.page,\n    timestamp: data.timestamp\n  };",
+  "read_only": true
+}

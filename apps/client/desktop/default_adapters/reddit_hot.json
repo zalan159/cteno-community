@@ -1,0 +1,24 @@
+{
+  "name": "reddit/hot",
+  "domain": "www.reddit.com",
+  "description": "获取 subreddit 热门帖子（或 Reddit 首页）",
+  "args": [
+    {
+      "name": "subreddit",
+      "description": "Subreddit name without r/ prefix (omit for front page)",
+      "required": false
+    },
+    {
+      "name": "count",
+      "description": "Number of posts (default 25, max 100)",
+      "required": false
+    },
+    {
+      "name": "after",
+      "description": "Fullname of the last item for pagination (e.g. t3_abc123)",
+      "required": false
+    }
+  ],
+  "script": "const count = Math.min(parseInt(args.count) || 25, 100);\n  const base = args.subreddit ? '/r/' + args.subreddit : '';\n  let url = base + '/hot.json?limit=' + count + '&raw_json=1';\n  if (args.after) url += '&after=' + args.after;\n\n  const resp = await fetch(url);\n  if (!resp.ok) return {error: 'HTTP ' + resp.status, hint: resp.status === 404 ? 'Subreddit not found' : 'API error'};\n  const d = await resp.json();\n  if (!d.data?.children) return {error: 'Unexpected response', hint: 'Reddit may be rate-limiting or returning a login page'};\n\n  const posts = d.data.children.map((c, i) => ({\n    rank: i + 1,\n    id: c.data.name,\n    title: c.data.title,\n    author: c.data.author,\n    subreddit: c.data.subreddit_name_prefixed,\n    score: c.data.score,\n    upvote_ratio: c.data.upvote_ratio,\n    num_comments: c.data.num_comments,\n    created_utc: c.data.created_utc,\n    url: c.data.url,\n    permalink: 'https://www.reddit.com' + c.data.permalink,\n    selftext_preview: (c.data.selftext || '').substring(0, 200),\n    is_self: c.data.is_self,\n    link_flair_text: c.data.link_flair_text || null\n  }));\n\n  return {\n    subreddit: args.subreddit || 'front page',\n    count: posts.length,\n    after: d.data.after || null,\n    posts\n  };",
+  "read_only": true
+}

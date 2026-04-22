@@ -1,0 +1,79 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Cteno",
+  "version": "0.1.32",
+  "identifier": "com.cteno.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:8081",
+    "beforeDevCommand": "yarn start",
+    "beforeBuildCommand": "yarn expo export --platform web --output-dir dist",
+    "additionalWatchFolders": [
+      "../../../packages/multi-agent-runtime/rust",
+      "../../../packages/agents/rust",
+      "../../../packages/host/rust",
+      "../../../packages/core/rust"
+    ]
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Cteno",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "../../../packages/agents/rust/crates/cteno-agent-stdio/target/release/cteno-agent",
+      "../../../packages/host/rust/target/release/cteno-memory-mcp"
+    ],
+    "resources": {
+      "resources/Cteno.icon": "resources/Cteno.icon",
+      "../../../packages/agents/rust/crates/cteno-agent-runtime/tools": "tools",
+      "../../../packages/agents/rust/crates/cteno-agent-runtime/skills": "skills",
+      "agents": "agents",
+      "helpers": "helpers"
+    },
+    "macOS": {
+      "entitlements": "./Entitlements.plist",
+      "minimumSystemVersion": "13.0",
+      "files": {
+        "Resources/Assets.car": "resources/Assets.car"
+      }
+    },
+    "createUpdaterArtifacts": "v1Compatible"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "cteno"
+        ]
+      }
+    },
+    "updater": {
+      "endpoints": [
+        "https://cteno.frontfidelity.cn/v1/desktop/update-check?current_version={{current_version}}&target={{target}}"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNCQTZCMEE0RERBNjk1OUEKUldTYWxhYmRwTENtTzdNblgzc2pMR0hTdDltOHI3a2dVTTd6T2w4RDFBNmEydTdlcFl4L3dYTTMK"
+    }
+  }
+}

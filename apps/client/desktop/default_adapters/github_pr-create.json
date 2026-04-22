@@ -1,0 +1,34 @@
+{
+  "name": "github/pr-create",
+  "domain": "github.com",
+  "description": "Create a GitHub pull request",
+  "args": [
+    {
+      "name": "repo",
+      "description": "Target repo (owner/repo)",
+      "required": true
+    },
+    {
+      "name": "title",
+      "description": "PR title",
+      "required": true
+    },
+    {
+      "name": "head",
+      "description": "Source branch (user:branch or branch)",
+      "required": true
+    },
+    {
+      "name": "base",
+      "description": "Target branch (default: main)",
+      "required": false
+    },
+    {
+      "name": "body",
+      "description": "PR description (markdown)",
+      "required": false
+    }
+  ],
+  "script": "if (!args.repo) return {error: 'Missing argument: repo'};\n  if (!args.title) return {error: 'Missing argument: title'};\n  if (!args.head) return {error: 'Missing argument: head', hint: 'Provide source branch as \"user:branch\" or \"branch\"'};\n\n  const resp = await fetch('https://api.github.com/repos/' + args.repo + '/pulls', {\n    method: 'POST',\n    \n    headers: {'Content-Type': 'application/json'},\n    body: JSON.stringify({\n      title: args.title,\n      head: args.head,\n      base: args.base || 'main',\n      body: args.body || ''\n    })\n  });\n\n  if (!resp.ok) {\n    const status = resp.status;\n    if (status === 401 || status === 403) return {error: 'HTTP ' + status, hint: 'Not logged in to GitHub'};\n    if (status === 404) return {error: 'Repo not found: ' + args.repo};\n    if (status === 422) {\n      const d = await resp.json().catch(() => null);\n      const msg = d?.errors?.[0]?.message || d?.message || 'Validation failed';\n      return {error: msg, hint: 'Check that the head branch exists and has commits ahead of base'};\n    }\n    return {error: 'HTTP ' + status};\n  }\n\n  const pr = await resp.json();\n  return {\n    number: pr.number,\n    title: pr.title,\n    url: pr.html_url,\n    state: pr.state\n  };",
+  "read_only": false
+}

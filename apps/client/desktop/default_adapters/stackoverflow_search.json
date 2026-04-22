@@ -1,0 +1,19 @@
+{
+  "name": "stackoverflow/search",
+  "domain": "stackoverflow.com",
+  "description": "Search Stack Overflow questions",
+  "args": [
+    {
+      "name": "query",
+      "description": "Search query",
+      "required": true
+    },
+    {
+      "name": "count",
+      "description": "Number of results (default 10, max 50)",
+      "required": false
+    }
+  ],
+  "script": "if (!args.query) return {error: 'Missing argument: query', hint: 'Provide a search query string'};\n  const count = Math.min(parseInt(args.count) || 10, 50);\n  const url = 'https://api.stackexchange.com/2.3/search?order=desc&sort=relevance&intitle='\n    + encodeURIComponent(args.query)\n    + '&site=stackoverflow&pagesize=' + count;\n  const resp = await fetch(url);\n  if (!resp.ok) return {error: 'HTTP ' + resp.status};\n  const data = await resp.json();\n  if (data.error_id) return {error: data.error_name, message: data.error_message};\n  const items = data.items || [];\n  return {\n    query: args.query,\n    count: items.length,\n    has_more: data.has_more,\n    quota_remaining: data.quota_remaining,\n    questions: items.map(q => ({\n      id: q.question_id,\n      title: q.title,\n      url: q.link,\n      score: q.score,\n      answers: q.answer_count,\n      views: q.view_count,\n      tags: q.tags,\n      author: q.owner?.display_name,\n      is_answered: q.is_answered,\n      created: q.creation_date,\n      last_activity: q.last_activity_date\n    }))\n  };",
+  "read_only": true
+}

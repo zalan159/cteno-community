@@ -1,0 +1,21 @@
+[package]
+name = "cteno-community-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "cteno_community_host"
+path = "src/lib.rs"
+
+[features]
+default = []
+tauri-commands = ["dep:tauri"]
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+log = "0.4"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [], optional = true }

@@ -1,0 +1,148 @@
+[package]
+name = "cteno"
+version = "0.1.32"
+description = "Cteno - 智能的起点"
+authors = ["Cteno Team"]
+edition = "2021"
+license = "MIT"
+default-run = "cteno"
+
+[lib]
+name = "cteno_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "cteno"
+path = "src/main.rs"
+
+[[bin]]
+name = "cteno-agentd"
+path = "src/bin/cteno_agentd.rs"
+
+# Temporarily disabled - needs refactoring
+# [[bin]]
+# name = "cteno-native-host"
+# path = "src/bin/native_host.rs"
+
+# Commented out temporarily - these test binaries need refactoring after manager.rs changes
+# [[bin]]
+# name = "test-happy-client"
+# path = "src/bin/test_happy_client.rs"
+#
+# [[bin]]
+# name = "test-machine-registration"
+# path = "src/bin/test_machine_registration.rs"
+#
+# [[bin]]
+# name = "test-happy-integration"
+# path = "src/bin/test_happy_integration.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[features]
+default = ["community"]
+community = []
+commercial-cloud = []
+
+[dependencies]
+tauri = { version = "2.10.3", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-notification = "2"
+notify-rust = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
+lazy_static = "1.5"
+regex = "1"
+shellexpand = "3"
+async-trait = "0.1"
+rand = "0.8"
+hmac = "0.12"
+sha1 = "0.10"
+multi-agent-protocol = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-protocol" }
+multi-agent-runtime-core = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-runtime-core" }
+multi-agent-runtime-cteno = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-runtime-cteno" }
+multi-agent-runtime-local = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-runtime-local" }
+multi-agent-runtime-claude = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-runtime-claude" }
+multi-agent-runtime-codex = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-runtime-codex" }
+multi-agent-runtime-gemini = { path = "../../../packages/multi-agent-runtime/rust/crates/multi-agent-runtime-gemini" }
+cteno-community-core = { path = "../../../packages/core/rust/crates/cteno-community-core", features = ["tauri-commands"] }
+cteno-community-host = { path = "../../../packages/core/rust/crates/cteno-community-host", features = ["tauri-commands"] }
+cteno-host-bridge-localrpc = { path = "../../../packages/host/rust/crates/cteno-host-bridge-localrpc" }
+cteno-host-rpc-core = { path = "../../../packages/host/rust/crates/cteno-host-rpc-core" }
+cteno-host-runtime = { path = "../../../packages/host/rust/crates/cteno-host-runtime" }
+cteno-host-session-codec = { path = "../../../packages/host/rust/crates/cteno-host-session-codec" }
+cteno-host-session-registry = { path = "../../../packages/host/rust/crates/cteno-host-session-registry" }
+cteno-host-session-wire = { path = "../../../packages/host/rust/crates/cteno-host-session-wire" }
+cteno-host-usage-monitor = { path = "../../../packages/host/rust/crates/cteno-host-usage-monitor" }
+cteno-host-agent-sync = { path = "../../../packages/host/rust/crates/cteno-host-agent-sync" }
+cteno-agent-runtime = { path = "../../../packages/agents/rust/crates/cteno-agent-runtime" }
+
+# HTTP client for API calls
+reqwest = { version = "0.12", features = ["json", "stream"] }
+urlencoding = "2"
+tokio-util = { version = "0.7", features = ["io"] }
+zip = "2"
+
+# Happy Client dependencies
+futures-util = "0.3"
+glob = "0.3"
+aes-gcm = "0.10"
+crypto_box = { version = "0.9", features = ["std"] }
+xsalsa20poly1305 = "0.9"
+base64 = "0.22"
+qrcode = { version = "0.14", default-features = false }
+hex = "0.4"
+hostname = "0.4"
+dotenvy = "0.15"
+which = "6"
+
+# Scheduler: cron expression parsing
+croner = "2"
+# Scheduler: IANA timezone support
+chrono-tz = "0.10"
+
+# Fetch tool: HTML content extraction and conversion
+readability = "0.3"
+html2md = "0.2"
+url = "2"
+
+# Computer Use: screenshot + mouse/keyboard simulation
+xcap = "0.8"
+enigo = { version = "0.6", default-features = false }
+image = "0.25"
+
+# Browser automation: CDP WebSocket connection
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# MCP (Model Context Protocol) official SDK
+rmcp = { version = "0.14", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+# panic = "abort"  # Temporarily disabled due to html2md dependency
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

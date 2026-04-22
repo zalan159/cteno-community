@@ -1,0 +1,14 @@
+{
+  "name": "hackernews/top",
+  "domain": "news.ycombinator.com",
+  "description": "获取 Hacker News 当前热门帖子",
+  "args": [
+    {
+      "name": "count",
+      "description": "Number of posts (default: 20, max: 50)",
+      "required": false
+    }
+  ],
+  "script": "const count = Math.min(parseInt(args.count) || 20, 50);\n  // HN Firebase API is public, no auth needed\n  const idsResp = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json');\n  if (!idsResp.ok) return {error: 'HTTP ' + idsResp.status};\n  const ids = await idsResp.json();\n  const topIds = ids.slice(0, count);\n\n  const items = await Promise.all(topIds.map(async id => {\n    const resp = await fetch('https://hacker-news.firebaseio.com/v0/item/' + id + '.json');\n    return await resp.json();\n  }));\n\n  return {\n    count: items.length,\n    posts: items.map((item, i) => ({\n      rank: i + 1, id: item.id, title: item.title,\n      url: item.url || null,\n      hn_url: 'https://news.ycombinator.com/item?id=' + item.id,\n      author: item.by, score: item.score,\n      comments: item.descendants || 0, time: item.time\n    }))\n  };",
+  "read_only": true
+}

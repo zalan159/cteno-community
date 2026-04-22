@@ -1,0 +1,5 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Cteno (dev)",
+  "identifier": "com.cteno.desktop.dev"
+}

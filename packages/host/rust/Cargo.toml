@@ -1,0 +1,18 @@
+[workspace]
+members = [
+  "crates/cteno-host-rpc-core",
+  "crates/cteno-host-runtime",
+  "crates/cteno-host-bridge-localrpc",
+  "crates/cteno-host-session-registry",
+  "crates/cteno-host-session-codec",
+  "crates/cteno-host-session-wire",
+  "crates/cteno-host-usage-monitor",
+  "crates/cteno-host-memory-mcp",
+  "crates/cteno-host-agent-sync",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Cteno Team"]

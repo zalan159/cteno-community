@@ -1,0 +1,19 @@
+{
+  "name": "google/search",
+  "domain": "www.google.com",
+  "description": "Google 搜索",
+  "args": [
+    {
+      "name": "query",
+      "description": "Search query",
+      "required": true
+    },
+    {
+      "name": "count",
+      "description": "Number of results (default 10)",
+      "required": false
+    }
+  ],
+  "script": "if (!args.query) return {error: 'Missing argument: query', hint: 'Provide a search query string'};\n  const num = args.count || 10;\n  const url = 'https://www.google.com/search?q=' + encodeURIComponent(args.query) + '&num=' + num;\n  const resp = await fetch(url);\n  if (!resp.ok) return {error: 'HTTP ' + resp.status, hint: 'Make sure a google.com tab is open'};\n  const html = await resp.text();\n  const doc = new DOMParser().parseFromString(html, 'text/html');\n\n  // Extract results structurally — no dependency on CSS class names.\n  // Each organic result has an h3 (title) inside an <a> (link).\n  // For each h3, walk up to find its result container (stops when parent has sibling results).\n  const h3s = doc.querySelectorAll('h3');\n  const results = [];\n  for (const h3 of h3s) {\n    const a = h3.closest('a');\n    if (!a) continue;\n    const link = a.getAttribute('href');\n    if (!link || !link.startsWith('http')) continue;\n    const title = h3.textContent.trim();\n    // Walk up from the link to find the result container\n    let container = a;\n    while (container.parentElement && container.parentElement.tagName !== 'BODY') {\n      const sibs = [...container.parentElement.children];\n      if (sibs.filter(s => s.querySelector('h3')).length > 1) break;\n      container = container.parentElement;\n    }\n    // Snippet: first substantial span outside the link block\n    let snippet = '';\n    const linkBlock = a.closest('div') || a;\n    const spans = container.querySelectorAll('span');\n    for (const sp of spans) {\n      if (linkBlock.contains(sp)) continue;\n      const t = sp.textContent.trim();\n      if (t.length > 30 && t !== title) { snippet = t; break; }\n    }\n    results.push({title, url: link, snippet});\n  }\n  return {query: args.query, count: results.length, results};",
+  "read_only": true
+}

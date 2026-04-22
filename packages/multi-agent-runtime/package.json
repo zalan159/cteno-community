@@ -1,0 +1,55 @@
+{
+  "name": "@cteno/multi-agent-runtime",
+  "version": "0.1.0",
+  "description": "Unified multi-agent protocol runtime with Claude Agent SDK and Codex SDK adapters.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "task:cli": "npm run build && node ./dist/cli/taskCli.js",
+    "smoke:coding": "npm run build && node ./examples/coding-studio.mjs",
+    "smoke:hybrid": "npm run build && node ./dist/examples/hybridClaudeCodex.js",
+    "smoke:opc": "npm run build && node ./examples/opc-solo-company.mjs",
+    "smoke:autoresearch": "npm run build && node ./examples/autoresearch.mjs",
+    "example:cteno-plan-coding-eval": "npm run build && node ./examples/cteno-plan-coding-eval.mjs",
+    "e2e:coding": "npm run build && MULTI_AGENT_E2E_TEMPLATE=coding-studio MULTI_AGENT_E2E_PROVIDER=claude node --test ./tests/e2e/template-suite.test.mjs",
+    "e2e:codex": "npm run build && MULTI_AGENT_E2E_PROVIDER=codex node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "e2e:codex:coding": "npm run build && MULTI_AGENT_E2E_TEMPLATE=coding-studio MULTI_AGENT_E2E_PROVIDER=codex node --test ./tests/e2e/template-suite.test.mjs",
+    "e2e:codex:opc": "npm run build && MULTI_AGENT_E2E_TEMPLATE=opc-solo-company MULTI_AGENT_E2E_PROVIDER=codex node --test ./tests/e2e/template-suite.test.mjs",
+    "e2e:codex:autoresearch": "npm run build && MULTI_AGENT_E2E_TEMPLATE=autoresearch MULTI_AGENT_E2E_PROVIDER=codex node --test ./tests/e2e/template-suite.test.mjs",
+    "e2e:opc": "npm run build && MULTI_AGENT_E2E_TEMPLATE=opc-solo-company MULTI_AGENT_E2E_PROVIDER=claude node --test ./tests/e2e/template-suite.test.mjs",
+    "e2e:autoresearch": "npm run build && MULTI_AGENT_E2E_TEMPLATE=autoresearch MULTI_AGENT_E2E_PROVIDER=claude node --test ./tests/e2e/template-suite.test.mjs",
+    "e2e:hybrid": "npm run build && MULTI_AGENT_E2E_PROVIDER=hybrid node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "e2e:hybrid:task-gate": "npm run build && MULTI_AGENT_E2E_TEMPLATE=task-gate-coding MULTI_AGENT_E2E_PROVIDER=hybrid node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "e2e:hybrid:worklist": "npm run build && MULTI_AGENT_E2E_TEMPLATE=hybrid-task-worklist MULTI_AGENT_E2E_PROVIDER=hybrid node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "e2e:hybrid:autoresearch-worklist": "npm run build && MULTI_AGENT_E2E_TEMPLATE=autoresearch-worklist MULTI_AGENT_E2E_PROVIDER=hybrid node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "e2e:all": "npm run build && node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "e2e": "npm run build && MULTI_AGENT_E2E_PROVIDER=claude node --test --test-concurrency=1 ./tests/e2e/template-suite.test.mjs",
+    "test": "npm run e2e",
+    "prepublishOnly": "npm run clean && npm run build && npm run typecheck"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.98",
+    "@openai/codex-sdk": "^0.118.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.12.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

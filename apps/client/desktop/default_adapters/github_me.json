@@ -1,0 +1,8 @@
+{
+  "name": "github/me",
+  "domain": "github.com",
+  "description": "获取当前 GitHub 登录用户信息",
+  "args": [],
+  "script": "const resp = await fetch('https://api.github.com/user');\n  if (!resp.ok) return {error: 'HTTP ' + resp.status, hint: resp.status === 401 ? 'Not logged into github.com' : 'API error'};\n  const d = await resp.json();\n  return {\n    login: d.login, name: d.name, bio: d.bio,\n    url: d.html_url || ('https://github.com/' + d.login),\n    public_repos: d.public_repos, followers: d.followers, following: d.following,\n    created_at: d.created_at\n  };",
+  "read_only": true
+}

@@ -1,0 +1,61 @@
+/* Theme-aware scrollbar styles using Unistyles CSS variables */
+
+/* Webkit Scrollbars (Chrome, Safari, Edge) */
+::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--colors-surface-high);
+    border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--colors-divider);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--colors-text-secondary);
+    background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--colors-surface-high);
+}
+
+/* Firefox */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--colors-divider) var(--colors-surface-high);
+}
+
+/* Ensure scrollbars are visible on hover for macOS */
+::-webkit-scrollbar:horizontal {
+    height: 12px;
+}
+
+::-webkit-scrollbar:vertical {
+    width: 12px;
+}
+
+/* Allow text selection on desktop (Tauri/Web).
+   React Native Web renders <Text> as <span> and <View> as <div>.
+   We enable user-select on <span> only — this allows copying text content
+   without breaking press/drag gestures on <div> (View) containers. */
+span {
+    -webkit-user-select: text !important;
+    user-select: text !important;
+}
+
+/* Hide scrollbar on inverted FlatList - scaleY(-1) flips drag direction */
+.inverted-list-container *::-webkit-scrollbar {
+    display: none;
+}
+.inverted-list-container * {
+    scrollbar-width: none;
+}
+
