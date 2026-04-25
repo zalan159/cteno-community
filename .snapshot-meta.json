@@ -1,7 +1,7 @@
 {
   "source_repo": "(internal monorepo)",
-  "source_commit": "111984e62cf250067243232b54cd8e604cd40ca8",
-  "exported_at": "2026-04-22T07:48:21Z",
+  "source_commit": "33d39a2c5c7282865544823d81e3aa90064ce340",
+  "exported_at": "2026-04-25T19:21:43Z",
   "exported_by": "scripts/export-community-snapshot.sh",
   "edition": "community",
   "desktop_cargo_features": "--no-default-features --features community",

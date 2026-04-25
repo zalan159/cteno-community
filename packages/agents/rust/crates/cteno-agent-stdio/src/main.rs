@@ -31,12 +31,23 @@ use crate::injected_tool::inject_tool;
 use crate::io::{spawn_stdin_reader, OutboundWriter};
 use crate::pending::{
     new_pending_host_calls, new_pending_permissions, new_pending_tool_execs, parse_decision,
+    PendingPermissions,
 };
 use crate::protocol::{Inbound, Outbound};
 use crate::session::{SessionHandle, SessionState};
+use cteno_agent_runtime::agent_queue::AgentMessage;
+
+#[derive(Debug)]
+enum InternalEvent {
+    TurnFinished { session_id: String },
+    SubagentMessage { session_id: String, content: String },
+}
 
 fn data_dir() -> PathBuf {
     if let Ok(v) = std::env::var("CTENO_AGENT_DATA_DIR") {
+        return PathBuf::from(v);
+    }
+    if let Ok(v) = std::env::var("CTENO_APP_DATA_DIR") {
         return PathBuf::from(v);
     }
     let base = dirs_next_home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -48,6 +59,59 @@ fn dirs_next_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env<T>(agent_dir: Option<&str>, app_dir: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_agent = std::env::var_os("CTENO_AGENT_DATA_DIR");
+        let old_app = std::env::var_os("CTENO_APP_DATA_DIR");
+
+        match agent_dir {
+            Some(value) => std::env::set_var("CTENO_AGENT_DATA_DIR", value),
+            None => std::env::remove_var("CTENO_AGENT_DATA_DIR"),
+        }
+        match app_dir {
+            Some(value) => std::env::set_var("CTENO_APP_DATA_DIR", value),
+            None => std::env::remove_var("CTENO_APP_DATA_DIR"),
+        }
+
+        let output = f();
+
+        match old_agent {
+            Some(value) => std::env::set_var("CTENO_AGENT_DATA_DIR", value),
+            None => std::env::remove_var("CTENO_AGENT_DATA_DIR"),
+        }
+        match old_app {
+            Some(value) => std::env::set_var("CTENO_APP_DATA_DIR", value),
+            None => std::env::remove_var("CTENO_APP_DATA_DIR"),
+        }
+
+        output
+    }
+
+    #[test]
+    fn data_dir_prefers_explicit_agent_dir() {
+        let path = with_env(
+            Some("/tmp/cteno-agent-explicit"),
+            Some("/tmp/cteno-app-data"),
+            data_dir,
+        );
+        assert_eq!(path, PathBuf::from("/tmp/cteno-agent-explicit"));
+    }
+
+    #[test]
+    fn data_dir_falls_back_to_host_app_data_dir() {
+        let path = with_env(None, Some("/tmp/cteno-app-data"), data_dir);
+        assert_eq!(path, PathBuf::from("/tmp/cteno-app-data"));
+    }
+
 }
 
 /// Rehydrate `profile_id` / `model` / `effort` into `agent_config` from the
@@ -108,9 +172,7 @@ fn restore_resume_profile_from_db(
             serde_json::Value::String(effort.to_string()),
         );
     }
-    log::info!(
-        "rehydrated profile selection for resumed session {session_id} from sessions.db"
-    );
+    log::info!("rehydrated profile selection for resumed session {session_id} from sessions.db");
 }
 
 /// Persist the current profile selection back into the agent_sessions row so
@@ -151,9 +213,7 @@ fn persist_profile_to_db(
         "cteno_profile",
         serde_json::Value::Object(stored),
     ) {
-        log::warn!(
-            "failed to persist cteno_profile for session {session_id}: {err}"
-        );
+        log::warn!("failed to persist cteno_profile for session {session_id}: {err}");
     }
 }
 
@@ -166,27 +226,33 @@ async fn main() -> anyhow::Result<()> {
 
     let data_dir = data_dir();
     std::fs::create_dir_all(&data_dir).ok();
+    log::info!("cteno-agent data dir: {:?}", data_dir);
 
     let writer = OutboundWriter::new();
     let mut rx = spawn_stdin_reader(writer.clone());
-
-    // Register default tool registry + URL provider. We keep a direct handle
-    // on the registry so we can dynamically add tools via `tool_inject`.
-    let installed = hooks_mvp::install_default_registry(data_dir.clone());
-    log::info!(
-        "cteno-agent stdio bootstrap complete: {} builtin tools registered",
-        installed.builtin_count
-    );
-    let registry = installed.handle;
-    let mcp_registries = installed.mcp_registries;
-
-    let db_path = data_dir.join("sessions.db");
 
     // Shared pending-request maps. Keyed by request_id (globally unique), not
     // by session_id: each request_id has a dedicated oneshot sender.
     let pending_permissions = new_pending_permissions();
     let pending_tool_execs = new_pending_tool_execs();
     let pending_host_calls = new_pending_host_calls();
+
+    // Register default tool registry + URL provider. We keep a direct handle
+    // on the registry so we can dynamically add tools via `tool_inject`.
+    let installed = hooks_mvp::install_default_registry(
+        data_dir.clone(),
+        writer.clone(),
+        pending_permissions.clone(),
+    );
+    log::info!(
+        "cteno-agent stdio bootstrap complete: {} builtin tools registered",
+        installed.builtin_count
+    );
+    let registry = installed.handle;
+    let mcp_registries = installed.mcp_registries;
+    let subagent_bootstrap = installed.subagent_bootstrap;
+
+    let db_path = data_dir.join("sessions.db");
 
     // Install the generic HostCallDispatcher into the runtime. In-runtime hook
     // impls (added by later waves) can look up this dispatcher and proxy their
@@ -205,13 +271,102 @@ async fn main() -> anyhow::Result<()> {
         auth_slot.clone(),
     )));
 
+    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalEvent>();
     let mut sessions: HashMap<String, SessionHandle> = HashMap::new();
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else {
+                    break;
+                };
+                Some(msg)
+            }
+            event = internal_rx.recv() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                match event {
+                    InternalEvent::TurnFinished { session_id } => {
+                        if let Some(handle) = sessions.get_mut(&session_id) {
+                            handle.harvest_finished();
+                            // A turn just ended — if SubagentMessage(s) had
+                            // arrived during it and were pushed onto the
+                            // queue (we deferred wake while the turn was
+                            // active), drain them now and start an
+                            // autonomous turn so persona reacts to the
+                            // queued handoffs. Without this, queue content
+                            // accumulated mid-turn would sit forever until
+                            // the next user message.
+                            try_drain_and_wake(
+                                handle,
+                                &session_id,
+                                "subagent_handoff_after_turn",
+                                &writer,
+                                &pending_permissions,
+                                &internal_tx,
+                            )
+                            .await;
+                        }
+                    }
+                    InternalEvent::SubagentMessage { session_id, content } => {
+                        let Some(handle) = sessions.get_mut(&session_id) else {
+                            log::warn!(
+                                "SubAgent notification for unknown session {session_id} (dropping)"
+                            );
+                            continue;
+                        };
+
+                        let push_result = handle
+                            .message_queue
+                            .push(AgentMessage::subagent(session_id.clone(), content));
+                        if let Err(err) = push_result {
+                            log::warn!(
+                                "failed to enqueue SubAgent notification for {session_id}: {err}"
+                            );
+                            continue;
+                        }
+
+                        handle.harvest_finished();
+                        if handle.turn_in_progress() {
+                            // Turn-active path: leave the message in the
+                            // queue. The TurnFinished handler will drain and
+                            // wake when the active turn ends. (The active
+                            // turn's ReAct loop's `pop_all` only fires at
+                            // the END of an iteration that ran tools — if
+                            // the LLM ends the turn with a final assistant
+                            // text and no tool call, pop_all is skipped.
+                            // Hence the TurnFinished safety net.)
+                            log::info!(
+                                "session {session_id} has an in-progress turn; queued for post-turn wake"
+                            );
+                            continue;
+                        }
+
+                        try_drain_and_wake(
+                            handle,
+                            &session_id,
+                            "subagent_handoff",
+                            &writer,
+                            &pending_permissions,
+                            &internal_tx,
+                        )
+                        .await;
+                    }
+                }
+                None
+            }
+        };
+
+        let Some(msg) = msg else {
+            continue;
+        };
+
         match msg {
             Inbound::Init {
                 session_id,
                 workdir,
+                additional_directories,
                 mut agent_config,
                 system_prompt,
                 auth_token,
@@ -253,23 +408,70 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Replace-on-reinit: if the host re-inits an existing id we
-                // drop the prior handle (any in-flight turn keeps running via
-                // its JoinHandle, but will no longer receive new input).
+                // Replace-on-reinit: abort the prior stdio-side workers for
+                // this id before installing the fresh session state.
+                if let Some(mut old) = sessions.remove(&session_id) {
+                    old.state.abort_flag.store(true, Ordering::SeqCst);
+                    old.abort_running_turn();
+                    old.abort_subagent_receiver();
+                    cteno_agent_runtime::subagent::manager::global()
+                        .unregister_session(&session_id)
+                        .await;
+                }
+
                 let new_state = SessionState::new(
                     session_id.clone(),
                     workdir,
+                    additional_directories,
                     agent_config,
                     system_prompt,
                     db_path.clone(),
                 );
-                sessions.insert(session_id.clone(), SessionHandle::new(new_state));
+                subagent_bootstrap
+                    .register_session(
+                        session_id.clone(),
+                        new_state.workdir.clone(),
+                        new_state.additional_directories.clone(),
+                        new_state.agent_config.clone(),
+                    )
+                    .await;
+
+                let mut subagent_rx = cteno_agent_runtime::subagent::manager::global()
+                    .register_session(session_id.clone())
+                    .await;
+                let subagent_session_id = session_id.clone();
+                let subagent_internal_tx = internal_tx.clone();
+                let subagent_receiver = tokio::spawn(async move {
+                    log::info!(
+                        "stdio SubAgent notification receiver started for session {subagent_session_id}"
+                    );
+                    while let Some(content) = subagent_rx.recv().await {
+                        if subagent_internal_tx
+                            .send(InternalEvent::SubagentMessage {
+                                session_id: subagent_session_id.clone(),
+                                content,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    log::info!(
+                        "stdio SubAgent notification receiver stopped for session {subagent_session_id}"
+                    );
+                });
+
+                let mut handle = SessionHandle::new(new_state);
+                handle.subagent_receiver = Some(subagent_receiver);
+                sessions.insert(session_id.clone(), handle);
                 writer.send(Outbound::Ready { session_id }).await;
             }
 
             Inbound::UserMessage {
                 session_id,
                 content,
+                task_id,
+                attachments,
             } => {
                 let handle = match sessions.get_mut(&session_id) {
                     Some(h) => h,
@@ -286,32 +488,78 @@ async fn main() -> anyhow::Result<()> {
 
                 handle.harvest_finished();
                 if handle.turn_in_progress() {
+                    log::warn!(
+                        "user_message received while session {session_id} is busy; rejecting duplicate in-flight turn"
+                    );
                     writer
                         .send(Outbound::Error {
-                            session_id: handle.state.session_id.clone(),
-                            message:
-                                "a turn is already in progress for this session; abort it first"
-                                    .to_string(),
+                            session_id,
+                            message: "session is busy; send the next user message after the current turn completes".to_string(),
                         })
                         .await;
                     continue;
                 }
 
-                let state = handle.state.clone();
-                let writer_for_turn = writer.clone();
-                let pending_for_turn = pending_permissions.clone();
-                handle.running_turn = Some(tokio::spawn(async move {
-                    runner::run_turn(&state, content, writer_for_turn, pending_for_turn).await;
-                }));
+                start_turn(
+                    handle,
+                    content,
+                    task_id,
+                    attachments,
+                    writer.clone(),
+                    pending_permissions.clone(),
+                    internal_tx.clone(),
+                );
             }
 
-            Inbound::Abort { session_id } => {
-                if let Some(handle) = sessions.get(&session_id) {
+            Inbound::Abort { session_id, reason } => {
+                if let Some(handle) = sessions.get_mut(&session_id) {
                     handle.state.abort_flag.store(true, Ordering::SeqCst);
-                    log::info!("abort requested for session {session_id}");
+                    let aborted = handle.abort_running_turn();
+                    log::info!("abort requested for session {session_id} (aborted={aborted})");
+                    if aborted {
+                        let message = reason.unwrap_or_else(|| {
+                            "Turn aborted. You can retry when ready.".to_string()
+                        });
+                        writer
+                            .send(Outbound::Error {
+                                session_id: session_id.clone(),
+                                message,
+                            })
+                            .await;
+                        writer
+                            .send(Outbound::TurnComplete {
+                                session_id,
+                                final_text: String::new(),
+                                iteration_count: 0,
+                                usage: Default::default(),
+                                context_usage: None,
+                            })
+                            .await;
+                    }
                 } else {
                     log::warn!("abort for unknown session {session_id} (dropping)");
                 }
+            }
+
+            Inbound::CloseSession { session_id } => {
+                let removed = sessions.remove(&session_id);
+                let existed = removed.is_some();
+                if let Some(mut handle) = removed {
+                    handle.state.abort_flag.store(true, Ordering::SeqCst);
+                    handle.abort_running_turn();
+                    handle.abort_subagent_receiver();
+                }
+                let cleaned =
+                    hooks_mvp::cleanup_session_mcp_tools(&registry, &mcp_registries, &session_id)
+                        .await;
+                subagent_bootstrap.unregister_session(&session_id).await;
+                cteno_agent_runtime::subagent::manager::global()
+                    .unregister_session(&session_id)
+                    .await;
+                log::info!(
+                    "closed session {session_id} in stdio runner (existed={} mcp_tools_cleaned={cleaned})",
+                    existed
+                );
             }
 
             Inbound::SetModel {
@@ -332,6 +580,14 @@ async fn main() -> anyhow::Result<()> {
                         effort,
                         &app_data_dir,
                     );
+                    subagent_bootstrap
+                        .register_session(
+                            session_id.clone(),
+                            handle.state.workdir.clone(),
+                            handle.state.additional_directories.clone(),
+                            handle.state.agent_config.clone(),
+                        )
+                        .await;
                     // Persist the new profile_id / model so a later resume
                     // (subprocess respawn, daemon restart) can rehydrate the
                     // selection instead of falling back to the default local
@@ -352,6 +608,14 @@ async fn main() -> anyhow::Result<()> {
             Inbound::SetPermissionMode { session_id, mode } => {
                 if let Some(handle) = sessions.get_mut(&session_id) {
                     runner::apply_permission_mode_control(&mut handle.state.agent_config, mode);
+                    subagent_bootstrap
+                        .register_session(
+                            session_id.clone(),
+                            handle.state.workdir.clone(),
+                            handle.state.additional_directories.clone(),
+                            handle.state.agent_config.clone(),
+                        )
+                        .await;
                     log::info!("updated session permission mode for {session_id}");
                 } else {
                     writer
@@ -517,17 +781,27 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Harvest finished turn handles across all sessions so
-        // `turn_in_progress()` stays accurate.
+        // `turn_in_progress()` stays accurate. Normal progression is driven
+        // by `InternalEvent::TurnFinished`; this is just best-effort cleanup
+        // after inbound control frames.
         for h in sessions.values_mut() {
             h.harvest_finished();
         }
     }
 
     // Graceful shutdown: wait for any in-flight turn to finish.
-    let handles: Vec<_> = sessions
-        .drain()
-        .filter_map(|(_, mut h)| h.running_turn.take())
-        .collect();
+    let mut handles = Vec::new();
+    for (session_id, mut h) in sessions.drain() {
+        hooks_mvp::cleanup_session_mcp_tools(&registry, &mcp_registries, &session_id).await;
+        subagent_bootstrap.unregister_session(&session_id).await;
+        cteno_agent_runtime::subagent::manager::global()
+            .unregister_session(&session_id)
+            .await;
+        h.abort_subagent_receiver();
+        if let Some(handle) = h.running_turn.take() {
+            handles.push(handle);
+        }
+    }
     for handle in handles {
         let _ = handle.await;
     }
@@ -538,3 +812,91 @@ async fn main() -> anyhow::Result<()> {
 // Convenience re-exports, though nothing external uses them right now.
 #[allow(dead_code)]
 fn _keep_channel_imports(_rx: mpsc::Receiver<Inbound>) {}
+
+/// If the session is idle and has queued SubAgent handoffs, drain the queue,
+/// emit the explicit `Outbound::AutonomousTurnStart` boundary frame (carrying
+/// the synthetic user-message text the host renders as a user-bubble), and
+/// kick a fresh turn via `start_turn`. No-op if the queue is empty or the
+/// session is busy.
+///
+/// Called from both:
+/// - `InternalEvent::SubagentMessage` when the message arrives at an idle
+///   session (immediate wake)
+/// - `InternalEvent::TurnFinished` when a turn just ended and queue may have
+///   accumulated content during the active turn (post-turn wake — required
+///   because `autonomous_agent`'s in-loop `pop_all` only fires after a tool
+///   iteration; a turn that ends with a final assistant text never reaches
+///   it, leaving queued messages stranded without this safety net).
+async fn try_drain_and_wake(
+    handle: &mut SessionHandle,
+    session_id: &str,
+    reason: &str,
+    writer: &OutboundWriter,
+    pending_permissions: &PendingPermissions,
+    internal_tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    if handle.turn_in_progress() {
+        return;
+    }
+    let queue_msgs = handle.message_queue.pop_all(session_id);
+    if queue_msgs.is_empty() {
+        return;
+    }
+    let combined = queue_msgs
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    log::info!(
+        "auto-wake persona session {session_id} ({reason}): {} chars",
+        combined.len()
+    );
+    writer
+        .send(Outbound::AutonomousTurnStart {
+            session_id: session_id.to_string(),
+            reason: Some(reason.to_string()),
+            synthetic_user_message: Some(combined.clone()),
+        })
+        .await;
+    start_turn(
+        handle,
+        combined,
+        None,
+        Vec::new(),
+        writer.clone(),
+        pending_permissions.clone(),
+        internal_tx.clone(),
+    );
+}
+
+fn start_turn(
+    handle: &mut SessionHandle,
+    content: String,
+    task_id: Option<String>,
+    attachments: Vec<crate::protocol::Attachment>,
+    writer: OutboundWriter,
+    pending_permissions: PendingPermissions,
+    internal_tx: mpsc::UnboundedSender<InternalEvent>,
+) {
+    handle.state.abort_flag.store(false, Ordering::SeqCst);
+    let state = handle.state.clone();
+    let session_id_for_event = state.session_id.clone();
+    let writer_for_turn = writer.clone();
+    let pending_for_turn = pending_permissions.clone();
+    let message_queue = handle.message_queue.clone();
+    handle.running_turn = Some(tokio::spawn(async move {
+        runner::run_turn(
+            &state,
+            content,
+            task_id,
+            attachments,
+            writer_for_turn,
+            pending_for_turn,
+            Some(message_queue),
+        )
+        .await;
+        let _ = internal_tx.send(InternalEvent::TurnFinished {
+            session_id: session_id_for_event,
+        });
+    }));
+}

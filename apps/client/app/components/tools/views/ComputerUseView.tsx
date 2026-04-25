@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, ActivityIndicator } from 'react-native';
+import { View } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolCall } from '@/sync/typesMessage';
@@ -69,7 +69,6 @@ export const ComputerUseView = React.memo((props: { tool: ToolCall, metadata: Me
         return (
             <View style={styles.container}>
                 <View style={styles.runningRow}>
-                    <ActivityIndicator size="small" />
                     <Text style={styles.runningText}>
                         {action === 'screenshot' ? 'Taking screenshot...' : `${action || 'Executing'}...`}
                     </Text>

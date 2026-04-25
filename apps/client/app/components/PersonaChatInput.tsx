@@ -14,8 +14,9 @@ import { StatusDot } from './StatusDot';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { useSetting } from '@/sync/storage';
 import { Text } from '@/components/StyledText';
-import { UsagePopover } from './UsagePopover';
-import type { VendorUsageId } from '@/sync/storageTypes';
+import { QuotaPopover } from './QuotaPopover';
+import type { Metadata, VendorQuotaId } from '@/sync/storageTypes';
+import { PermissionRequestCard } from './tools/PermissionRequestCard';
 
 export type PickedImage = {
     uri: string;
@@ -64,10 +65,24 @@ interface PersonaChatInputProps {
     }>;
     // Machine-level usage indicator — `vendor` picks which quota set
     // (claude / codex / gemini) to read from the global store. `machineId`
-    // is optional; UsagePopover falls back to the only registered machine.
-    usageVendor?: VendorUsageId | null;
-    usageMachineId?: string | null;
-    usagePreferredModelId?: string | null;
+    // is optional; QuotaPopover falls back to the only registered machine.
+    quotaVendor?: VendorQuotaId | null;
+    quotaMachineId?: string | null;
+    quotaPreferredModelId?: string | null;
+    sessionId?: string;
+    metadata?: Metadata | null;
+    pendingPermission?: {
+        id: string;
+        tool: string;
+        arguments: any;
+        createdAt?: number | null;
+    } | null;
+    todoToggle?: {
+        completed: number;
+        total: number;
+        collapsed: boolean;
+        onPress: () => void;
+    } | null;
 }
 
 function extractActiveMention(text: string, cursorPosition: number): { query: string; start: number; end: number } | null {
@@ -134,6 +149,12 @@ const stylesheet = StyleSheet.create((theme) => ({
         color: theme.colors.textSecondary,
         ...Typography.default(),
     },
+    todoStatusButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 3,
+        flexShrink: 0,
+    },
     sendButton: {
         width: 32,
         height: 32,
@@ -181,9 +202,13 @@ export const PersonaChatInput = React.memo(({
     effortName,
     onEffortPress,
     autocompleteOptions,
-    usageVendor,
-    usageMachineId,
-    usagePreferredModelId,
+    quotaVendor,
+    quotaMachineId,
+    quotaPreferredModelId,
+    sessionId,
+    metadata,
+    pendingPermission,
+    todoToggle,
 }: PersonaChatInputProps) => {
     const { theme } = useUnistyles();
     const styles = stylesheet;
@@ -192,7 +217,8 @@ export const PersonaChatInput = React.memo(({
     const hasImages = (pendingImages?.length ?? 0) > 0;
     const hasSkills = (selectedSkills?.length ?? 0) > 0;
     const hasContent = hasText || hasImages || hasSkills;
-    const canSend = hasContent;
+    const isPermissionBlocked = !!pendingPermission;
+    const canSend = hasContent && !isPermissionBlocked;
     const [toastMessage, setToastMessage] = React.useState<string | null>(null);
     const inputRef = React.useRef<MultiTextInputHandle>(null);
     const [selection, setSelection] = React.useState({ start: value.length, end: value.length });
@@ -379,6 +405,10 @@ export const PersonaChatInput = React.memo(({
     }, [onAbort, isAborting]);
 
     const handleKeyPress = React.useCallback((event: KeyPressEvent): boolean => {
+        if (isPermissionBlocked) {
+            return true;
+        }
+
         if (autocompleteSuggestions.length > 0) {
             if (event.key === 'ArrowDown') {
                 setSelectedAutocompleteIndex((current) => (current + 1) % autocompleteSuggestions.length);
@@ -419,6 +449,7 @@ export const PersonaChatInput = React.memo(({
         autocompleteSuggestions,
         canSend,
         handleAbortPress,
+        isPermissionBlocked,
         isAborting,
         onAbort,
         onSend,
@@ -444,7 +475,7 @@ export const PersonaChatInput = React.memo(({
             )}
             <View style={[styles.innerContainer, { maxWidth: layout.maxWidth, paddingHorizontal: 16 }]}>
                 {/* Status info row (above input, non-interactive) */}
-                {(connectionStatus || onClear) && (
+                {(connectionStatus || onClear || todoToggle) && (
                     <View style={styles.statusInfoRow}>
                         {connectionStatus && (
                             <>
@@ -461,14 +492,37 @@ export const PersonaChatInput = React.memo(({
                                         • context: {connectionStatus.compressionInfo.text}
                                     </Text>
                                 )}
-                                {usageVendor && (
-                                    <UsagePopover
-                                        machineId={usageMachineId ?? null}
-                                        vendor={usageVendor}
-                                        preferredModelId={usagePreferredModelId ?? null}
+                                {quotaVendor && (
+                                    <QuotaPopover
+                                        machineId={quotaMachineId ?? null}
+                                        vendor={quotaVendor}
+                                        preferredModelId={quotaPreferredModelId ?? null}
                                     />
                                 )}
                             </>
+                        )}
+                        {todoToggle && (
+                            <Pressable
+                                onPress={() => {
+                                    hapticsLight();
+                                    todoToggle.onPress();
+                                }}
+                                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                                accessibilityLabel={todoToggle.collapsed ? '展开 todolist' : '收起 todolist'}
+                                style={({ pressed }) => [
+                                    styles.todoStatusButton,
+                                    { opacity: pressed ? 0.6 : 1 },
+                                ]}
+                            >
+                                <Text style={[styles.statusText, { color: theme.colors.textSecondary, ...Typography.default('semiBold') }]}>
+                                    • Todo {todoToggle.completed}/{todoToggle.total}
+                                </Text>
+                                <Ionicons
+                                    name={todoToggle.collapsed ? 'chevron-up' : 'chevron-down'}
+                                    size={12}
+                                    color={theme.colors.textSecondary}
+                                />
+                            </Pressable>
                         )}
                         {onClear && (
                             <Pressable
@@ -499,6 +553,15 @@ export const PersonaChatInput = React.memo(({
                 )}
 
                 <View style={styles.unifiedPanel}>
+                    {pendingPermission && sessionId && (
+                        <PermissionRequestCard
+                            sessionId={sessionId}
+                            pendingPermission={pendingPermission}
+                            metadata={metadata}
+                            variant="card"
+                        />
+                    )}
+
                     {/* Image preview row */}
                     {hasImages && (
                         <ScrollView
@@ -584,6 +647,7 @@ export const PersonaChatInput = React.memo(({
                             onKeyPress={handleKeyPress}
                             onSelectionChange={setSelection}
                             onStateChange={(state) => setSelection(state.selection)}
+                            editable={!isPermissionBlocked}
                         />
                     </View>
 
@@ -859,6 +923,7 @@ export const PersonaChatInput = React.memo(({
                                     })}
                                     hitSlop={{ top: 5, bottom: 10, left: 0, right: 0 }}
                                     onPress={() => {
+                                        if (isPermissionBlocked) return;
                                         hapticsLight();
                                         onSend();
                                     }}

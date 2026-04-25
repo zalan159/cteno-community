@@ -25,14 +25,16 @@ interface LlmProfileListProps {
 export function LlmProfileList({ models, selectedModelId, defaultModelId, onModelChange, variant = 'inline' }: LlmProfileListProps) {
     const { theme } = useUnistyles();
 
-    if (models.length === 0) return null;
-
     const vendorProfiles = models.filter(p => p.sourceType === 'vendor');
     const proxyProfiles = models.filter(p => (p.sourceType ?? (p.isProxy ? 'proxy' : 'byok')) === 'proxy');
     const byokProfiles = models.filter(p => (p.sourceType ?? (p.isProxy ? 'proxy' : 'byok')) === 'byok');
 
     const freeProfiles = proxyProfiles.filter(p => isFreeModel(p));
     const paidProfiles = proxyProfiles.filter(p => !isFreeModel(p));
+    const selectedIsFreeProxy = freeProfiles.some((profile) => profile.id === selectedModelId);
+    const selectedIsPaidProxy = paidProfiles.some((profile) => profile.id === selectedModelId);
+    const [freeCollapsed, setFreeCollapsed] = React.useState(() => freeProfiles.length > 6 && !selectedIsFreeProxy);
+    const [paidCollapsed, setPaidCollapsed] = React.useState(() => paidProfiles.length > 6 && !selectedIsPaidProxy);
     const vendorGroups = [
         {
             key: 'claude',
@@ -60,6 +62,15 @@ export function LlmProfileList({ models, selectedModelId, defaultModelId, onMode
     const hasPaid = paidProfiles.length > 0;
     const hasByok = byokProfiles.length > 0;
     const hasVendorGroups = vendorGroups.length > 0;
+
+    React.useEffect(() => {
+        if (selectedIsFreeProxy) {
+            setFreeCollapsed(false);
+        }
+        if (selectedIsPaidProxy) {
+            setPaidCollapsed(false);
+        }
+    }, [selectedIsFreeProxy, selectedIsPaidProxy]);
 
     React.useEffect(() => {
         frontendLog(`[LlmProfileList] ${JSON.stringify({
@@ -91,6 +102,8 @@ export function LlmProfileList({ models, selectedModelId, defaultModelId, onMode
         selectedModelId,
         variant,
     ]);
+
+    if (models.length === 0) return null;
 
     const renderRow = (model: ModelOptionDisplay) => (
         <ProfileRow
@@ -128,35 +141,31 @@ export function LlmProfileList({ models, selectedModelId, defaultModelId, onMode
 
             {hasFree && (
                 <>
-                    <Text style={{
-                        fontSize: 12,
-                        fontWeight: '600',
-                        color: theme.colors.textSecondary,
-                        paddingHorizontal: 16,
-                        paddingBottom: variant === 'modal' ? 6 : 4,
-                        paddingTop: hasVendorGroups ? (variant === 'modal' ? 12 : 8) : 0,
-                        ...Typography.default('semiBold')
-                    }}>
-                        免费模型
-                    </Text>
-                    {freeProfiles.map(renderRow)}
+                    <ProfileSectionHeader
+                        title="免费模型"
+                        count={freeProfiles.length}
+                        collapsed={freeCollapsed}
+                        collapsible
+                        topPadding={hasVendorGroups ? (variant === 'modal' ? 12 : 8) : 0}
+                        variant={variant}
+                        onPress={() => setFreeCollapsed((value) => !value)}
+                    />
+                    {!freeCollapsed && freeProfiles.map(renderRow)}
                 </>
             )}
 
             {hasPaid && (
                 <>
-                    <Text style={{
-                        fontSize: 12,
-                        fontWeight: '600',
-                        color: theme.colors.textSecondary,
-                        paddingHorizontal: 16,
-                        paddingBottom: variant === 'modal' ? 6 : 4,
-                        paddingTop: (hasVendorGroups || hasFree) ? (variant === 'modal' ? 12 : 8) : 0,
-                        ...Typography.default('semiBold')
-                    }}>
-                        {variant === 'modal' ? '内置代理模型（消耗余额）' : '内置代理（消耗余额）'}
-                    </Text>
-                    {paidProfiles.map(renderRow)}
+                    <ProfileSectionHeader
+                        title={variant === 'modal' ? '内置代理模型（消耗余额）' : '内置代理（消耗余额）'}
+                        count={paidProfiles.length}
+                        collapsed={paidCollapsed}
+                        collapsible
+                        topPadding={(hasVendorGroups || hasFree) ? (variant === 'modal' ? 12 : 8) : 0}
+                        variant={variant}
+                        onPress={() => setPaidCollapsed((value) => !value)}
+                    />
+                    {!paidCollapsed && paidProfiles.map(renderRow)}
                 </>
             )}
 
@@ -177,6 +186,62 @@ export function LlmProfileList({ models, selectedModelId, defaultModelId, onMode
                 </>
             )}
         </View>
+    );
+}
+
+function ProfileSectionHeader({ title, count, collapsed, collapsible, topPadding, variant, onPress }: {
+    title: string;
+    count?: number;
+    collapsed?: boolean;
+    collapsible?: boolean;
+    topPadding: number;
+    variant: 'inline' | 'modal';
+    onPress?: () => void;
+}) {
+    const { theme } = useUnistyles();
+    const content = (
+        <>
+            <Text style={{
+                fontSize: 12,
+                fontWeight: '600',
+                color: theme.colors.textSecondary,
+                ...Typography.default('semiBold')
+            }}>
+                {count !== undefined ? `${title} · ${count}` : title}
+            </Text>
+            {collapsible && (
+                <Ionicons
+                    name={collapsed ? 'chevron-forward' : 'chevron-down'}
+                    size={14}
+                    color={theme.colors.textSecondary}
+                />
+            )}
+        </>
+    );
+
+    const style = {
+        flexDirection: 'row' as const,
+        alignItems: 'center' as const,
+        gap: 4,
+        paddingHorizontal: 16,
+        paddingBottom: variant === 'modal' ? 6 : 4,
+        paddingTop: topPadding,
+    };
+
+    if (!collapsible) {
+        return <View style={style}>{content}</View>;
+    }
+
+    return (
+        <Pressable
+            onPress={onPress}
+            style={({ pressed }) => [
+                style,
+                pressed ? { opacity: 0.65 } : null,
+            ]}
+        >
+            {content}
+        </Pressable>
     );
 }
 

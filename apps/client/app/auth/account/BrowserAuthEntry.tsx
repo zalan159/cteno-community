@@ -11,6 +11,8 @@ import { Typography } from '@/constants/Typography';
 import { loginWithBrowserOAuth } from '@/auth/account/authBrowser';
 import { MobileLoginPage } from '@/auth/account/MobileLoginPage';
 
+type BrowserLoginMode = 'cloud' | 'local-token';
+
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
         flex: 1,
@@ -57,17 +59,23 @@ const stylesheet = StyleSheet.create((theme) => ({
 interface BrowserAuthEntryProps {
     title?: string;
     subtitle?: string;
+    buttonTitle?: string;
+    loginMode?: BrowserLoginMode;
 }
 
 export function BrowserAuthEntry({
     title = 'Login',
     subtitle = 'Continue in your browser to sign in and return to the desktop app.',
+    buttonTitle = 'Login',
+    loginMode = 'cloud',
 }: BrowserAuthEntryProps) {
     if (Platform.OS === 'ios' || Platform.OS === 'android') {
         return (
             <MobileLoginPage
                 title={title}
                 subtitle={subtitle}
+                buttonTitle={buttonTitle}
+                loginMode={loginMode}
             />
         );
     }
@@ -83,7 +91,11 @@ export function BrowserAuthEntry({
 
         try {
             const payload = await loginWithBrowserOAuth();
-            await auth.login(payload);
+            if (loginMode === 'local-token') {
+                await auth.loginForLocalToken(payload);
+            } else {
+                await auth.login(payload);
+            }
         } catch (caughtError) {
             const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
             console.error('Browser OAuth login failed:', caughtError);
@@ -95,7 +107,7 @@ export function BrowserAuthEntry({
         } finally {
             setLoading(false);
         }
-    }, [auth]);
+    }, [auth, loginMode]);
 
     return (
         <View style={styles.container}>
@@ -106,7 +118,7 @@ export function BrowserAuthEntry({
                     <Text style={styles.title}>{title}</Text>
                     <Text style={styles.subtitle}>{subtitle}</Text>
                     <RoundButton
-                        title="Login"
+                        title={buttonTitle}
                         size="large"
                         onPress={handleLogin}
                         loading={loading}

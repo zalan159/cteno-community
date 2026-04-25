@@ -11,7 +11,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{ensure_object_mut, mcp_to_json, persona_link_path, read_json_or_empty, write_json};
+use super::{
+    ensure_object_mut, mcp_to_json, persona_link_path, read_json_or_empty, write_json,
+    LEGACY_CTENO_MEMORY_MCP_NAME,
+};
 use crate::{
     schemas::{McpSpec, PersonaSpec, SkillSpec},
     symlink::{ensure_symlink, ensure_symlink_to_dir},
@@ -46,6 +49,7 @@ impl VendorSyncer for ClaudeSyncer {
             .entry("mcpServers")
             .or_insert_with(|| Value::Object(Default::default()));
         let map = ensure_object_mut(servers);
+        map.remove(LEGACY_CTENO_MEMORY_MCP_NAME);
         for spec in specs {
             map.insert(spec.name.clone(), mcp_to_json(spec));
         }

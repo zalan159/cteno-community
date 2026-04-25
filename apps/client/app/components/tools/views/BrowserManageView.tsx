@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, ActivityIndicator } from 'react-native';
+import { View } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolViewProps } from './_all';
@@ -54,7 +54,6 @@ export const BrowserManageView = React.memo<ToolViewProps>(({ tool }) => {
         return (
             <View style={styles.container}>
                 <View style={styles.row}>
-                    <ActivityIndicator size="small" />
                     <Text style={styles.runningText}>{label}...</Text>
                 </View>
             </View>

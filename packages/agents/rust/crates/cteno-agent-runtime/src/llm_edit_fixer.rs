@@ -93,6 +93,7 @@ Respond with JSON:
             2048,  // 足够的 token
             None,  // No streaming for edit fixer
             false, // No thinking for edit fixer
+            None,
         )
         .await?;
 

@@ -92,26 +92,29 @@ export interface Session {
         timestamp: number;
     } | null;
     contextTokens?: number;
+    contextWindowTokens?: number;
+    autoCompactTokenLimit?: number;
     compressionThreshold?: number;
     ownerSessionId?: string;
     // SSE streaming state: accumulates deltas for real-time display
     streamingText?: string;
     streamingThinking?: string;
+    streamingNotice?: string;
     promptSuggestions?: string[];
 }
 
 // ---------------------------------------------------------------------------
-// Vendor usage — machine-level rate-limit / quota snapshot.
+// Vendor quota — machine-level plan/rate-limit snapshot.
 //
-// Populated by the daemon's `cteno-host-usage-monitor`, pulled via the
-// `{machineId}:usage-read` RPC on a 60s frontend poll. Not session-scoped:
+// Populated by the daemon's `cteno-host-quota-monitor`, pulled via the
+// `{machineId}:quota-read` RPC on a 60s frontend poll. Not session-scoped:
 // every session with the same vendor shows the same data.
 // ---------------------------------------------------------------------------
 
-export type VendorUsageId = 'claude' | 'codex' | 'gemini';
-export type VendorUsageShape = 'windows' | 'buckets';
+export type VendorQuotaId = 'claude' | 'codex' | 'gemini';
+export type VendorQuotaShape = 'windows' | 'buckets';
 
-export interface UsageWindow {
+export interface QuotaWindow {
     usedPercent: number;     // 0-100, "已用"。UI 显示剩余时 = 100 - usedPercent
     resetsAt?: number;       // unix seconds
     windowDurationMins?: number;
@@ -119,7 +122,7 @@ export interface UsageWindow {
     limitType?: string;      // '5h' | '7d' | ...
 }
 
-export interface UsageBucket {
+export interface QuotaBucket {
     modelId: string;
     tokenType: string;       // 'REQUESTS' | 'TOKENS'
     usedPercent: number;     // 0-100
@@ -127,20 +130,20 @@ export interface UsageBucket {
     remainingAmount?: string;
 }
 
-export interface UsageCredits {
+export interface QuotaCredits {
     hasCredits: boolean;
     unlimited: boolean;
     balance?: string;
 }
 
-export interface VendorUsage {
-    provider: VendorUsageId;
-    shape: VendorUsageShape;
+export interface VendorQuota {
+    provider: VendorQuotaId;
+    shape: VendorQuotaShape;
     /** Present when shape === 'windows'. Keys like 'fiveHour', 'weekly', etc. */
-    windows?: Record<string, UsageWindow>;
+    windows?: Record<string, QuotaWindow>;
     /** Present when shape === 'buckets'. */
-    buckets?: UsageBucket[];
-    credits?: UsageCredits;
+    buckets?: QuotaBucket[];
+    credits?: QuotaCredits;
     planType?: string;
     primaryModel?: string;
     updatedAt: number;       // unix seconds
@@ -226,6 +229,13 @@ export interface Persona {
     continuousBrowsing: boolean;
     createdAt: string;
     updatedAt: string;
+}
+
+export interface PersonaProject {
+    machineId: string;
+    workdir: string;
+    createdAt: number;
+    updatedAt: number;
 }
 
 export interface PersonaTaskSummary {

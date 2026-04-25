@@ -20,6 +20,7 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 use crate::{
     schemas::{McpSpec, McpTransport, PersonaSpec, SkillSpec},
     syncer::{SyncReport, VendorSyncer},
+    vendors::LEGACY_CTENO_MEMORY_MCP_NAME,
 };
 
 pub struct CodexSyncer {
@@ -80,6 +81,7 @@ impl VendorSyncer for CodexSyncer {
             .as_table_mut()
             .context("`mcp_servers` is not a table")?;
 
+        servers_tbl.remove(LEGACY_CTENO_MEMORY_MCP_NAME);
         for spec in specs {
             let mut entry = Table::new();
             match &spec.transport {

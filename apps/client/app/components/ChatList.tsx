@@ -44,8 +44,9 @@ const StreamingBubble = React.memo((props: { sessionId: string }) => {
     const { theme } = useUnistyles();
     const streamingText = session?.streamingText;
     const streamingThinking = session?.streamingThinking;
+    const streamingNotice = session?.streamingNotice;
 
-    if (!streamingText && !streamingThinking) return null;
+    if (!streamingText && !streamingThinking && !streamingNotice) return null;
 
     return (
         <View style={streamingStyles.container}>
@@ -63,6 +64,11 @@ const StreamingBubble = React.memo((props: { sessionId: string }) => {
                 {streamingText ? (
                     <View style={streamingStyles.textContainer}>
                         <MarkdownView markdown={streamingText} />
+                    </View>
+                ) : null}
+                {streamingNotice ? (
+                    <View style={streamingStyles.textContainer}>
+                        <MarkdownView markdown={streamingNotice} />
                     </View>
                 ) : null}
             </View>

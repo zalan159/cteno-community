@@ -13,14 +13,14 @@ pub use workspace::*;
 
 pub use executor::{
     AgentCapabilities, AgentExecutor, AgentExecutorError, Attachment, AttachmentKind,
-    ConnectionHandle, ConnectionHandleId, ConnectionHealth, ConnectionSpec, DeltaKind, Effort,
-    EventStream, ExecutorEvent, ExecutorSemanticCapabilities, InjectedToolSpec, ModelChangeOutcome,
-    ModelSelectionLifecycle, ModelSpec, ModelSupport, NativeMessage, NativeSessionId,
-    NormalizedModelSpec, Pagination, PermissionAccessScope, PermissionDecision, PermissionMode,
-    PermissionModeKind, PermissionModeLifecycle, PermissionModeSemantics, PermissionModeSupport,
-    PermissionPromptBehavior, ProcessHandleToken, ResumeHints, SessionFilter, SessionInfo,
-    SessionMeta, SessionRecord, SessionRef, SessionStatusFilter, SessionStoreProvider,
-    SpawnSessionSpec, TokenUsage, UserMessage,
+    AutonomousTurnHandler, ConnectionHandle, ConnectionHandleId, ConnectionHealth, ConnectionSpec,
+    DeltaKind, Effort, EventStream, ExecutorEvent, ExecutorSemanticCapabilities, InjectedToolSpec,
+    ModelChangeOutcome, ModelSelectionLifecycle, ModelSpec, ModelSupport, NativeMessage,
+    NativeSessionId, NormalizedModelSpec, Pagination, PermissionAccessScope, PermissionDecision,
+    PermissionMode, PermissionModeKind, PermissionModeLifecycle, PermissionModeSemantics,
+    PermissionModeSupport, PermissionPromptBehavior, ProcessHandleToken, ResumeHints,
+    SessionFilter, SessionInfo, SessionMeta, SessionRecord, SessionRef, SessionStatusFilter,
+    SessionStoreProvider, SpawnSessionSpec, TokenUsage, UserMessage,
 };
 
 pub use session_protocol::*;

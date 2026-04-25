@@ -466,7 +466,11 @@ fn build_mcp_rpc_hooks() -> McpRpcHooks {
                 let server_id = config.id.clone();
                 let mut reg = mcp_reg.write().await;
                 match reg.add_server(config).await {
-                    Ok(_) => Ok(json!({ "success": true, "serverId": server_id })),
+                    Ok(_) => {
+                        drop(reg);
+                        reconcile_mcp_vendor_configs_after_mutation().await;
+                        Ok(json!({ "success": true, "serverId": server_id }))
+                    }
                     Err(e) => Ok(json!({ "success": false, "error": e })),
                 }
             })
@@ -487,7 +491,11 @@ fn build_mcp_rpc_hooks() -> McpRpcHooks {
                     .map_err(|e| format!("MCP registry not available: {}", e))?;
                 let mut reg = mcp_reg.write().await;
                 match reg.remove_server(&server_id).await {
-                    Ok(_) => Ok(json!({ "success": true })),
+                    Ok(_) => {
+                        drop(reg);
+                        reconcile_mcp_vendor_configs_after_mutation().await;
+                        Ok(json!({ "success": true }))
+                    }
                     Err(e) => Ok(json!({ "success": false, "error": e })),
                 }
             })
@@ -512,12 +520,27 @@ fn build_mcp_rpc_hooks() -> McpRpcHooks {
                     .map_err(|e| format!("MCP registry not available: {}", e))?;
                 let mut reg = mcp_reg.write().await;
                 match reg.toggle_server(&server_id, enabled).await {
-                    Ok(_) => Ok(json!({ "success": true })),
+                    Ok(_) => {
+                        drop(reg);
+                        reconcile_mcp_vendor_configs_after_mutation().await;
+                        Ok(json!({ "success": true }))
+                    }
                     Err(e) => Ok(json!({ "success": false, "error": e })),
                 }
             })
         }),
     }
+}
+
+async fn reconcile_mcp_vendor_configs_after_mutation() {
+    let db_path = match crate::local_services::agent_runtime_context() {
+        Ok(ctx) => ctx.db_path,
+        Err(err) => {
+            log::warn!("MCP mutation succeeded but agent runtime context is unavailable: {err}");
+            return;
+        }
+    };
+    crate::agent_sync_bridge::reconcile_mcp_now_from_db(&db_path).await;
 }
 
 #[derive(Clone)]
@@ -563,6 +586,81 @@ async fn spawn_local_persona_session(
         persona.id,
         persona.workdir
     );
+
+    Ok(session_id)
+}
+
+fn should_create_persona_session_in_background(agent_type: Option<&str>) -> bool {
+    match agent_type.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("cteno") | None => false,
+        Some(_) => true,
+    }
+}
+
+async fn bind_local_persona_session(
+    profile_store: Arc<RwLock<ProfileStore>>,
+    persona: &mut crate::persona::Persona,
+    agent_type: Option<&str>,
+    db_path: PathBuf,
+    machine_id: String,
+    attempt_id: String,
+) -> Result<String, String> {
+    let pending_session_id = persona.chat_session_id.clone();
+    let persona_id = persona.id.clone();
+    let vendor = agent_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("cteno")
+        .to_string();
+    let session_id = spawn_local_persona_session(profile_store, persona, agent_type).await?;
+
+    let pm = crate::local_services::persona_manager()?;
+    match pm.store().get_persona(&persona_id)? {
+        Some(current) if current.chat_session_id == pending_session_id => {}
+        Some(current) => {
+            if let Ok(spawn_config) = crate::local_services::spawn_config() {
+                if let Some(conn) = spawn_config.session_connections.remove(&session_id).await {
+                    conn.kill().await;
+                }
+            }
+            return Err(format!(
+                "Persona session binding stale: expected {}, found {}",
+                pending_session_id, current.chat_session_id
+            ));
+        }
+        None => {
+            if let Ok(spawn_config) = crate::local_services::spawn_config() {
+                if let Some(conn) = spawn_config.session_connections.remove(&session_id).await {
+                    conn.kill().await;
+                }
+            }
+            return Err(format!("Persona {} no longer exists", persona_id));
+        }
+    }
+
+    pm.store()
+        .update_chat_session_id(&persona_id, &session_id)?;
+    persona.chat_session_id = session_id.clone();
+
+    let session_payload = host_sessions::get_host_session(&db_path, &machine_id, &session_id)
+        .ok()
+        .flatten()
+        .and_then(|summary| serde_json::to_value(summary).ok());
+    let ready_session_id = session_id.clone();
+    tokio::spawn(async move {
+        cteno_host_runtime::events::emit(
+            cteno_host_runtime::events::HostEvent::PersonaSessionReady {
+                persona_id,
+                pending_session_id,
+                attempt_id,
+                vendor,
+                machine_id,
+                session_id: ready_session_id,
+                session: session_payload,
+            },
+        )
+        .await;
+    });
 
     Ok(session_id)
 }
@@ -638,9 +736,31 @@ async fn resolve_persona_model_selection_with_auth_state(
         };
     }
 
-    trimmed_profile_id
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| llm_profile::DEFAULT_PROXY_PROFILE.to_string())
+    if let Some(profile_id) = trimmed_profile_id {
+        if let Ok(models) = crate::commands::collect_vendor_models(agent_flavor).await {
+            if models.iter().any(|model| model.id == profile_id) {
+                return profile_id.to_owned();
+            }
+            if let Some(model_id) = models
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.id.clone())
+                .or_else(|| models.first().map(|model| model.id.clone()))
+            {
+                log::warn!(
+                    "Requested {} model '{}' is not advertised by the vendor; falling back to '{}'",
+                    agent_flavor,
+                    profile_id,
+                    model_id
+                );
+                return model_id;
+            }
+        }
+
+        return profile_id.to_owned();
+    }
+
+    llm_profile::DEFAULT_PROXY_PROFILE.to_string()
 }
 
 /// Happy Client Manager for Cteno Desktop
@@ -761,9 +881,14 @@ impl HappyClientManager {
         let prompt_options = system_prompt::PromptOptions::default();
         let system_prompt_text = system_prompt::build_system_prompt(&prompt_options);
         let rpc_methods = MachineRpcMethods::new(&machine_id);
-        if persisted_machine_auth.is_some() {
+        let cloud_session_sync_enabled = crate::session_sync_impl::cloud_session_sync_enabled();
+        if persisted_machine_auth.is_some() && cloud_session_sync_enabled {
             log::info!(
                 "Community runtime found cached machine auth; new sessions can attempt best-effort cloud upload without blocking local startup"
+            );
+        } else if persisted_machine_auth.is_some() {
+            log::info!(
+                "Community runtime found cached machine auth, but cloud session sync is disabled; new sessions will stay local-only"
             );
         } else {
             log::warn!(
@@ -1955,60 +2080,88 @@ impl HappyClientManager {
             )
             .await;
 
-        // list-subagents — direct SubAgentManager call
+        // list-subagents — query the SubAgent registry mirror that the
+        // cteno adapter populates from `Outbound::SubAgentLifecycle`
+        // events. The legacy desktop-local `crate::subagent::manager::global()`
+        // is intentionally NOT consulted: cteno-agent runs as a separate
+        // child process so its in-memory SubAgentManager is invisible to
+        // the host. The mirror is the canonical host-side view. We still
+        // fall back to `list_local_agent_sessions_as_subagents` (DB-based)
+        // for vendors that haven't migrated to the lifecycle wire.
         registry
             .register(&rpc_methods.list_subagents, {
                 let list_subagents_db_path = db_path_buf.clone();
                 move |params: Value| {
                     let list_subagents_db_path = list_subagents_db_path.clone();
                     async move {
-                        let result = {
-                            let manager = crate::subagent::manager::global();
+                        let status_str = params.get("status").and_then(|v| v.as_str());
+                        let status = status_str.and_then(|s| match s {
+                            "pending" => Some(crate::subagent::SubAgentStatus::Pending),
+                            "running" => Some(crate::subagent::SubAgentStatus::Running),
+                            "completed" => Some(crate::subagent::SubAgentStatus::Completed),
+                            "failed" => Some(crate::subagent::SubAgentStatus::Failed),
+                            "stopped" => Some(crate::subagent::SubAgentStatus::Stopped),
+                            "timed_out" => Some(crate::subagent::SubAgentStatus::TimedOut),
+                            _ => None,
+                        });
+                        let parent_session_id = params
+                            .get("parentSessionId")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let active_only = params
+                            .get("activeOnly")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
 
-                            let status_str = params.get("status").and_then(|v| v.as_str());
-                            let status = status_str.and_then(|s| match s {
-                                "pending" => Some(crate::subagent::SubAgentStatus::Pending),
-                                "running" => Some(crate::subagent::SubAgentStatus::Running),
-                                "completed" => Some(crate::subagent::SubAgentStatus::Completed),
-                                "failed" => Some(crate::subagent::SubAgentStatus::Failed),
-                                "stopped" => Some(crate::subagent::SubAgentStatus::Stopped),
-                                "timed_out" => Some(crate::subagent::SubAgentStatus::TimedOut),
-                                _ => None,
-                            });
-                            let parent_session_id = params
-                                .get("parentSessionId")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let active_only = params
-                                .get("activeOnly")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-
-                            let filter = crate::subagent::SubAgentFilter {
-                                parent_session_id,
-                                status,
-                                active_only,
-                            };
-                            let mut subagents = manager.list(filter).await;
-                            let local_subagents = list_local_agent_sessions_as_subagents(
-                                &list_subagents_db_path,
-                                status_str,
-                                params.get("parentSessionId").and_then(|v| v.as_str()),
-                                active_only,
+                        let filter = crate::subagent::SubAgentFilter {
+                            parent_session_id: parent_session_id.clone(),
+                            status,
+                            active_only,
+                        };
+                        log::info!(
+                            "[list_subagents] RPC called parentSessionId={:?} activeOnly={} status={:?}",
+                            parent_session_id,
+                            active_only,
+                            status_str
+                        );
+                        let mut subagents = if let Some(mirror) =
+                            crate::subagent_mirror::instance()
+                        {
+                            let out = mirror.list(filter);
+                            log::info!(
+                                "[list_subagents] mirror returned {} subagents for parentSessionId={:?}",
+                                out.len(),
+                                parent_session_id
                             );
-                            if !local_subagents.is_empty() {
-                                let existing_ids: std::collections::HashSet<String> =
-                                    subagents.iter().map(|item| item.id.clone()).collect();
-                                for local in local_subagents {
-                                    let local_id = local.id.clone();
-                                    if !existing_ids.contains(&local_id) {
-                                        subagents.push(local);
-                                    }
+                            out
+                        } else {
+                            log::warn!(
+                                "[list_subagents] SubAgent mirror not installed — returning empty for cteno path"
+                            );
+                            Vec::new()
+                        };
+
+                        // Legacy DB-based fallback for sessions whose
+                        // subagents aren't (yet) on the lifecycle wire.
+                        let local_subagents = list_local_agent_sessions_as_subagents(
+                            &list_subagents_db_path,
+                            status_str,
+                            parent_session_id.as_deref(),
+                            active_only,
+                        );
+                        if !local_subagents.is_empty() {
+                            let existing_ids: std::collections::HashSet<String> =
+                                subagents.iter().map(|item| item.id.clone()).collect();
+                            for local in local_subagents {
+                                let local_id = local.id.clone();
+                                if !existing_ids.contains(&local_id) {
+                                    subagents.push(local);
                                 }
                             }
-                            Ok::<Value, String>(serde_json::json!({ "subagents": subagents }))
-                        };
-                        result
+                        }
+                        Ok::<Value, String>(
+                            serde_json::json!({ "subagents": subagents }),
+                        )
                     }
                 }
             })
@@ -2811,13 +2964,17 @@ impl HappyClientManager {
             })
             .await;
 
-        // create-persona — creates persona and starts the local session runtime
-        // Uses async `register` so we can await session creation before returning
-        // the persona with a real (non-pending) chat_session_id.
+        // create-persona — creates the persona immediately and then binds the
+        // local session runtime via host lifecycle events. Non-Cteno vendors
+        // spawn in the background so the UI can enter the pending session page.
         let cp_profile_store = self.profile_store.clone();
+        let cp_db_path = db_path_buf.clone();
+        let cp_machine_id = machine_id.clone();
         registry
             .register(&rpc_method_create_persona, move |params: Value| {
                 let profile_store = cp_profile_store.clone();
+                let db_path = cp_db_path.clone();
+                let machine_id = cp_machine_id.clone();
                 async move {
                     let name = params
                         .get("name")
@@ -2880,47 +3037,113 @@ impl HappyClientManager {
                         Err(e) => return Ok(json!({ "success": false, "error": e })),
                     };
 
-                    // Await session creation so the persona returned to the frontend
-                    // has a real chat_session_id (not "pending-...").
-                    match spawn_local_persona_session(
-                        profile_store,
-                        &persona,
-                        agent_type.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(session_id) => {
-                            // Update the DB and our local copy
-                            if let Ok(pm) = crate::local_services::persona_manager() {
-                                let _ = pm.store().update_chat_session_id(&persona.id, &session_id);
-                            }
-                            persona.chat_session_id = session_id.clone();
-
-                            // Notify frontend (fire-and-forget)
-                            let persona_id = persona.id.clone();
-                            tokio::spawn(async move {
-                                if let Ok(socket) = crate::local_services::machine_socket() {
-                                    let payload = serde_json::json!({
-                                        "type": "hypothesis-push",
-                                        "agentId": persona_id,
-                                        "event": "persona_session_ready",
-                                    });
-                                    let _ = socket.emit("hypothesis-push", payload).await;
+                    if should_create_persona_session_in_background(agent_type.as_deref()) {
+                        let mut persona_for_spawn = persona.clone();
+                        let profile_store_for_spawn = profile_store.clone();
+                        let agent_type_for_spawn = agent_type.clone();
+                        let db_path_for_spawn = db_path.clone();
+                        let machine_id_for_spawn = machine_id.clone();
+                        let attempt_id = uuid::Uuid::new_v4().to_string();
+                        let response_attempt_id = attempt_id.clone();
+                        let pending_session_id = persona.chat_session_id.clone();
+                        tokio::spawn(async move {
+                            match bind_local_persona_session(
+                                profile_store_for_spawn,
+                                &mut persona_for_spawn,
+                                agent_type_for_spawn.as_deref(),
+                                db_path_for_spawn,
+                                machine_id_for_spawn.clone(),
+                                attempt_id.clone(),
+                            )
+                            .await
+                            {
+                                Ok(session_id) => log::info!(
+                                    "[Persona] Background local session ready: {} (persona: {})",
+                                    session_id,
+                                    persona_for_spawn.id
+                                ),
+                                Err(e) => {
+                                    log::error!(
+                                        "[Persona] Failed to create background local session for {}: {}",
+                                        persona_for_spawn.id,
+                                        e
+                                    );
+                                    cteno_host_runtime::events::emit(
+                                        cteno_host_runtime::events::HostEvent::PersonaSessionFailed {
+                                            persona_id: persona_for_spawn.id.clone(),
+                                            pending_session_id: persona_for_spawn.chat_session_id.clone(),
+                                            attempt_id,
+                                            vendor: agent_type_for_spawn
+                                                .as_deref()
+                                                .map(str::trim)
+                                                .filter(|value| !value.is_empty())
+                                                .unwrap_or("cteno")
+                                                .to_string(),
+                                            machine_id: machine_id_for_spawn,
+                                            error: e,
+                                        },
+                                    )
+                                    .await;
                                 }
-                            });
-                        }
-                        Err(e) => {
+                            }
+                        });
+                        return Ok(json!({
+                            "success": true,
+                            "persona": persona,
+                            "pendingSessionId": pending_session_id,
+                            "attemptId": response_attempt_id,
+                            "lifecycle": "creating",
+                        }));
+                    } else {
+                        let attempt_id = uuid::Uuid::new_v4().to_string();
+                        let pending_session_id = persona.chat_session_id.clone();
+                        let vendor = agent_type
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("cteno")
+                            .to_string();
+                        let bind_result = bind_local_persona_session(
+                            profile_store,
+                            &mut persona,
+                            agent_type.as_deref(),
+                            db_path,
+                            machine_id.clone(),
+                            attempt_id.clone(),
+                        )
+                        .await;
+                        if let Err(e) = bind_result {
                             log::error!(
                                 "[Persona] Failed to create local session for {}: {}",
                                 persona.id,
                                 e
                             );
+                            cteno_host_runtime::events::emit(
+                                cteno_host_runtime::events::HostEvent::PersonaSessionFailed {
+                                    persona_id: persona.id.clone(),
+                                    pending_session_id,
+                                    attempt_id,
+                                    vendor,
+                                    machine_id: machine_id.clone(),
+                                    error: e,
+                                },
+                            )
+                            .await;
                             // Return persona anyway — frontend will see pending- ID
-                            // and can retry or show an error
+                            // and can retry or show an error.
                         }
                     }
 
-                    Ok(json!({ "success": true, "persona": persona }))
+                    let lifecycle = if persona.chat_session_id.starts_with("pending-") {
+                        "creating"
+                    } else {
+                        "ready"
+                    };
+                    Ok(json!({
+                        "success": true,
+                        "persona": persona,
+                        "lifecycle": lifecycle,
+                    }))
                 }
             })
             .await;
@@ -3781,6 +4004,16 @@ mod tests {
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_123_456,
         }
+    }
+
+    #[test]
+    fn only_non_cteno_persona_session_creation_is_deferred() {
+        assert!(!should_create_persona_session_in_background(None));
+        assert!(!should_create_persona_session_in_background(Some("cteno")));
+        assert!(!should_create_persona_session_in_background(Some("  ")));
+        assert!(should_create_persona_session_in_background(Some("claude")));
+        assert!(should_create_persona_session_in_background(Some("gemini")));
+        assert!(should_create_persona_session_in_background(Some("codex")));
     }
 
     #[tokio::test]

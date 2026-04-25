@@ -27,8 +27,10 @@ import type { ModelOptionDisplay } from '@/sync/ops';
 import { Text } from '@/components/StyledText';
 import { LlmProfileList } from './LlmProfileList';
 import { EffortSelector, type RuntimeEffort } from './EffortSelector';
-import { UsagePopover } from './UsagePopover';
-import type { VendorUsageId } from '@/sync/storageTypes';
+import { QuotaPopover } from './QuotaPopover';
+import type { VendorQuotaId } from '@/sync/storageTypes';
+import type { Message } from '@/sync/typesMessage';
+import { PermissionRequestCard } from './tools/PermissionRequestCard';
 import {
     type PermissionMode,
     permissionModeLabel,
@@ -96,6 +98,7 @@ interface AgentInputProps {
     llmDefaultProfileId?: string;
     onLlmProfileChange?: (profileId: string) => void;
     runtimeEffort?: RuntimeEffort;
+    runtimeEffortLevels?: RuntimeEffort[];
     onRuntimeEffortChange?: (effort: RuntimeEffort) => void;
     activeSkillCount?: number;
     onSkillClick?: () => void;
@@ -103,6 +106,24 @@ interface AgentInputProps {
     onMcpClick?: () => void;
     activeRunCount?: number;
     onRunsClick?: () => void;
+    pendingPermission?: {
+        id: string;
+        tool: string;
+        arguments: any;
+        createdAt?: number | null;
+    } | null;
+    todoToggle?: {
+        completed: number;
+        total: number;
+        collapsed: boolean;
+        onPress: () => void;
+    } | null;
+    todos?: Array<{
+        content: string;
+        status: 'pending' | 'in_progress' | 'completed';
+        priority?: 'high' | 'medium' | 'low';
+        id?: string;
+    }> | null;
 }
 
 const MAX_CONTEXT_SIZE = 190000;
@@ -133,6 +154,69 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
         paddingRight: 8,
         paddingVertical: 4,
         minHeight: 40,
+    },
+    todoPanel: {
+        borderBottomWidth: 1,
+        borderBottomColor: theme.colors.divider,
+        paddingHorizontal: 8,
+        paddingVertical: 10,
+        gap: 7,
+    },
+    todoHeader: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
+    todoIcon: {
+        width: 24,
+        height: 24,
+        borderRadius: 12,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: theme.colors.surfacePressed,
+    },
+    todoTitle: {
+        flex: 1,
+        fontSize: 14,
+        fontWeight: '700',
+        color: theme.colors.text,
+        ...Typography.default('semiBold'),
+    },
+    todoCount: {
+        fontSize: 12,
+        color: theme.colors.textSecondary,
+        ...Typography.default(),
+    },
+    todoRows: {
+        gap: 5,
+    },
+    todoRow: {
+        flexDirection: 'row',
+        alignItems: 'flex-start',
+        gap: 8,
+    },
+    todoText: {
+        flex: 1,
+        fontSize: 12,
+        lineHeight: 17,
+        color: theme.colors.text,
+        ...Typography.default(),
+    },
+    todoTextCompleted: {
+        color: theme.colors.textSecondary,
+        textDecorationLine: 'line-through',
+    },
+    todoMore: {
+        fontSize: 12,
+        color: theme.colors.textSecondary,
+        paddingLeft: 22,
+        ...Typography.default(),
+    },
+    todoStatusButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 3,
+        flexShrink: 0,
     },
 
     // Overlay styles
@@ -322,6 +406,143 @@ const getContextWarning = (contextSize: number, alwaysShow: boolean = false, the
     return null; // No display needed
 };
 
+export type AgentInputTodo = NonNullable<AgentInputProps['todos']>[number];
+
+function isPlanToolName(name: string): boolean {
+    const normalized = name.trim().toLowerCase();
+    return normalized === 'update_plan' || normalized === 'update plan' || normalized === 'todowrite';
+}
+
+function planItemsFromInput(input: any): unknown {
+    return input?.todos ?? input?.newTodos ?? input?.items ?? input?.plan;
+}
+
+function normalizeTodos(rawTodos: unknown, messageId: string): AgentInputProps['todos'] | null {
+    if (!Array.isArray(rawTodos)) {
+        return null;
+    }
+    const todos: AgentInputTodo[] = rawTodos
+        .map((todo: any, index: number): AgentInputTodo | null => {
+            const content = typeof todo?.content === 'string'
+                ? todo.content
+                : typeof todo?.task === 'string'
+                    ? todo.task
+                    : typeof todo?.text === 'string'
+                        ? todo.text
+                        : typeof todo?.title === 'string'
+                            ? todo.title
+                            : typeof todo?.step === 'string'
+                                ? todo.step
+                                : '';
+            const rawStatus = typeof todo?.status === 'string' ? todo.status.trim().toLowerCase() : '';
+            const status = rawStatus === 'completed' || rawStatus === 'complete' || rawStatus === 'done'
+                ? 'completed'
+                : rawStatus === 'in_progress' || rawStatus === 'in-progress' || rawStatus === 'inprogress' || rawStatus === 'running'
+                    ? 'in_progress'
+                    : rawStatus === 'pending' || rawStatus === 'queued'
+                        ? 'pending'
+                : todo?.completed === true || todo?.done === true
+                    ? 'completed'
+                    : 'pending';
+            if (!content.trim()) {
+                return null;
+            }
+            return {
+                content,
+                status,
+                priority: todo?.priority === 'high' || todo?.priority === 'medium' || todo?.priority === 'low'
+                    ? todo.priority
+                    : 'medium',
+                id: typeof todo?.id === 'string' ? todo.id : `plan-${messageId}-${index}`,
+            };
+        })
+        .filter((todo: AgentInputTodo | null): todo is AgentInputTodo => todo !== null);
+    return todos.length > 0 ? todos : null;
+}
+
+function todosFromMessageTool(message: Message): AgentInputProps['todos'] | null {
+    if (message.kind !== 'tool-call' || !isPlanToolName(message.tool.name)) {
+        return null;
+    }
+    return normalizeTodos(planItemsFromInput(message.tool.input), message.id);
+}
+
+export function latestTodosFromMessages(messages: Message[]): AgentInputProps['todos'] | null {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const todos = todosFromMessageTool(messages[i]);
+        if (todos) {
+            return todos;
+        }
+    }
+    return null;
+}
+
+export const TodoInputPanel = React.memo((props: { todos: NonNullable<AgentInputProps['todos']> }) => {
+    const styles = stylesheet;
+    const { theme } = useUnistyles();
+    const visibleTodos = props.todos.slice(0, 6);
+    const completedCount = props.todos.filter(todo => todo.status === 'completed').length;
+    const remainingCount = props.todos.length - completedCount;
+
+    if (props.todos.length === 0) {
+        return null;
+    }
+
+    return (
+        <View style={styles.todoPanel}>
+            <View style={styles.todoHeader}>
+                <View style={styles.todoIcon}>
+                    <Ionicons name="list-outline" size={15} color={theme.colors.text} />
+                </View>
+                <Text style={styles.todoTitle} numberOfLines={1}>
+                    Todo List
+                </Text>
+                <Text style={styles.todoCount} numberOfLines={1}>
+                    {completedCount}/{props.todos.length}
+                </Text>
+            </View>
+            <View style={styles.todoRows}>
+                {visibleTodos.map((todo, index) => {
+                    const isCompleted = todo.status === 'completed';
+                    const isInProgress = todo.status === 'in_progress';
+                    const iconName = isCompleted
+                        ? 'checkmark-circle'
+                        : isInProgress
+                            ? 'radio-button-on'
+                            : 'ellipse-outline';
+                    const iconColor = isCompleted
+                        ? theme.colors.success
+                        : isInProgress
+                            ? theme.colors.status.default
+                            : theme.colors.textSecondary;
+
+                    return (
+                        <View key={todo.id || `${todo.content}-${index}`} style={styles.todoRow}>
+                            <Ionicons name={iconName} size={14} color={iconColor} style={{ marginTop: 1 }} />
+                            <Text
+                                style={[styles.todoText, isCompleted && styles.todoTextCompleted]}
+                                numberOfLines={2}
+                            >
+                                {todo.content}
+                            </Text>
+                        </View>
+                    );
+                })}
+                {props.todos.length > visibleTodos.length && (
+                    <Text style={styles.todoMore}>
+                        +{props.todos.length - visibleTodos.length} more
+                    </Text>
+                )}
+                {remainingCount === 0 && props.todos.length > 0 && (
+                    <Text style={styles.todoMore}>
+                        All done
+                    </Text>
+                )}
+            </View>
+        </View>
+    );
+});
+
 export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, AgentInputProps>((props, ref) => {
     const styles = stylesheet;
     const { theme } = useUnistyles();
@@ -335,7 +556,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     const isGemini = props.metadata?.flavor === 'gemini' || props.agentType === 'gemini';
     const metaVendor = props.metadata?.vendor?.trim().toLowerCase();
     const metaFlavor = props.metadata?.flavor?.trim().toLowerCase();
-    const usageVendor: VendorUsageId | null = (() => {
+    const quotaVendor: VendorQuotaId | null = (() => {
         // metadata.vendor is the authoritative executor vendor on both new
         // and legacy sessions; flavor + agentType cover older metadata and
         // the NewSessionWizard path where metadata hasn't been populated yet.
@@ -373,6 +594,8 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         : null;
 
     const agentInputEnterToSend = useSetting('agentInputEnterToSend');
+    const pendingPermission = props.pendingPermission ?? null;
+    const isPermissionBlocked = !!pendingPermission;
 
 
     // Abort button state
@@ -515,6 +738,10 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
             return true;
         }
 
+        if (isPermissionBlocked) {
+            return true;
+        }
+
         // Original key handling
         if (Platform.OS === 'web') {
             if (agentInputEnterToSend && event.key === 'Enter' && !event.shiftKey) {
@@ -535,7 +762,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
 
         }
         return false; // Key was not handled
-    }, [suggestions, moveUp, moveDown, selected, handleSuggestionSelect, props.showAbortButton, props.onAbort, isAborting, handleAbortPress, agentInputEnterToSend, props.value, props.onSend, props.permissionMode, props.onPermissionModeChange]);
+    }, [suggestions, moveUp, moveDown, selected, handleSuggestionSelect, props.showAbortButton, props.onAbort, isAborting, handleAbortPress, isPermissionBlocked, agentInputEnterToSend, props.value, props.onSend, props.permissionMode, props.onPermissionModeChange]);
 
 
 
@@ -635,6 +862,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                                         <View style={styles.overlayDivider} />
                                         <EffortSelector
                                             value={props.runtimeEffort || 'default'}
+                                            availableLevels={props.runtimeEffortLevels}
                                             onChange={(effort) => {
                                                 hapticsLight();
                                                 props.onRuntimeEffortChange?.(effort);
@@ -724,7 +952,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                 )}
 
                 {/* Connection status, context warning, and permission mode */}
-                {(props.connectionStatus || contextWarning || props.permissionMode) && (
+                {(props.connectionStatus || contextWarning || props.permissionMode || props.todoToggle) && (
                     <View style={{
                         flexDirection: 'row',
                         alignItems: 'center',
@@ -839,12 +1067,39 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                                     {(props.connectionStatus || contextWarning) ? '• ' : ''}context: {props.connectionStatus.compressionInfo.text}
                                 </Text>
                             )}
-                            {usageVendor && (
-                                <UsagePopover
+                            {quotaVendor && (
+                                <QuotaPopover
                                     machineId={props.metadata?.machineId ?? null}
-                                    vendor={usageVendor}
+                                    vendor={quotaVendor}
                                     preferredModelId={props.metadata?.modelId ?? null}
                                 />
+                            )}
+                            {props.todoToggle && (
+                                <Pressable
+                                    onPress={() => {
+                                        hapticsLight();
+                                        props.todoToggle?.onPress();
+                                    }}
+                                    hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                                    accessibilityLabel={props.todoToggle.collapsed ? '展开 todolist' : '收起 todolist'}
+                                    style={({ pressed }) => [
+                                        styles.todoStatusButton,
+                                        { opacity: pressed ? 0.6 : 1 },
+                                    ]}
+                                >
+                                    <Text style={{
+                                        fontSize: 11,
+                                        color: theme.colors.textSecondary,
+                                        ...Typography.default('semiBold'),
+                                    }}>
+                                        • Todo {props.todoToggle.completed}/{props.todoToggle.total}
+                                    </Text>
+                                    <Ionicons
+                                        name={props.todoToggle.collapsed ? 'chevron-up' : 'chevron-down'}
+                                        size={12}
+                                        color={theme.colors.textSecondary}
+                                    />
+                                </Pressable>
                             )}
                         </View>
                         <View style={{
@@ -987,6 +1242,14 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
 
                 {/* Box 2: Action Area (Input + Send) */}
                 <View style={styles.unifiedPanel}>
+                    {pendingPermission && props.sessionId && (
+                        <PermissionRequestCard
+                            sessionId={props.sessionId}
+                            pendingPermission={pendingPermission}
+                            metadata={props.metadata}
+                            variant="embedded"
+                        />
+                    )}
                     {/* Input field */}
                     <View style={[styles.inputContainer, props.minHeight ? { minHeight: props.minHeight } : undefined]}>
                         <MultiTextInput
@@ -999,6 +1262,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                             onKeyPress={handleKeyPress}
                             onStateChange={handleInputStateChange}
                             maxHeight={120}
+                            editable={!isPermissionBlocked}
                         />
                     </View>
 
@@ -1267,7 +1531,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                                 <View
                                     style={[
                                         styles.sendButton,
-                                        (hasText || props.isSending || (props.showAbortButton && !hasText))
+                                        (!isPermissionBlocked && (hasText || props.isSending || (props.showAbortButton && !hasText)))
                                             ? styles.sendButtonActive
                                             : styles.sendButtonInactive
                                     ]}
@@ -1312,7 +1576,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                                             hapticsLight();
                                             props.onSend();
                                         }}
-                                        disabled={!hasText || props.isSendDisabled || props.isSending}
+                                        disabled={!hasText || props.isSendDisabled || props.isSending || isPermissionBlocked}
                                     >
                                         {props.isSending ? (
                                             <ActivityIndicator

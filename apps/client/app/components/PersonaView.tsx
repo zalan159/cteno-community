@@ -14,15 +14,15 @@ import { AvatarPickerModal } from '@/components/AvatarPickerModal';
 import { usePersonas } from '@/hooks/usePersonas';
 import { useAgentWorkspaces } from '@/hooks/useAgentWorkspaces';
 import { usePersonaUnread } from '@/hooks/usePersonaUnread';
-import { useAllMachines, useAllSessions, useLocalSettingMutable, useSession } from '@/sync/storage';
-import { isMachineOnline } from '@/utils/machineUtils';
+import { storage, useAllMachines, useAllSessions, useCachedPersonaProjects, useLocalSettingMutable, useSession } from '@/sync/storage';
+import { resolveVisibleMachineId } from '@/utils/machineSelection';
 import { useIsTablet } from '@/utils/responsive';
 import { sync } from '@/sync/sync';
-import { machineBootstrapWorkspace, machineDeleteAgentWorkspace, machineListModels } from '@/sync/ops';
+import { machineBootstrapWorkspace, machineDeleteAgentWorkspace } from '@/sync/ops';
 import { layout } from '@/components/layout';
 import { UpdateBanner } from '@/components/UpdateBanner';
 import { t } from '@/text';
-import type { Persona } from '@/sync/storageTypes';
+import type { Persona, Session } from '@/sync/storageTypes';
 import { useScheduledTasks } from '@/hooks/useScheduledTasks';
 import { frontendLog } from '@/utils/tauri';
 import type { WorkspaceRoleVendorOverrides, WorkspaceTemplateId, VendorName } from '@/sync/ops';
@@ -40,6 +40,19 @@ function dirName(path: string): string {
 /** Group key for a persona — uses workdir or empty string for unlinked */
 function groupKey(persona: Persona): string {
     return persona.workdir?.trim() || '';
+}
+
+function parsePersonaTime(value: string | null | undefined): number | null {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function personaSortTime(persona: Persona, sessionMap: ReadonlyMap<string, Pick<Session, 'updatedAt'>>): number {
+    return sessionMap.get(persona.chatSessionId)?.updatedAt
+        ?? parsePersonaTime(persona.updatedAt)
+        ?? parsePersonaTime(persona.createdAt)
+        ?? 0;
 }
 
 function workspaceTemplateLabel(templateId: string | null | undefined): string | null {
@@ -104,6 +117,7 @@ function PersonaListItem({ persona, onPress, onDelete, onAvatarPress, isSelected
 
     // Preload messages for this persona's session
     React.useEffect(() => {
+        if (persona.chatSessionId.startsWith('pending-')) return;
         sync.onSessionVisible(persona.chatSessionId);
     }, [persona.chatSessionId]);
 
@@ -365,26 +379,10 @@ export const PersonaView = React.memo(() => {
     }, [isTablet, pathname]);
 
     // Use selected machine filter, fall back to auto-selection
-    const machineId = useMemo(() => {
-        // If a specific machine is selected in the filter, use it
-        if (selectedMachineIdFilter) {
-            return selectedMachineIdFilter;
-        }
-        // Fall back: try machines with sessions first
-        const machineIds = new Set<string>();
-        for (const session of sessions) {
-            const mid = session.metadata?.machineId;
-            if (mid) machineIds.add(mid);
-        }
-        for (const mid of machineIds) {
-            if (machines.some(m => m.id === mid && isMachineOnline(m))) {
-                return mid;
-            }
-        }
-        const online = machines.find(m => isMachineOnline(m));
-        if (online) return online.id;
-        return machines.length > 0 ? machines[0].id : undefined;
-    }, [selectedMachineIdFilter, machines, sessions]);
+    const machineId = useMemo(
+        () => resolveVisibleMachineId(selectedMachineIdFilter, machines, sessions),
+        [selectedMachineIdFilter, machines, sessions],
+    );
     const selectedMachine = useMemo(
         () => machines.find((machine) => machine.id === machineId),
         [machineId, machines]
@@ -393,6 +391,7 @@ export const PersonaView = React.memo(() => {
     const { personas: rawPersonas, loading, createPersona, deletePersona, updatePersona, refresh } = usePersonas({
         machineId,
     });
+    const persistedPersonaProjects = useCachedPersonaProjects();
     const { workspaces, refresh: refreshWorkspaces } = useAgentWorkspaces({ machineId });
 
     // Log when persona list first renders with data
@@ -417,17 +416,36 @@ export const PersonaView = React.memo(() => {
         return new Map(workspaces.map((workspace) => [workspace.persona.id, workspace]));
     }, [workspaces]);
 
-    // Sort personas (online first), then group by workdir
+    useEffect(() => {
+        if (!machineId) return;
+        const seenWorkdirs = new Set<string>();
+        for (const persona of rawPersonas) {
+            const workdir = groupKey(persona);
+            if (!workdir || seenWorkdirs.has(workdir)) continue;
+            seenWorkdirs.add(workdir);
+            storage.getState().upsertPersonaProject({ machineId, workdir });
+        }
+    }, [machineId, rawPersonas]);
+
+    // Sort newest activity first, then group by workdir.
     const projectGroups = useMemo(() => {
         const sessionMap = new Map(sessions.map(s => [s.id, s]));
         const sorted = [...rawPersonas].sort((a, b) => {
-            const aOnline = sessionMap.get(a.chatSessionId)?.presence === 'online' ? 0 : 1;
-            const bOnline = sessionMap.get(b.chatSessionId)?.presence === 'online' ? 0 : 1;
-            return aOnline - bOnline;
+            const byTime = personaSortTime(b, sessionMap) - personaSortTime(a, sessionMap);
+            return byTime || a.name.localeCompare(b.name);
         });
 
-        // Group by workdir
+        // Group by persisted project first, then attach existing persona chats.
         const groupMap = new Map<string, Persona[]>();
+        for (const project of persistedPersonaProjects) {
+            if (project.machineId !== machineId) continue;
+            const key = project.workdir.trim();
+            if (!key) continue;
+            if (!groupMap.has(key)) {
+                groupMap.set(key, []);
+            }
+        }
+
         for (const p of sorted) {
             const key = groupKey(p);
             const list = groupMap.get(key);
@@ -452,17 +470,17 @@ export const PersonaView = React.memo(() => {
             });
         }
 
-        // Sort groups: has online first, then alphabetical
+        // Sort groups by their newest persona activity; keep the unlinked group last.
         groups.sort((a, b) => {
-            if (a.hasOnline !== b.hasOnline) return a.hasOnline ? -1 : 1;
-            // Unlinked always last
             if (!a.key) return 1;
             if (!b.key) return -1;
-            return a.label.localeCompare(b.label);
+            const aLatest = Math.max(...a.personas.map((persona) => personaSortTime(persona, sessionMap)), 0);
+            const bLatest = Math.max(...b.personas.map((persona) => personaSortTime(persona, sessionMap)), 0);
+            return bLatest - aLatest || a.label.localeCompare(b.label);
         });
 
         return groups;
-    }, [rawPersonas, sessions]);
+    }, [machineId, persistedPersonaProjects, rawPersonas, sessions]);
 
     const toggleGroup = useCallback((key: string) => {
         setCollapsedGroups(prev => {
@@ -494,28 +512,27 @@ export const PersonaView = React.memo(() => {
 
     const handleQuickCreate = useCallback(async (workdir: string, agent?: VendorName) => {
         if (isCreating) return;
+        if (machineId) {
+            storage.getState().upsertPersonaProject({ machineId, workdir });
+        }
         setIsCreating(true);
         try {
-            let modelId: string | undefined;
-            if (machineId && agent && agent !== 'cteno') {
-                try {
-                    const result = await machineListModels(machineId, agent);
-                    modelId = result.defaultModelId || undefined;
-                } catch (error) {
-                    console.warn('[PersonaView] Failed to prefetch vendor default model:', error);
-                }
-            }
-            const persona = await createPersona({ workdir, agent, modelId });
+            const persona = await createPersona({ workdir, agent });
             if (persona?.id) {
-                // Refresh sessions so the persona's chatSessionId is in storage
-                // before we navigate to the persona detail page
-                await sync.refreshSessions();
+                if (!agent || agent === 'cteno') {
+                    await sync.refreshSessions();
+                }
                 router.push(`/persona/${persona.id}` as any);
             }
         } finally {
             setIsCreating(false);
         }
-    }, [createPersona, router, isCreating, machineId]);
+    }, [createPersona, machineId, router, isCreating]);
+
+    const handleCreateProject = useCallback(async (workdir: string) => {
+        if (!machineId) return;
+        storage.getState().upsertPersonaProject({ machineId, workdir });
+    }, [machineId]);
 
     const handleNewTaskWithVendor = useCallback((workdir: string = '~/') => {
         let modalId: string;
@@ -556,6 +573,13 @@ export const PersonaView = React.memo(() => {
     const handleDelete = useCallback(async (id: string) => {
         if (deletingPersonaIds.has(id)) return;
         const workspace = workspaceMap.get(id);
+        const persona = rawPersonas.find((item) => item.id === id);
+        if (machineId && persona) {
+            const workdir = groupKey(persona);
+            if (workdir) {
+                storage.getState().upsertPersonaProject({ machineId, workdir });
+            }
+        }
 
         setDeletingPersonaIds((prev) => {
             const next = new Set(prev);
@@ -586,10 +610,10 @@ export const PersonaView = React.memo(() => {
                 return next;
             });
         }
-    }, [deletePersona, deletingPersonaIds, machineId, refresh, refreshWorkspaces, workspaceMap]);
+    }, [deletePersona, deletingPersonaIds, machineId, rawPersonas, refresh, refreshWorkspaces, workspaceMap]);
 
     const handleDeleteProject = useCallback(async (group: ProjectGroup) => {
-        if (!group.key || group.personas.length === 0) return;
+        if (!group.key || !machineId) return;
 
         setDeletingProjectKeys((prev) => {
             const next = new Set(prev);
@@ -619,6 +643,7 @@ export const PersonaView = React.memo(() => {
                 }
             }
 
+            storage.getState().deletePersonaProject(machineId, group.key);
             await Promise.all([refresh(), refreshWorkspaces()]);
 
             if (failedCount > 0) {
@@ -715,8 +740,6 @@ export const PersonaView = React.memo(() => {
         );
     }
 
-    const allPersonas = projectGroups.flatMap(g => g.personas);
-
     return (
         <ItemList style={{ paddingTop: 0 }}>
             <UpdateBanner />
@@ -785,32 +808,6 @@ export const PersonaView = React.memo(() => {
                         {t('skills.title')}
                     </Text>
                 </Pressable>
-                {/* MCP servers — per-machine config, scoped to the currently selected machine */}
-                <Pressable
-                    onPress={() => machineId && router.push(`/settings/mcp?machineId=${machineId}` as any)}
-                    disabled={!machineId}
-                    style={({ pressed }) => ({
-                        flexDirection: 'row',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        paddingVertical: 10,
-                        borderRadius: 10,
-                        opacity: machineId ? 1 : 0.4,
-                        backgroundColor: pressed
-                            ? theme.colors.surfacePressed
-                            : theme.colors.surfaceHigh,
-                    })}
-                >
-                    <Ionicons name="git-network-outline" size={16} color={theme.colors.text} />
-                    <Text style={{
-                        fontSize: 14,
-                        color: theme.colors.text,
-                        marginLeft: 6,
-                        ...Typography.default('semiBold'),
-                    }}>
-                        {t('settings.mcp')}
-                    </Text>
-                </Pressable>
                 {/* Scheduled tasks — per-machine */}
                 <Pressable
                     onPress={() => machineId && router.push(`/settings/scheduled-tasks?machineId=${machineId}` as any)}
@@ -865,11 +862,11 @@ export const PersonaView = React.memo(() => {
                 </View>
             </View>
 
-            {loading && allPersonas.length === 0 ? (
+            {loading && projectGroups.length === 0 ? (
                 <View style={{ padding: 40, alignItems: 'center' }}>
                     <ActivityIndicator size="small" color={theme.colors.textSecondary} />
                 </View>
-            ) : allPersonas.length === 0 ? (
+            ) : projectGroups.length === 0 ? (
                 <View style={{
                     maxWidth: layout.maxWidth,
                     alignSelf: 'center',
@@ -920,7 +917,19 @@ export const PersonaView = React.memo(() => {
                                 />
                                 {!collapsed && (
                                     <View style={{ paddingLeft: 16 }}>
-                                        {renderPersonaSection(group.personas)}
+                                        {group.personas.length > 0 ? (
+                                            renderPersonaSection(group.personas)
+                                        ) : (
+                                            <View style={{ paddingHorizontal: 16, paddingVertical: 18 }}>
+                                                <Text style={{
+                                                    fontSize: 14,
+                                                    color: theme.colors.textSecondary,
+                                                    ...Typography.default(),
+                                                }}>
+                                                    {t('persona.noMessages')}
+                                                </Text>
+                                            </View>
+                                        )}
                                     </View>
                                 )}
                             </View>
@@ -935,9 +944,8 @@ export const PersonaView = React.memo(() => {
                 homeDir={selectedMachine?.metadata?.homeDir}
                 onClose={() => setShowNewProject(false)}
                 onCreate={async (workdir) => {
-                    // Close the project modal first, then show vendor selector
                     setShowNewProject(false);
-                    handleNewTaskWithVendor(workdir);
+                    await handleCreateProject(workdir);
                 }}
             />
 

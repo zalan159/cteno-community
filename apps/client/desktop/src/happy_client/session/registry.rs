@@ -83,6 +83,27 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Find a desktop session connection by the vendor-native session id held
+    /// inside its executor `SessionRef`. Used only for display/transport of
+    /// runtime-owned background ACP events, not for session progression.
+    pub async fn get_by_executor_session_id(
+        &self,
+        native_session_id: &str,
+    ) -> Option<(String, SessionConnection)> {
+        self.0
+            .lock()
+            .await
+            .iter()
+            .find(|(_, connection)| {
+                connection
+                    .session_ref
+                    .as_ref()
+                    .map(|session_ref| session_ref.id.as_str() == native_session_id)
+                    .unwrap_or(false)
+            })
+            .map(|(session_id, connection)| (session_id.clone(), connection.clone()))
+    }
+
     /// Check whether a session is registered.
     pub async fn contains_key(&self, session_id: &str) -> bool {
         self.0.lock().await.contains_key(session_id)

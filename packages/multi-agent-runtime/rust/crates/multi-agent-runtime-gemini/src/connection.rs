@@ -20,15 +20,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use multi_agent_runtime_core::{AgentExecutorError, ExecutorEvent};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::stream::{FrameKind, JsonRpcError, JsonRpcFrame, JsonRpcId};
@@ -57,21 +57,31 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 pub struct SessionState {
     pub events_tx: broadcast::Sender<ExecutorEvent>,
     pub pending_inbound: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// Best known active Gemini model for this session. Prompt responses may
+    /// refine this via `_meta.quota.model_usage`, but this gives us a
+    /// session-scoped hint before the first response arrives.
+    pub current_model: Mutex<Option<String>>,
     /// Most recently seen prompt request id (u64). Used to cancel the right
     /// in-flight turn on `interrupt`, although Gemini resolves it on its own
     /// in response to `session/cancel`.
     pub in_flight_prompt_id: Mutex<Option<JsonRpcId>>,
+    /// Number of permission requests that are blocking this session. Prompt
+    /// watchdogs must pause while this is non-zero because Gemini intentionally
+    /// moves the task into input-required until the user replies.
+    pub pending_permission_count: AtomicU64,
     /// Whether the session is still considered live inside the connection.
     pub alive: AtomicBool,
 }
 
 impl SessionState {
-    pub fn new() -> Self {
+    pub fn new(current_model: Option<String>) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
             events_tx,
             pending_inbound: Mutex::new(HashMap::new()),
+            current_model: Mutex::new(current_model),
             in_flight_prompt_id: Mutex::new(None),
+            pending_permission_count: AtomicU64::new(0),
             alive: AtomicBool::new(true),
         }
     }
@@ -274,8 +284,12 @@ impl GeminiAcpConnection {
             .map_err(|_| AgentExecutorError::Protocol("gemini writer channel closed".to_string()))
     }
 
-    pub async fn register_session(&self, session_id: String) -> Arc<SessionState> {
-        let state = Arc::new(SessionState::new());
+    pub async fn register_session(
+        &self,
+        session_id: String,
+        current_model: Option<String>,
+    ) -> Arc<SessionState> {
+        let state = Arc::new(SessionState::new(current_model));
         self.sessions
             .write()
             .await
@@ -530,11 +544,10 @@ async fn route_incoming_request(
                 JsonRpcId::String(s) => s.clone(),
             };
             let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
-            let tool_name = tool_call
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| "unknown".to_string());
+            let tool_name = gemini_tool_name(
+                tool_call.get("title").and_then(Value::as_str),
+                tool_call.get("kind").and_then(Value::as_str),
+            );
 
             // Stash an oneshot so respond_to_permission can fulfil it.
             let (reply_tx, reply_rx) = oneshot::channel::<Value>();
@@ -543,6 +556,9 @@ async fn route_incoming_request(
                 .lock()
                 .await
                 .insert(corr.clone(), reply_tx);
+            session
+                .pending_permission_count
+                .fetch_add(1, Ordering::SeqCst);
 
             // Bundle the full vendor payload for the UI. Frontend branches
             // on `_vendor="gemini"` and renders one button per entry in
@@ -580,6 +596,11 @@ async fn route_incoming_request(
                         }
                     }
                     Err(_) => {
+                        let _ = session.pending_permission_count.fetch_update(
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                            |count| Some(count.saturating_sub(1)),
+                        );
                         // Fallback — respond with cancelled so gemini proceeds.
                         let _ = reply_conn
                             .respond(&reply_id, json!({"outcome":{"outcome":"cancelled"}}))
@@ -644,12 +665,13 @@ async fn route_notification(conn: &GeminiAcpConnection, method: String, params: 
         Ok(crate::stream::SessionUpdate::ToolCall {
             tool_call_id,
             title,
+            kind,
             content,
             extra,
             ..
         }) => Some(ExecutorEvent::ToolCallStart {
             tool_use_id: tool_call_id,
-            name: title.unwrap_or_else(|| "unknown".to_string()),
+            name: gemini_tool_name(title.as_deref(), kind.as_deref()),
             input: content.unwrap_or_else(|| Value::Object(extra)),
             partial: false,
         }),
@@ -687,5 +709,34 @@ async fn route_notification(conn: &GeminiAcpConnection, method: String, params: 
 
     if let Some(event) = event {
         let _ = session.events_tx.send(event);
+    }
+}
+
+fn gemini_tool_name(title: Option<&str>, kind: Option<&str>) -> String {
+    [title, kind]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gemini_tool_name;
+
+    #[test]
+    fn tool_name_falls_back_to_kind_for_update_plan() {
+        assert_eq!(gemini_tool_name(None, Some("update_plan")), "update_plan");
+        assert_eq!(
+            gemini_tool_name(Some("update_plan"), Some("ignored")),
+            "update_plan"
+        );
+        assert_eq!(
+            gemini_tool_name(Some("  "), Some("update_plan")),
+            "update_plan"
+        );
     }
 }

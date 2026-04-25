@@ -48,7 +48,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use multi_agent_runtime_core::executor::ConnectionHandleId;
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
@@ -56,6 +55,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::protocol::{Inbound, Outbound};
+
+pub type BackgroundAcpSink = Arc<dyn Fn(String, serde_json::Value) + Send + Sync>;
 
 /// Capacity of the shared stdin writer channel. Producers (session worker
 /// tasks) push frames into this channel and the writer task serialises them
@@ -158,44 +159,41 @@ impl SessionRouter {
         guard.remove(session_id)
     }
 
-    async fn route(&self, session_id: &str, frame: Outbound) {
+    /// Returns `Ok(())` if the frame was routed to a registered session;
+    /// `Err(frame)` if no session is registered under that id (caller decides
+    /// whether to drop it or hand it to a fallback sink).
+    async fn route(&self, session_id: &str, frame: Outbound) -> Result<(), Outbound> {
         let sender = {
             let guard = self.entries.lock().await;
             guard.get(session_id).cloned()
         };
-        match sender {
-            Some(tx) => {
-                // `try_send` first so a slow consumer never blocks the demuxer
-                // — slow consumers only starve themselves, never the
-                // connection. If full, spawn a bounded-timeout send so we
-                // don't silently drop a frame.
-                if let Err(err) = tx.try_send(frame) {
-                    match err {
-                        mpsc::error::TrySendError::Full(frame) => {
-                            log::warn!("cteno session {} backpressured; awaiting slot", session_id);
-                            if let Err(_e) = timeout(Duration::from_secs(2), tx.send(frame)).await {
-                                log::warn!(
-                                    "cteno session {} backpressure timeout; frame dropped",
-                                    session_id
-                                );
-                            }
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
-                            log::debug!(
-                                "cteno session {} channel closed; dropping frame",
-                                session_id
-                            );
-                        }
+        let Some(tx) = sender else {
+            return Err(frame);
+        };
+        // `try_send` first so a slow consumer never blocks the demuxer
+        // — slow consumers only starve themselves, never the
+        // connection. If full, spawn a bounded-timeout send so we
+        // don't silently drop a frame.
+        if let Err(err) = tx.try_send(frame) {
+            match err {
+                mpsc::error::TrySendError::Full(frame) => {
+                    log::warn!("cteno session {} backpressured; awaiting slot", session_id);
+                    if let Err(_e) = timeout(Duration::from_secs(2), tx.send(frame)).await {
+                        log::warn!(
+                            "cteno session {} backpressure timeout; frame dropped",
+                            session_id
+                        );
                     }
                 }
-            }
-            None => {
-                log::warn!(
-                    "cteno-agent emitted frame for unknown session_id={} — dropping",
-                    session_id
-                );
+                mpsc::error::TrySendError::Closed(_) => {
+                    log::debug!(
+                        "cteno session {} channel closed; dropping frame",
+                        session_id
+                    );
+                }
             }
         }
+        Ok(())
     }
 
     /// Drain every registered sender, closing all per-session channels.
@@ -245,7 +243,10 @@ impl CtenoConnection {
     /// Takes ownership of the stdio handles so the caller cannot race with
     /// the connection's internal tasks. Does NOT send any protocol frames —
     /// sessions are attached via `register_session` after this returns.
-    pub fn start(mut child: Child) -> Result<Arc<Self>, String> {
+    pub fn start(
+        mut child: Child,
+        background_acp_sink: Option<BackgroundAcpSink>,
+    ) -> Result<Arc<Self>, String> {
         let pid = child.id().map(|p| p as i32);
         let stdin = child
             .stdin
@@ -267,7 +268,7 @@ impl CtenoConnection {
         let writer_handle = tokio::spawn(writer_task(stdin, writer_rx));
 
         let router_for_demux = router.clone();
-        let demux_handle = tokio::spawn(demux_task(stdout, router_for_demux));
+        let demux_handle = tokio::spawn(demux_task(stdout, router_for_demux, background_acp_sink));
 
         let stderr_tail_for_task = stderr_tail.clone();
         let stderr_handle = tokio::spawn(stderr_task(stderr, stderr_tail_for_task));
@@ -463,7 +464,11 @@ async fn writer_task(mut stdin: ChildStdin, mut rx: mpsc::Receiver<WriterCmd>) {
 }
 
 /// Demux task: reads JSON-lines from stdout and routes each by session_id.
-async fn demux_task(stdout: ChildStdout, router: Arc<SessionRouter>) {
+async fn demux_task(
+    stdout: ChildStdout,
+    router: Arc<SessionRouter>,
+    background_acp_sink: Option<BackgroundAcpSink>,
+) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     loop {
@@ -485,7 +490,36 @@ async fn demux_task(stdout: ChildStdout, router: Arc<SessionRouter>) {
                 match serde_json::from_str::<Outbound>(trimmed) {
                     Ok(frame) => {
                         let session_id = outbound_session_id(&frame).to_string();
-                        router.route(&session_id, frame).await;
+                        if let Err(unrouted) = router.route(&session_id, frame).await {
+                            // Unknown session_id. The common case here is a
+                            // subagent-tagged Acp frame: the subagent runs
+                            // inside cteno-agent and its
+                            // `acp_sender_factory` stamps frames with the
+                            // subagent's own session_id (which equals
+                            // `SubAgent.id` — never registered with the
+                            // demux router because the subagent doesn't have
+                            // its own AgentExecutor session). Route those to
+                            // the fallback sink so desktop can persist them
+                            // under the subagent's `agent_sessions` row.
+                            // Anything else is dropped with a warning.
+                            if let Outbound::Acp {
+                                session_id, data, ..
+                            } = unrouted
+                            {
+                                if let Some(sink) = background_acp_sink.as_ref() {
+                                    sink(session_id, data);
+                                } else {
+                                    log::warn!(
+                                        "cteno-agent emitted Acp for unknown session and no fallback sink installed — dropping"
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "cteno-agent emitted non-Acp frame for unknown session_id={} — dropping",
+                                    session_id
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         log::warn!("cteno-agent outbound frame parse error: {e}; raw={trimmed}");
@@ -526,20 +560,16 @@ async fn stderr_task(stderr: ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) {
 fn outbound_session_id(frame: &Outbound) -> &str {
     match frame {
         Outbound::Ready { session_id } => session_id,
-        Outbound::Delta { session_id, .. } => session_id,
-        Outbound::ToolUse { session_id, .. } => session_id,
-        Outbound::ToolResult { session_id, .. } => session_id,
+        Outbound::Acp { session_id, .. } => session_id,
         Outbound::PermissionRequest { session_id, .. } => session_id,
         Outbound::ToolExecutionRequest { session_id, .. } => session_id,
         Outbound::TurnComplete { session_id, .. } => session_id,
         Outbound::Error { session_id, .. } => session_id,
         Outbound::HostCallRequest { session_id, .. } => session_id,
+        Outbound::AutonomousTurnStart { session_id, .. } => session_id,
+        Outbound::SubAgentLifecycle { session_id, .. } => session_id,
     }
 }
-
-// Re-export internal protocol types through a helper module so tests and the
-// adapter can use `crate::protocol::Inbound` / `Outbound` consistently.
-pub use crate::protocol::Outbound as OutboundEvent;
 
 /// Helper: receive the `Ready` frame for a session, returning Err on any
 /// other matching-session Error / unexpected frame, or on channel close.

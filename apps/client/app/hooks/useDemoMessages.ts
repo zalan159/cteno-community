@@ -27,6 +27,7 @@ export function useDemoMessages(messages: Message[]) {
                     taskLifecycle: {},
                     reducerState: createReducer(),
                     isLoaded: true,
+                    isSyncing: false,
                     hasOlderMessages: false,
                     isLoadingOlder: false,
                 }

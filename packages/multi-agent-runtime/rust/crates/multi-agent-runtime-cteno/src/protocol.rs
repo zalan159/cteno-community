@@ -19,6 +19,33 @@ pub struct InjectedToolWire {
     pub input_schema: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpDeliveryWire {
+    Transient,
+    Persisted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKindWire {
+    Image,
+    Text,
+    File,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachmentWire {
+    pub kind: AttachmentKindWire,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
 /// Messages the host writes to cteno-agent's stdin. Matches
 /// `cteno-agent-stdio::protocol::Inbound`.
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +55,8 @@ pub enum Inbound {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         workdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_directories: Vec<String>,
         #[serde(default)]
         agent_config: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,8 +73,17 @@ pub enum Inbound {
     UserMessage {
         session_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentWire>,
     },
     Abort {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    CloseSession {
         session_id: String,
     },
     SetModel {
@@ -105,6 +143,18 @@ pub struct UsageWire {
     pub cache_read_input_tokens: u32,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContextUsageWire {
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub raw_max_tokens: u32,
+    #[serde(default)]
+    pub auto_compact_token_limit: u32,
+}
+
 /// Messages cteno-agent writes to stdout.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -113,23 +163,10 @@ pub enum Outbound {
     Ready {
         session_id: String,
     },
-    Delta {
+    Acp {
         session_id: String,
-        kind: String,
-        content: String,
-    },
-    ToolUse {
-        session_id: String,
-        tool_use_id: String,
-        name: String,
-        input: Value,
-    },
-    ToolResult {
-        session_id: String,
-        tool_use_id: String,
-        output: String,
-        #[serde(default)]
-        is_error: bool,
+        delivery: AcpDeliveryWire,
+        data: Value,
     },
     PermissionRequest {
         session_id: String,
@@ -149,6 +186,8 @@ pub enum Outbound {
         iteration_count: usize,
         #[serde(default)]
         usage: UsageWire,
+        #[serde(default)]
+        context_usage: Option<ContextUsageWire>,
     },
     Error {
         session_id: String,
@@ -160,5 +199,66 @@ pub enum Outbound {
         hook_name: String,
         method: String,
         params: Value,
+    },
+    AutonomousTurnStart {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+        /// Synthetic user-message text the agent will feed into the new turn
+        /// (e.g. concatenated `[Task Complete] X\n\n result` blocks for
+        /// queued subagent handoffs). Mirrors the field added on the stdio
+        /// crate's wire enum; carried through the dispatcher into the
+        /// host-side autonomous_turn_handler so the host can render it in
+        /// the persona transcript before the turn's assistant frames begin.
+        #[serde(default)]
+        synthetic_user_message: Option<String>,
+    },
+    /// SubAgent lifecycle transition emitted by the agent's
+    /// `SubAgentManager`. Mirror of the stdio crate's variant; routed by
+    /// the dispatcher to `SessionEventSink::on_subagent_lifecycle` so the
+    /// host can update its SubAgent registry mirror and trigger a UI
+    /// refresh (BackgroundRunsModal).
+    SubAgentLifecycle {
+        session_id: String,
+        event: SubAgentLifecycleEventWire,
+    },
+}
+
+/// Wire representation of subagent lifecycle events. Mirror of the stdio
+/// crate's `SubAgentLifecycleEvent` — kept here so the adapter doesn't
+/// need to depend on the stdio crate just for the types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubAgentLifecycleEventWire {
+    Spawned {
+        subagent_id: String,
+        agent_id: String,
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        created_at_ms: i64,
+    },
+    Started {
+        subagent_id: String,
+        started_at_ms: i64,
+    },
+    Updated {
+        subagent_id: String,
+        iteration_count: u32,
+    },
+    Completed {
+        subagent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        completed_at_ms: i64,
+    },
+    Failed {
+        subagent_id: String,
+        error: String,
+        completed_at_ms: i64,
+    },
+    Stopped {
+        subagent_id: String,
+        completed_at_ms: i64,
     },
 }

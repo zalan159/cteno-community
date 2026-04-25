@@ -1,7 +1,15 @@
 ---
+id: pptx
 name: pptx-generator
+version: "1.0"
 description: "Generate, edit, and read PowerPoint presentations. Create from scratch with PptxGenJS (cover, TOC, content, section divider, summary slides), edit existing PPTX via XML workflows, or extract text with markitdown. Triggers: PPT, PPTX, PowerPoint, presentation, slide, deck, slides."
 license: MIT
+when_to_use: "Use when the user asks to create, edit, read, analyze, or reformat a PowerPoint deck, PPT, PPTX, presentation, slides, or slide deck."
+tags:
+  - pptx
+  - powerpoint
+  - presentation
+  - productivity
 metadata:
   version: "1.0"
   category: productivity

@@ -1,6 +1,14 @@
 ---
+id: docx
 name: minimax-docx
+version: "1.0.0"
 license: MIT
+when_to_use: "Use when the user wants to create, edit, fill, reformat, validate, or convert a Word document or any printable/formal document whose final output should be .docx."
+tags:
+  - docx
+  - word
+  - document-processing
+  - openxml
 metadata:
   version: "1.0.0"
   category: document-processing

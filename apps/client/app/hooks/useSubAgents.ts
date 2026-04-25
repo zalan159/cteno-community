@@ -106,6 +106,24 @@ export function useSubAgents(options: UseSubAgentsOptions): UseSubAgentsReturn {
         return () => clearInterval(timer);
     }, [machineId, hasActiveSubAgents, pollingInterval, fetchSubagents]);
 
+    // Real-time push from cteno-agent's SubAgentManager → Rust subagent_mirror
+    // → `local-session:subagents-updated` Tauri event → `cteno:subagents-updated`
+    // window event (set up in `sync.ts`). Triggers an immediate refresh
+    // so DAG subagents appear in BackgroundRunsModal the instant they
+    // spawn / transition / complete, without waiting for the polling tick.
+    useEffect(() => {
+        if (!machineId || typeof window === 'undefined') return;
+        const handler = (e: Event) => {
+            const detail = (e as CustomEvent<{ sessionId?: string }>).detail;
+            if (detail?.sessionId && detail.sessionId !== sessionId) {
+                return;
+            }
+            void fetchSubagents();
+        };
+        window.addEventListener('cteno:subagents-updated', handler);
+        return () => window.removeEventListener('cteno:subagents-updated', handler);
+    }, [machineId, sessionId, fetchSubagents]);
+
     return {
         subagents,
         loading,

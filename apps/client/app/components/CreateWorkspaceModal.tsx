@@ -254,6 +254,7 @@ export const CreateWorkspaceModal: React.FC<CreateWorkspaceModalProps> = ({
                         backgroundColor: theme.colors.surface,
                         borderTopLeftRadius: 20,
                         borderTopRightRadius: 20,
+                        maxHeight: '80%',
                         padding: 16,
                         gap: 16,
                     }}
@@ -290,7 +291,8 @@ export const CreateWorkspaceModal: React.FC<CreateWorkspaceModalProps> = ({
                     </View>
 
                     <ScrollView
-                        showsVerticalScrollIndicator={false}
+                        style={{ flexShrink: 1 }}
+                        showsVerticalScrollIndicator
                         contentContainerStyle={{ gap: 16, paddingBottom: 16 }}
                     >
                         <View style={{ gap: 8 }}>

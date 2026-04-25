@@ -11,7 +11,47 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::{sleep, timeout, Duration};
+
+const VENDOR_MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(12);
+const PROCESS_GROUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
+#[cfg(unix)]
+fn place_in_own_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn place_in_own_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+async fn kill_process_group(pid: u32) {
+    let group = format!("-{pid}");
+    let _ = Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg(&group)
+        .status()
+        .await;
+    sleep(PROCESS_GROUP_SHUTDOWN_GRACE).await;
+    let _ = Command::new("/bin/kill")
+        .arg("-KILL")
+        .arg(&group)
+        .status()
+        .await;
+}
+
+#[cfg(not(unix))]
+async fn kill_process_group(_pid: u32) {}
+
+async fn terminate_child_group(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        kill_process_group(pid).await;
+    } else {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
 
 /// Capability flags consumed by the RN UI (`AgentCapabilities` in
 /// `apps/client/app/sync/ops.ts`). Values are serialised as camelCase.
@@ -503,6 +543,25 @@ async fn wait_json_rpc_response(
     }
 }
 
+async fn wait_json_rpc_response_with_timeout(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    expected_id: u64,
+    operation: &str,
+) -> Result<Value, String> {
+    timeout(
+        VENDOR_MODEL_LIST_TIMEOUT,
+        wait_json_rpc_response(stdin, stdout, expected_id),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "{operation} timed out after {}s",
+            VENDOR_MODEL_LIST_TIMEOUT.as_secs()
+        )
+    })?
+}
+
 fn codex_model_from_value(value: &Value) -> Option<VendorModelInfoDto> {
     let model = value
         .get("model")
@@ -568,14 +627,75 @@ fn codex_model_from_value(value: &Value) -> Option<VendorModelInfoDto> {
     })
 }
 
+fn parse_simple_toml_string_value(line: &str, key: &str) -> Option<String> {
+    let (candidate_key, raw_value) = line.split_once('=')?;
+    if candidate_key.trim() != key {
+        return None;
+    }
+
+    let value = raw_value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.split_once('"').map(|(value, _)| value))
+        .unwrap_or_else(|| value.split('#').next().unwrap_or(value).trim());
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_codex_config_model(raw: &str) -> Option<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .find_map(|line| parse_simple_toml_string_value(line, "model"))
+}
+
+fn read_codex_config_model(home_dir: Option<&Path>) -> Option<String> {
+    let home_dir = home_dir?;
+    let raw = std::fs::read_to_string(home_dir.join(".codex").join("config.toml")).ok()?;
+    parse_codex_config_model(&raw)
+}
+
+fn apply_codex_configured_default(
+    mut models: Vec<VendorModelInfoDto>,
+    configured_model: Option<String>,
+) -> Vec<VendorModelInfoDto> {
+    let Some(configured_model) = configured_model else {
+        return models;
+    };
+    let configured_model = configured_model.trim();
+    if configured_model.is_empty()
+        || !models
+            .iter()
+            .any(|model| model.id == configured_model || model.model == configured_model)
+    {
+        return models;
+    }
+
+    for model in models.iter_mut() {
+        model.is_default = model.id == configured_model || model.model == configured_model;
+    }
+    models
+}
+
 async fn collect_codex_models() -> Result<Vec<VendorModelInfoDto>, String> {
-    let mut child = Command::new("codex")
+    let codex_path = crate::executor_registry::resolve_codex_path()
+        .ok_or_else(|| "Codex CLI not installed on this host".to_string())?;
+    let mut command = Command::new(codex_path);
+    command
         .arg("app-server")
         .arg("--listen")
         .arg("stdio://")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    place_in_own_process_group(&mut command);
+    command.kill_on_drop(true);
+
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to spawn codex app-server: {e}"))?;
     let mut stdin = child
@@ -588,44 +708,62 @@ async fn collect_codex_models() -> Result<Vec<VendorModelInfoDto>, String> {
         .ok_or_else(|| "Codex app-server missing stdout".to_string())?;
     let mut stdout_reader = BufReader::new(stdout);
 
-    write_json_rpc_request(
-        &mut stdin,
-        1,
-        "initialize",
-        json!({
-            "clientInfo": {
-                "name": "cteno-desktop",
-                "title": "cteno-desktop",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "capabilities": {
-                "experimentalApi": true,
-            },
-        }),
-    )
-    .await?;
-    let _ = wait_json_rpc_response(&mut stdin, &mut stdout_reader, 1).await?;
-    write_json_rpc_notification(&mut stdin, "initialized", Value::Null).await?;
-    write_json_rpc_request(
-        &mut stdin,
-        2,
-        "model/list",
-        json!({
-            "limit": 100,
-            "includeHidden": false,
-        }),
-    )
-    .await?;
-    let result = wait_json_rpc_response(&mut stdin, &mut stdout_reader, 2).await?;
-    let _ = child.kill().await;
+    let result = async {
+        write_json_rpc_request(
+            &mut stdin,
+            1,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "cteno-desktop",
+                    "title": "cteno-desktop",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            }),
+        )
+        .await?;
+        let _ = wait_json_rpc_response_with_timeout(
+            &mut stdin,
+            &mut stdout_reader,
+            1,
+            "codex model initialize",
+        )
+        .await?;
+        write_json_rpc_notification(&mut stdin, "initialized", Value::Null).await?;
+        write_json_rpc_request(
+            &mut stdin,
+            2,
+            "model/list",
+            json!({
+                "limit": 100,
+                "includeHidden": false,
+            }),
+        )
+        .await?;
+        wait_json_rpc_response_with_timeout(&mut stdin, &mut stdout_reader, 2, "codex model/list")
+            .await
+    }
+    .await;
 
-    Ok(result
+    drop(stdin);
+    drop(stdout_reader);
+    terminate_child_group(&mut child).await;
+    let result = result?;
+
+    let models = result
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(codex_model_from_value)
-        .collect())
+        .collect();
+    Ok(apply_codex_configured_default(
+        models,
+        read_codex_config_model(current_home_dir().as_deref()),
+    ))
 }
 
 fn claude_sdk_script() -> &'static str {
@@ -714,16 +852,32 @@ async fn collect_claude_models() -> Result<Vec<VendorModelInfoDto>, String> {
     let package_dir = multi_agent_runtime_package_dir().ok_or_else(|| {
         "Unable to locate packages/multi-agent-runtime for Claude SDK".to_string()
     })?;
-    let output = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .arg("--input-type=module")
         .arg("-e")
         .arg(claude_sdk_script())
         .current_dir(&package_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
+        .stderr(Stdio::piped());
+    place_in_own_process_group(&mut command);
+    command.kill_on_drop(true);
+    let child = command
+        .spawn()
         .map_err(|e| format!("Failed to invoke Claude SDK via node: {e}"))?;
+    let child_pid = child.id();
+    let output = match timeout(VENDOR_MODEL_LIST_TIMEOUT, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|e| format!("Failed to invoke Claude SDK via node: {e}"))?,
+        Err(_) => {
+            if let Some(pid) = child_pid {
+                kill_process_group(pid).await;
+            }
+            return Err(format!(
+                "Claude SDK model listing timed out after {}s",
+                VENDOR_MODEL_LIST_TIMEOUT.as_secs()
+            ));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -905,6 +1059,63 @@ mod tests {
     use super::*;
     use crate::headless_auth::{save_account_auth, HeadlessAccountAuth};
     use tempfile::tempdir;
+
+    #[test]
+    fn codex_config_model_parser_reads_current_default() {
+        assert_eq!(
+            parse_codex_config_model(
+                r#"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
+"#
+            ),
+            Some("gpt-5.5".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_configured_default_only_marks_advertised_models() {
+        let models = vec![
+            VendorModelInfoDto {
+                id: "gpt-5.4".to_string(),
+                model: "gpt-5.4".to_string(),
+                display_name: "gpt-5.4".to_string(),
+                description: None,
+                vendor: "codex".to_string(),
+                api_format: "openai",
+                is_default: true,
+                default_reasoning_effort: Some("medium".to_string()),
+                supported_reasoning_efforts: vec!["medium".to_string(), "high".to_string()],
+                supports_vision: true,
+                supports_computer_use: false,
+            },
+            VendorModelInfoDto {
+                id: "gpt-5.5".to_string(),
+                model: "gpt-5.5".to_string(),
+                display_name: "GPT-5.5".to_string(),
+                description: None,
+                vendor: "codex".to_string(),
+                api_format: "openai",
+                is_default: false,
+                default_reasoning_effort: Some("medium".to_string()),
+                supported_reasoning_efforts: vec!["medium".to_string(), "high".to_string()],
+                supports_vision: true,
+                supports_computer_use: false,
+            },
+        ];
+
+        let merged = apply_codex_configured_default(models, Some("gpt-5.5".to_string()));
+
+        assert!(!merged[0].is_default);
+        assert!(merged[1].is_default);
+        assert_eq!(
+            apply_codex_configured_default(merged, Some("gpt-5.6".to_string()))
+                .iter()
+                .filter(|model| model.is_default)
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn codex_auth_probe_reads_auth_json_shape() {

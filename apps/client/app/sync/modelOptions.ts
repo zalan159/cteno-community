@@ -1,7 +1,8 @@
 import type { PublicProxyModel } from './apiBalance';
 import type { ModelOptionDisplay } from './ops';
+import type { RuntimeEffort } from './storageTypes';
 
-const DEFAULT_COMPRESS_MODEL_ID = 'deepseek-chat';
+const DEFAULT_COMPRESS_MODEL_ID = 'deepseek-v4-flash';
 
 function getCompressModelId(models: PublicProxyModel[]): string {
     return models.find(model => model.isCompressModel)?.id || DEFAULT_COMPRESS_MODEL_ID;
@@ -16,6 +17,17 @@ function normalizeApiFormat(
     return 'anthropic';
 }
 
+function inferSupportedReasoningEfforts(modelId: string, thinking?: boolean): RuntimeEffort[] {
+    const normalized = modelId.trim().toLowerCase();
+    if (!thinking) {
+        return ['default'];
+    }
+    if (normalized.includes('deepseek-v4')) {
+        return ['default', 'high', 'max'];
+    }
+    return ['default', 'high', 'max'];
+}
+
 export function buildModelOptionFromProxyModel(
     model: PublicProxyModel,
     compressModelId: string
@@ -28,6 +40,8 @@ export function buildModelOptionFromProxyModel(
         supportsVision: model.supportsVision === true,
         supportsComputerUse: model.supportsComputerUse === true,
         apiFormat: normalizeApiFormat(model.apiFormat),
+        thinking: model.thinking === true,
+        supportedReasoningEfforts: inferSupportedReasoningEfforts(model.id, model.thinking === true),
         chat: {
             api_key_masked: '',
             base_url: '',
@@ -80,4 +94,15 @@ export function mergeModelsWithServerProxyModels(
 
     const customModels = models.filter(model => !model.isProxy);
     return [...mergedProxyModels, ...customModels];
+}
+
+export function filterProxyModelsForAuth(
+    models: ModelOptionDisplay[],
+    includeProxyModels: boolean
+): ModelOptionDisplay[] {
+    if (includeProxyModels) {
+        return models;
+    }
+
+    return models.filter(model => model.isProxy !== true);
 }

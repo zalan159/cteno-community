@@ -30,6 +30,7 @@ import { BrowserNavigateView } from './BrowserNavigateView';
 import { BrowserActionView } from './BrowserActionView';
 import { BrowserStateView } from './BrowserStateView';
 import { BrowserManageView } from './BrowserManageView';
+import { GlobView, GrepView } from './SearchView';
 
 export type ToolViewProps = {
     tool: ToolCall;
@@ -61,6 +62,10 @@ export const toolViewRegistry: Record<string, ToolViewComponent> = {
     activate_skill: ActivateSkillView,
     skill_manager: SkillManagerView,
     list_skills: ListSkillsView,
+    Glob: GlobView,
+    glob: GlobView,
+    Grep: GrepView,
+    grep: GrepView,
     fetch: FetchView,
     computer_use: ComputerUseView,
     screenshot: ScreenshotView,
@@ -124,3 +129,4 @@ export { BrowserNavigateView } from './BrowserNavigateView';
 export { BrowserActionView } from './BrowserActionView';
 export { BrowserStateView } from './BrowserStateView';
 export { BrowserManageView } from './BrowserManageView';
+export { GlobView, GrepView } from './SearchView';

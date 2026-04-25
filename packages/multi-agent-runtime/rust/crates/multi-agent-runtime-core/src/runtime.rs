@@ -1361,6 +1361,7 @@ mod tests {
                 agent: RoleAgentSpec {
                     description: "Writes code".to_string(),
                     prompt: "Implement the requested changes".to_string(),
+                    provider: Some(MultiAgentProvider::Cteno),
                     tools: Some(vec!["Read".to_string(), "Edit".to_string()]),
                     disallowed_tools: None,
                     model: None,

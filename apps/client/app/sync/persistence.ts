@@ -312,6 +312,22 @@ export function saveCachedPersonas(personas: any[]) {
     mmkv.set('cached-personas', JSON.stringify(personas));
 }
 
+export function loadCachedPersonaProjects(): any[] {
+    const data = mmkv.getString('cached-persona-projects');
+    if (data) {
+        try {
+            return JSON.parse(data);
+        } catch {
+            // ignore
+        }
+    }
+    return [];
+}
+
+export function saveCachedPersonaProjects(projects: any[]) {
+    mmkv.set('cached-persona-projects', JSON.stringify(projects));
+}
+
 export function loadCachedAgentWorkspaces(): any[] {
     const data = mmkv.getString('cached-agent-workspaces');
     if (data) {

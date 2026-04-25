@@ -7,7 +7,7 @@ import {
     saveCredentials,
 } from '@/auth/tokenStorage';
 import { installRustAuthSync, onTokensRotated } from '@/auth/rustAuthSync';
-import { syncCreate } from '@/sync/sync';
+import { syncCreate, syncSetLocalModeCredentials } from '@/sync/sync';
 import * as Updates from 'expo-updates';
 import { clearPersistence } from '@/sync/persistence';
 import { Platform } from 'react-native';
@@ -25,6 +25,11 @@ interface AuthContextType {
      * with a far-future expiry so the first real request refreshes it.
      */
     login: (response: AuthSuccessPayload | string, extras?: { machineId?: string }) => Promise<void>;
+    /**
+     * Store credentials for local-mode agent/proxy auth without turning on
+     * cloud sync or leaving local mode.
+     */
+    loginForLocalToken: (response: AuthSuccessPayload | string, extras?: { machineId?: string }) => Promise<void>;
     logout: () => Promise<void>;
     /**
      * Kept for back-compat with components that used to force an encryption
@@ -64,7 +69,7 @@ export function AuthProvider({
     initialLocalMode?: boolean;
 }) {
     const [isAuthenticated, setIsAuthenticated] = useState(!!initialCredentials);
-    const [isLocalMode, setIsLocalMode] = useState(initialLocalMode && !initialCredentials);
+    const [isLocalMode, setIsLocalMode] = useState(initialLocalMode);
     const [credentials, setCredentials] = useState<AuthCredentials | null>(initialCredentials);
     const hasAppAccess = isAuthenticated || isLocalMode;
 
@@ -80,6 +85,7 @@ export function AuthProvider({
             hasAppAccess,
             credentials,
             login,
+            loginForLocalToken,
             logout,
             reloadEncryption,
         });
@@ -93,6 +99,7 @@ export function AuthProvider({
             console.warn('[AuthContext] installRustAuthSync failed:', err);
         });
         const unsubscribe = onTokensRotated((rotated) => {
+            syncSetLocalModeCredentials(rotated);
             setCredentials(rotated);
             setIsAuthenticated(true);
         });
@@ -112,6 +119,21 @@ export function AuthProvider({
         setCredentials(newCredentials);
         setIsAuthenticated(true);
         setIsLocalMode(false);
+    };
+
+    const loginForLocalToken = async (
+        response: AuthSuccessPayload | string,
+        extras?: { machineId?: string },
+    ) => {
+        const payload = coerceAuthResponse(response);
+        const newCredentials = credentialsFromAuthResponse(payload, {
+            machineId: extras?.machineId,
+        });
+        await saveCredentials(newCredentials);
+        syncSetLocalModeCredentials(newCredentials);
+        setCredentials(newCredentials);
+        setIsAuthenticated(true);
+        setIsLocalMode(true);
     };
 
     const logout = async () => {
@@ -162,6 +184,7 @@ export function AuthProvider({
                 hasAppAccess,
                 credentials,
                 login,
+                loginForLocalToken,
                 logout,
                 reloadEncryption,
             }}

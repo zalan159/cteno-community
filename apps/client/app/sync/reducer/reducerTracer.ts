@@ -67,6 +67,7 @@ export type TracedMessage = NormalizedMessage & {
 export interface TracerState {
     // Task tracking - stores Task tool calls by their message ID
     taskTools: Map<string, { messageId: string; prompt: string }>;  // messageId -> Task info
+    toolIdToTaskId: Map<string, string>;  // Task tool call id -> message ID
     promptToTaskId: Map<string, string>;  // prompt -> task message ID (for matching sidechains)
     
     // Sidechain tracking - maps message UUIDs to their originating Task message ID
@@ -83,6 +84,7 @@ export interface TracerState {
 export function createTracer(): TracerState {
     return {
         taskTools: new Map(),
+        toolIdToTaskId: new Map(),
         promptToTaskId: new Map(),
         uuidToSidechainId: new Map(),
         orphanMessages: new Map(),
@@ -110,6 +112,35 @@ function getParentUuid(message: NormalizedMessage): string | null {
         }
     }
     return null;
+}
+
+function getParentToolUseId(message: NormalizedMessage): string | null {
+    if (message.role === 'agent' && message.content.length > 0) {
+        const firstContent = message.content[0];
+        if ('parentToolUseId' in firstContent && firstContent.parentToolUseId) {
+            return firstContent.parentToolUseId;
+        }
+    }
+    return null;
+}
+
+function isSidechainParentToolName(name: string): boolean {
+    const normalized = name.trim().toLowerCase();
+    return normalized === 'task'
+        || normalized === 'agent'
+        || normalized === 'dispatch_task'
+        || normalized === 'dispatch-task'
+        || normalized === 'dispatchtask';
+}
+
+function extractTaskPrompt(input: unknown): string | null {
+    if (!input || typeof input !== 'object') {
+        return null;
+    }
+
+    const record = input as Record<string, unknown>;
+    const value = record.prompt ?? record.task ?? record.description ?? record.summary;
+    return typeof value === 'string' && value.trim().length > 0 ? value : null;
 }
 
 // Process orphan messages recursively when their parent becomes available
@@ -166,14 +197,18 @@ export function traceMessages(state: TracerState, messages: NormalizedMessage[])
         // Extract Task tools and index them by message ID for later sidechain matching
         if (message.role === 'agent') {
             for (const content of message.content) {
-                if (content.type === 'tool-call' && content.name === 'Task') {
-                    if (content.input && typeof content.input === 'object' && 'prompt' in content.input) {
+                if (content.type === 'tool-call' && isSidechainParentToolName(content.name)) {
+                    const prompt = extractTaskPrompt(content.input);
+                    if (prompt) {
                         // Store Task info indexed by message ID (not tool ID)
                         state.taskTools.set(message.id, {
                             messageId: message.id,
-                            prompt: content.input.prompt
+                            prompt
                         });
-                        state.promptToTaskId.set(content.input.prompt, message.id);
+                        state.toolIdToTaskId.set(content.id, message.id);
+                        state.promptToTaskId.set(prompt, message.id);
+                    } else {
+                        state.toolIdToTaskId.set(content.id, message.id);
                     }
                 }
             }
@@ -192,6 +227,7 @@ export function traceMessages(state: TracerState, messages: NormalizedMessage[])
         // Handle sidechain messages - these need to be linked to their originating Task
         const uuid = getMessageUuid(message);
         const parentUuid = getParentUuid(message);
+        const parentToolUseId = getParentToolUseId(message);
         
         // Check if this is a sidechain root by matching its prompt to a known Task
         let isSidechainRoot = false;
@@ -201,13 +237,22 @@ export function traceMessages(state: TracerState, messages: NormalizedMessage[])
         if (message.role === 'agent') {
             for (const content of message.content) {
                 if (content.type === 'sidechain' && content.prompt) {
-                    const taskId = state.promptToTaskId.get(content.prompt);
+                    const taskId = (content.parentToolUseId ? state.toolIdToTaskId.get(content.parentToolUseId) : undefined)
+                        ?? state.promptToTaskId.get(content.prompt);
                     if (taskId) {
                         isSidechainRoot = true;
                         sidechainId = taskId;
                         break;
                     }
                 }
+            }
+        }
+
+        if (!isSidechainRoot && parentToolUseId) {
+            const taskId = state.toolIdToTaskId.get(parentToolUseId);
+            if (taskId) {
+                isSidechainRoot = true;
+                sidechainId = taskId;
             }
         }
         

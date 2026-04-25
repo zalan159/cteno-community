@@ -287,6 +287,7 @@ async fn execute_agent_rpc_via_executor(
             &session_ref,
             UserMessage {
                 content: prompt,
+                task_id: None,
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
                 injected_tools: Vec::new(),

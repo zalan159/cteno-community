@@ -139,6 +139,7 @@ export function useDemoSession() {
                     taskLifecycle: {},
                     reducerState: createReducer(),
                     isLoaded: true,
+                    isSyncing: false,
                     hasOlderMessages: false,
                     isLoadingOlder: false,
                 },

@@ -23,7 +23,7 @@ pub use capabilities::{
 pub use error::AgentExecutorError;
 pub use event::{DeltaKind, EventStream, ExecutorEvent};
 pub use session_store::{SessionRecord, SessionStoreProvider};
-pub use trait_def::{AgentExecutor, ConnectionHandle};
+pub use trait_def::{AgentExecutor, AutonomousTurnHandler, ConnectionHandle};
 pub use types::{
     Attachment, AttachmentKind, ConnectionHandleId, ConnectionHealth, ConnectionSpec, Effort,
     InjectedToolSpec, ModelChangeOutcome, ModelSpec, NativeMessage, NativeSessionId,
@@ -52,6 +52,7 @@ mod tests {
             supports_injected_tools: true,
             supports_permission_closure: true,
             supports_interrupt: true,
+            autonomous_turn: false,
         };
         let json = serde_json::to_string(&caps).expect("ser");
         let decoded: AgentCapabilities = serde_json::from_str(&json).expect("de");
@@ -63,7 +64,7 @@ mod tests {
     #[test]
     fn executor_error_display() {
         let e = AgentExecutorError::Unsupported {
-            capability: "list_sessions",
+            capability: "list_sessions".to_string(),
         };
         assert!(e.to_string().contains("list_sessions"));
 
@@ -145,6 +146,7 @@ mod tests {
             supports_injected_tools: false,
             supports_permission_closure: true,
             supports_interrupt: true,
+            autonomous_turn: false,
         };
 
         let semantic = caps.semantic_capabilities();

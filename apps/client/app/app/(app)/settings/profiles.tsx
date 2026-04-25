@@ -15,6 +15,7 @@ import { useLocalSearchParams } from 'expo-router';
 import {
     machineListProfiles,
     machineSaveProfile,
+    machineSaveCodingPlanProfiles,
     machineDeleteProfile,
     machineExportProfiles,
     type ModelOptionDisplay,
@@ -22,9 +23,17 @@ import {
     type LlmEndpointInput,
     type LlmProfileFull,
 } from '@/sync/ops';
+import {
+    CODING_PLAN_PRESETS,
+    buildCodingPlanProfiles,
+    getCodingPlanProvider,
+    type CodingPlanProviderId,
+    type CodingPlanRegion,
+} from '@/sync/codingPlanPresets';
 import { Text } from '@/components/StyledText';
 import { Image } from 'expo-image';
 import { getDefaultAvatarForModelId, MODEL_AVATAR_IMAGES } from '@/utils/modelAvatars';
+import { Modal } from '@/modal';
 
 function ProfileManager() {
     const { theme } = useUnistyles();
@@ -39,6 +48,13 @@ function ProfileManager() {
     const [editingProfile, setEditingProfile] = React.useState<LlmProfileInput | null>(null);
     const [isEditingExisting, setIsEditingExisting] = React.useState(false);
     const [showEditForm, setShowEditForm] = React.useState(false);
+
+    // Coding Plan preset modal state
+    const [showCodingPlanModal, setShowCodingPlanModal] = React.useState(false);
+    const [codingPlanProviderId, setCodingPlanProviderId] = React.useState<CodingPlanProviderId>('bailian');
+    const [codingPlanRegion, setCodingPlanRegion] = React.useState<CodingPlanRegion>('intl');
+    const [codingPlanApiKey, setCodingPlanApiKey] = React.useState('');
+    const [codingPlanSaving, setCodingPlanSaving] = React.useState(false);
 
     // Import modal state
     const [showImportModal, setShowImportModal] = React.useState(false);
@@ -141,10 +157,45 @@ function ProfileManager() {
             },
             supports_vision: display.supportsVision,
             supports_computer_use: display.supportsComputerUse,
+            thinking: display.thinking,
+            supports_function_calling: display.supportsFunctionCalling,
+            supports_image_output: display.supportsImageOutput,
             api_format: display.apiFormat,
         });
         setIsEditingExisting(true);
         setShowEditForm(true);
+    };
+
+    const handleOpenCodingPlan = () => {
+        const provider = getCodingPlanProvider(codingPlanProviderId);
+        setCodingPlanRegion(provider.defaultRegion);
+        setCodingPlanApiKey('');
+        setShowCodingPlanModal(true);
+    };
+
+    const handleSaveCodingPlan = async () => {
+        if (!selectedMachineId) return;
+        const apiKey = codingPlanApiKey.trim();
+        if (!apiKey) return;
+
+        const provider = getCodingPlanProvider(codingPlanProviderId);
+        const { profiles, defaultProfileId } = buildCodingPlanProfiles(provider, codingPlanRegion, apiKey);
+        try {
+            setCodingPlanSaving(true);
+            const result = await machineSaveCodingPlanProfiles(selectedMachineId, profiles, defaultProfileId);
+            if (result.success) {
+                setShowCodingPlanModal(false);
+                setCodingPlanApiKey('');
+                loadProfiles();
+                Alert.alert('', `已添加 ${provider.name} 的 ${profiles.length} 个模型`);
+            } else {
+                Alert.alert(t('common.error'), result.error || t('profiles.failedToSave'));
+            }
+        } catch (e) {
+            Alert.alert(t('common.error'), e instanceof Error ? e.message : t('profiles.failedToSave'));
+        } finally {
+            setCodingPlanSaving(false);
+        }
     };
 
     const handleSaveProfile = async () => {
@@ -165,32 +216,30 @@ function ProfileManager() {
         }
     };
 
-    const handleDeleteProfile = (profile: ModelOptionDisplay) => {
+    const handleDeleteProfile = async (profile: ModelOptionDisplay) => {
         if (!selectedMachineId) return;
-        Alert.alert(
+
+        const confirmed = await Modal.confirm(
             t('profiles.delete.title'),
             t('profiles.delete.message', { name: profile.name }),
-            [
-                { text: t('profiles.delete.cancel'), style: 'cancel' },
-                {
-                    text: t('profiles.delete.confirm'),
-                    style: 'destructive',
-                    onPress: async () => {
-                        try {
-                            const result = await machineDeleteProfile(selectedMachineId, profile.id);
-                            if (result.success) {
-                                loadProfiles();
-                            } else {
-                                Alert.alert(t('common.error'), result.error || t('profiles.cannotDelete'));
-                            }
-                        } catch (e) {
-                            Alert.alert(t('common.error'), e instanceof Error ? e.message : t('profiles.failedToDelete'));
-                        }
-                    },
-                },
-            ],
-            { cancelable: true }
+            {
+                cancelText: t('profiles.delete.cancel'),
+                confirmText: t('profiles.delete.confirm'),
+                destructive: true,
+            }
         );
+        if (!confirmed) return;
+
+        try {
+            const result = await machineDeleteProfile(selectedMachineId, profile.id);
+            if (result.success) {
+                loadProfiles();
+            } else {
+                Modal.alert(t('common.error'), result.error || t('profiles.cannotDelete'));
+            }
+        } catch (e) {
+            Modal.alert(t('common.error'), e instanceof Error ? e.message : t('profiles.failedToDelete'));
+        }
     };
 
     const handleOpenImport = () => {
@@ -442,7 +491,7 @@ function ProfileManager() {
                                 }}>自定义 Profile</Text>
                             )}
                             {profiles.filter(p => !p.isProxy).map((profile) => (
-                                <Pressable
+                                <View
                                     key={profile.id}
                                     style={{
                                         backgroundColor: theme.colors.input.background,
@@ -454,74 +503,84 @@ function ProfileManager() {
                                         borderWidth: profile.id === defaultProfileId ? 2 : 0,
                                         borderColor: theme.colors.text,
                                     }}
-                                    onPress={() => handleEditProfile(profile)}
                                 >
-                                    <View style={{
-                                        width: 24,
-                                        height: 24,
-                                        borderRadius: 12,
-                                        backgroundColor: profile.id === defaultProfileId
-                                            ? theme.colors.button.primary.background
-                                            : theme.colors.button.secondary.tint,
-                                        justifyContent: 'center',
-                                        alignItems: 'center',
-                                        marginRight: 12,
-                                    }}>
-                                        <Ionicons
-                                            name={profile.id === defaultProfileId ? 'star' : 'person'}
-                                            size={16}
-                                            color="white"
-                                        />
-                                    </View>
-                                    <View style={{ flex: 1 }}>
-                                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                                            <Text style={{
-                                                fontSize: 16,
-                                                fontWeight: '600',
-                                                color: theme.colors.text,
-                                                ...Typography.default('semiBold')
-                                            }}>
-                                                {profile.name}
-                                            </Text>
-                                            {profile.supportsVision && (
-                                                <Ionicons name="image-outline" size={14} color={theme.colors.textSecondary} />
-                                            )}
-                                            {profile.supportsComputerUse && (
-                                                <Ionicons name="desktop-outline" size={14} color={theme.colors.textSecondary} />
-                                            )}
+                                    <Pressable
+                                        style={{
+                                            flex: 1,
+                                            flexDirection: 'row',
+                                            alignItems: 'center',
+                                        }}
+                                        onPress={() => handleEditProfile(profile)}
+                                    >
+                                        <View style={{
+                                            width: 24,
+                                            height: 24,
+                                            borderRadius: 12,
+                                            backgroundColor: profile.id === defaultProfileId
+                                                ? theme.colors.button.primary.background
+                                                : theme.colors.button.secondary.tint,
+                                            justifyContent: 'center',
+                                            alignItems: 'center',
+                                            marginRight: 12,
+                                        }}>
+                                            <Ionicons
+                                                name={profile.id === defaultProfileId ? 'star' : 'person'}
+                                                size={16}
+                                                color="white"
+                                            />
                                         </View>
-                                        <Text style={{
-                                            fontSize: 13,
-                                            color: theme.colors.textSecondary,
-                                            marginTop: 2,
-                                            ...Typography.default()
-                                        }}>
-                                            {t('profiles.chatCompressSummary', {
-                                                chatModel: profile.chat.model,
-                                                compressModel: profile.compress.model,
-                                            })}
-                                        </Text>
-                                        <Text style={{
-                                            fontSize: 12,
-                                            color: theme.colors.textSecondary,
-                                            marginTop: 1,
-                                            ...Typography.default()
-                                        }}>
-                                            {t('profiles.authToken')}: {profile.chat.api_key_masked}
-                                        </Text>
-                                    </View>
+                                        <View style={{ flex: 1 }}>
+                                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                                                <Text style={{
+                                                    fontSize: 16,
+                                                    fontWeight: '600',
+                                                    color: theme.colors.text,
+                                                    ...Typography.default('semiBold')
+                                                }}>
+                                                    {profile.name}
+                                                </Text>
+                                                {profile.supportsVision && (
+                                                    <Ionicons name="image-outline" size={14} color={theme.colors.textSecondary} />
+                                                )}
+                                                {profile.supportsComputerUse && (
+                                                    <Ionicons name="desktop-outline" size={14} color={theme.colors.textSecondary} />
+                                                )}
+                                            </View>
+                                            <Text style={{
+                                                fontSize: 13,
+                                                color: theme.colors.textSecondary,
+                                                marginTop: 2,
+                                                ...Typography.default()
+                                            }}>
+                                                {t('profiles.chatCompressSummary', {
+                                                    chatModel: profile.chat.model,
+                                                    compressModel: profile.compress.model,
+                                                })}
+                                            </Text>
+                                            <Text style={{
+                                                fontSize: 12,
+                                                color: theme.colors.textSecondary,
+                                                marginTop: 1,
+                                                ...Typography.default()
+                                            }}>
+                                                {t('profiles.authToken')}: {profile.chat.api_key_masked}
+                                            </Text>
+                                        </View>
+                                    </Pressable>
                                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                                         {profile.id !== defaultProfileId && (
                                             <Pressable
                                                 hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                                                onPress={() => handleDeleteProfile(profile)}
+                                                onPress={() => {
+                                                    void handleDeleteProfile(profile);
+                                                }}
                                                 style={{ marginLeft: 12 }}
                                             >
                                                 <Ionicons name="trash-outline" size={20} color={theme.colors.deleteAction} />
                                             </Pressable>
                                         )}
                                     </View>
-                                </Pressable>
+                                </View>
                             ))}
 
                             {/* Add profile button */}
@@ -546,6 +605,30 @@ function ProfileManager() {
                                     ...Typography.default('semiBold')
                                 }}>
                                     {t('profiles.addProfile')}
+                                </Text>
+                            </Pressable>
+
+                            <Pressable
+                                style={{
+                                    backgroundColor: theme.colors.surface,
+                                    borderRadius: 12,
+                                    padding: 16,
+                                    marginBottom: 12,
+                                    flexDirection: 'row',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                }}
+                                onPress={handleOpenCodingPlan}
+                            >
+                                <Ionicons name="code-slash-outline" size={20} color={theme.colors.button.secondary.tint} />
+                                <Text style={{
+                                    fontSize: 16,
+                                    fontWeight: '600',
+                                    color: theme.colors.button.secondary.tint,
+                                    marginLeft: 8,
+                                    ...Typography.default('semiBold')
+                                }}>
+                                    添加 Coding Plan
                                 </Text>
                             </Pressable>
 
@@ -579,6 +662,188 @@ function ProfileManager() {
                     )}
                 </View>
             </ScrollView>
+
+            {/* Coding Plan Preset Modal */}
+            {showCodingPlanModal && (() => {
+                const provider = getCodingPlanProvider(codingPlanProviderId);
+                const preview = buildCodingPlanProfiles(provider, codingPlanRegion, codingPlanApiKey.trim() || 'sk-...');
+                return (
+                    <View style={profileManagerStyles.modalOverlay}>
+                        <View style={profileManagerStyles.modalContent}>
+                            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 20 }}>
+                                <Text style={{
+                                    fontSize: 18,
+                                    fontWeight: 'bold',
+                                    color: theme.colors.text,
+                                    marginBottom: 16,
+                                    ...Typography.default('semiBold')
+                                }}>
+                                    添加 Coding Plan
+                                </Text>
+
+                                <Text style={{
+                                    fontSize: 13,
+                                    color: theme.colors.textSecondary,
+                                    marginBottom: 8,
+                                    ...Typography.default('semiBold')
+                                }}>
+                                    选择套餐
+                                </Text>
+                                <View style={{ gap: 8, marginBottom: 16 }}>
+                                    {CODING_PLAN_PRESETS.map((item) => {
+                                        const selected = item.id === codingPlanProviderId;
+                                        return (
+                                            <Pressable
+                                                key={item.id}
+                                                onPress={() => {
+                                                    setCodingPlanProviderId(item.id);
+                                                    setCodingPlanRegion(item.defaultRegion);
+                                                }}
+                                                style={{
+                                                    borderRadius: 10,
+                                                    padding: 12,
+                                                    backgroundColor: selected ? theme.colors.button.primary.background : theme.colors.input.background,
+                                                    borderWidth: 1,
+                                                    borderColor: selected ? theme.colors.button.primary.background : theme.colors.divider,
+                                                }}
+                                            >
+                                                <Text style={{
+                                                    fontSize: 15,
+                                                    color: selected ? theme.colors.button.primary.tint : theme.colors.text,
+                                                    ...Typography.default('semiBold'),
+                                                }}>
+                                                    {item.name}
+                                                </Text>
+                                                <Text style={{
+                                                    fontSize: 12,
+                                                    color: selected ? theme.colors.button.primary.tint : theme.colors.textSecondary,
+                                                    marginTop: 4,
+                                                    ...Typography.default(),
+                                                }}>
+                                                    {item.description}
+                                                </Text>
+                                            </Pressable>
+                                        );
+                                    })}
+                                </View>
+
+                                {provider.regions.length > 1 && (
+                                    <>
+                                        <Text style={{
+                                            fontSize: 13,
+                                            color: theme.colors.textSecondary,
+                                            marginBottom: 8,
+                                            ...Typography.default('semiBold')
+                                        }}>
+                                            API 区域
+                                        </Text>
+                                        <View style={{ flexDirection: 'row', gap: 8, marginBottom: 16 }}>
+                                            {provider.regions.map((region) => {
+                                                const selected = region.id === codingPlanRegion;
+                                                return (
+                                                    <Pressable
+                                                        key={region.id}
+                                                        onPress={() => setCodingPlanRegion(region.id)}
+                                                        style={{
+                                                            flex: 1,
+                                                            backgroundColor: selected ? theme.colors.button.primary.background : theme.colors.surfaceHigh,
+                                                            borderRadius: 8,
+                                                            padding: 10,
+                                                            alignItems: 'center',
+                                                        }}
+                                                    >
+                                                        <Text style={{
+                                                            fontSize: 14,
+                                                            color: selected ? theme.colors.button.primary.tint : theme.colors.text,
+                                                            ...Typography.default('semiBold'),
+                                                        }}>
+                                                            {region.label}
+                                                        </Text>
+                                                    </Pressable>
+                                                );
+                                            })}
+                                        </View>
+                                    </>
+                                )}
+
+                                <ProfileField
+                                    label="Coding Plan SK"
+                                    value={codingPlanApiKey}
+                                    onChangeText={setCodingPlanApiKey}
+                                    placeholder="sk-..."
+                                    secureTextEntry
+                                />
+
+                                <View style={{
+                                    backgroundColor: theme.colors.input.background,
+                                    borderRadius: 10,
+                                    padding: 12,
+                                    marginTop: 4,
+                                }}>
+                                    <Text style={{
+                                        fontSize: 13,
+                                        color: theme.colors.text,
+                                        marginBottom: 8,
+                                        ...Typography.default('semiBold'),
+                                    }}>
+                                        将创建 {preview.profiles.length} 个模型，默认 {preview.defaultProfileId.replace(/^coding-plan-[^-]+-/, '')}
+                                    </Text>
+                                    {preview.profiles.slice(0, 8).map((profile) => (
+                                        <Text
+                                            key={profile.id}
+                                            style={{
+                                                fontSize: 12,
+                                                color: theme.colors.textSecondary,
+                                                marginBottom: 3,
+                                                ...Typography.default(),
+                                            }}
+                                        >
+                                            {profile.chat.model} · {profile.chat.context_window_tokens ? `${profile.chat.context_window_tokens / 1000}K` : 'auto'}
+                                        </Text>
+                                    ))}
+                                </View>
+
+                                <View style={{ flexDirection: 'row', gap: 12, marginTop: 24 }}>
+                                    <Pressable
+                                        style={{
+                                            flex: 1,
+                                            backgroundColor: theme.colors.surface,
+                                            borderRadius: 8,
+                                            padding: 12,
+                                            alignItems: 'center',
+                                        }}
+                                        onPress={() => { setShowCodingPlanModal(false); setCodingPlanApiKey(''); }}
+                                    >
+                                        <Text style={{ fontSize: 16, fontWeight: '600', color: theme.colors.button.secondary.tint, ...Typography.default('semiBold') }}>
+                                            {t('common.cancel')}
+                                        </Text>
+                                    </Pressable>
+                                    <Pressable
+                                        style={{
+                                            flex: 1,
+                                            backgroundColor: codingPlanApiKey.trim() ? theme.colors.button.primary.background : theme.colors.divider,
+                                            borderRadius: 8,
+                                            padding: 12,
+                                            alignItems: 'center',
+                                            opacity: codingPlanApiKey.trim() ? 1 : 0.5,
+                                        }}
+                                        onPress={handleSaveCodingPlan}
+                                        disabled={!codingPlanApiKey.trim() || codingPlanSaving}
+                                    >
+                                        {codingPlanSaving ? (
+                                            <ActivityIndicator color={theme.colors.button.primary.tint} />
+                                        ) : (
+                                            <Text style={{ fontSize: 16, fontWeight: '600', color: theme.colors.button.primary.tint, ...Typography.default('semiBold') }}>
+                                                添加并设为默认
+                                            </Text>
+                                        )}
+                                    </Pressable>
+                                </View>
+                            </ScrollView>
+                        </View>
+                    </View>
+                );
+            })()}
 
             {/* Profile Edit Modal */}
             {showEditForm && editingProfile && (

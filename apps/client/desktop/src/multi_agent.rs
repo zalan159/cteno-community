@@ -520,7 +520,7 @@ pub async fn register_local_workspace_rpc_handlers(
     registry: Arc<cteno_host_rpc_core::RpcRegistry>,
     machine_id: &str,
 ) {
-    crate::usage_monitor::register_rpc(registry.clone(), machine_id).await;
+    crate::quota_monitor::register_rpc(registry.clone(), machine_id).await;
 
     let rpc_method_bootstrap_workspace = format!("{}:bootstrap-workspace", machine_id);
     let rpc_method_list_agent_workspace_templates =
@@ -1267,6 +1267,7 @@ fn build_workspace_executor_spawn_spec(
     session_id: &str,
     vendor: &str,
     system_prompt: String,
+    profile_id: String,
     model: String,
     temperature: f32,
 ) -> SpawnSessionSpec {
@@ -1275,6 +1276,9 @@ fn build_workspace_executor_spawn_spec(
     // `extract_auth_from_agent_config`. Other vendors carry their own CLI auth
     // and the block is simply unused.
     crate::executor_session::merge_auth_into(&mut agent_config);
+    if vendor == "cteno" {
+        agent_config["profile_id"] = Value::String(profile_id);
+    }
     SpawnSessionSpec {
         workdir: PathBuf::from(shellexpand::tilde(&session_workdir(session_id)).to_string()),
         system_prompt: Some(system_prompt),
@@ -1377,6 +1381,7 @@ async fn local_role_execution_input(
         bool,
         bool,
         bool,
+        String,
         Vec<crate::llm::Tool>,
         Vec<AgentConfig>,
         Vec<String>,
@@ -1510,6 +1515,7 @@ async fn local_role_execution_input(
         profile.supports_vision,
         profile.thinking,
         profile.supports_function_calling && !options.disable_tools,
+        profile_id,
         native_tools,
         all_agents,
         runtime_context_messages,
@@ -1546,6 +1552,7 @@ async fn execute_local_workspace_session_with_options(
         _supports_vision,
         _enable_thinking,
         _supports_function_calling,
+        profile_id,
         _tools,
         _all_agents,
         runtime_context_messages,
@@ -1559,6 +1566,7 @@ async fn execute_local_workspace_session_with_options(
                 &session_id,
                 &session_vendor,
                 effective_system_prompt.clone(),
+                profile_id.clone(),
                 model.clone(),
                 temperature,
             );
@@ -1591,6 +1599,7 @@ async fn execute_local_workspace_session_with_options(
             &live_session.session_ref,
             UserMessage {
                 content: prompt,
+                task_id: None,
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
                 injected_tools: Vec::new(),
@@ -2002,6 +2011,7 @@ impl WorkspaceProvisioner for CtenoWorkspaceProvisioner {
                 _supports_vision,
                 _enable_thinking,
                 _supports_function_calling,
+                profile_id,
                 _tools,
                 _all_agents,
                 _runtime_context_messages,
@@ -2012,6 +2022,7 @@ impl WorkspaceProvisioner for CtenoWorkspaceProvisioner {
                 &session_id,
                 requested_vendor,
                 effective_system_prompt,
+                profile_id,
                 model,
                 temperature,
             );
@@ -2453,5 +2464,26 @@ mod tests {
         assert!(!is_workspace_custom_agent(
             &crate::agent_kind::AgentKind::Worker
         ));
+    }
+
+    #[test]
+    fn cteno_workspace_spawn_spec_preserves_profile_id() {
+        let spec = build_workspace_executor_spawn_spec(
+            "session-for-profile",
+            "cteno",
+            "system".to_string(),
+            "proxy-deepseek-v4-pro".to_string(),
+            "deepseek-v4-pro".to_string(),
+            0.2,
+        );
+
+        assert_eq!(
+            spec.agent_config.get("profile_id").and_then(Value::as_str),
+            Some("proxy-deepseek-v4-pro")
+        );
+        assert_eq!(
+            spec.model.as_ref().map(|model| model.model_id.as_str()),
+            Some("deepseek-v4-pro")
+        );
     }
 }

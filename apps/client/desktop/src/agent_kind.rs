@@ -16,8 +16,8 @@
 
 // Re-export runtime-native pieces so callers keep using `crate::agent_kind::*`.
 pub use cteno_agent_runtime::agent_kind::{
-    AgentKind, AgentProfile, BROWSER_ONLY, BROWSER_WHITELIST, PERSONA_ONLY, ToolFilter,
-    agent_kind_label, apply_filter, parse_agent_kind,
+    agent_kind_label, apply_filter, parse_agent_kind, AgentKind, AgentProfile, ToolFilter,
+    BROWSER_ONLY, BROWSER_WHITELIST, PERSONA_ONLY,
 };
 
 use crate::persona::models::{Persona, PersonaSessionLink, PersonaSessionType};

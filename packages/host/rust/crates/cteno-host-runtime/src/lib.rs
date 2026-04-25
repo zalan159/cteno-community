@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub mod auth;
 pub mod daemon_state;
+pub mod events;
 pub mod host_paths;
 pub mod identity;
 pub mod llm_key;

@@ -1,0 +1,22 @@
+{
+  "extends": "../../apps/client/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@cteno/client-agent-ui": ["src/index.ts"],
+      "@cteno/client-agent-ui/*": ["src/*"],
+      "@cteno/client-sync": ["../client-sync/src/index.ts"],
+      "@cteno/client-sync/*": ["../client-sync/src/*"],
+      "@cteno/client-ui": ["../client-ui/src/index.ts"],
+      "@cteno/client-ui/*": ["../client-ui/src/*"],
+      "react": ["../../apps/client/node_modules/@types/react"],
+      "react/*": ["../../apps/client/node_modules/@types/react/*"],
+      "react-native": ["../../apps/client/node_modules/react-native"],
+      "react-native/*": ["../../apps/client/node_modules/react-native/*"],
+      "react-native-svg": ["../../apps/client/node_modules/react-native-svg"],
+      "@expo/vector-icons": ["../../apps/client/node_modules/@expo/vector-icons"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "../client-sync/src/**/*.ts", "../client-ui/src/**/*.ts", "../client-ui/src/**/*.tsx"],
+  "exclude": ["node_modules"]
+}

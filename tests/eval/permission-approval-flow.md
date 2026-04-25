@@ -36,10 +36,10 @@ printf 'disposable content\n' > /tmp/cteno-permission-flow/scratch.txt
 - **anti-pattern**: bypass 模式下仍弹 Modal；ACP 里出现 permission-request
 - **severity**: high
 
-### [pending] 120s timeout 未响应 → 自动 Deny 并正确清理
-- **message**: 触发一条 shell 命令，前端不响应（模拟用户离开），等 121 秒
-- **expect**: 120 秒后 detached task 超时，调用 `respond_to_permission(Deny)`，`completedRequests` 标记 `denied`，pending_requests map 清空；session 不 panic，可接新消息
-- **anti-pattern**: 永久挂起；Aborted（会让 session 停掉）；pending 条目泄漏；重试时 id 冲突
+### [pending] 长时间不响应权限请求时保持 input-gate 阻塞，不自动 Deny
+- **message**: 触发一条 shell 命令，前端不响应（模拟用户离开），等待 121 秒后刷新页面
+- **expect**: 不调用 `respond_to_permission(Deny)` 或 `Abort`；`agentState.requests` 仍保留该 permission；输入框上方 input-gate 仍显示 Allow/Deny/Abort 决策区；聊天区不生成 pending permission 工具卡片；session 不 panic，普通发送入口保持阻塞
+- **anti-pattern**: 120 秒后自动 denied/canceled；pending 条目被清空；刷新后可以绕过权限继续发普通消息；pending permission 跟随 tool card / PermissionFooter 出现在聊天记录里；agent 被用户未选择的决策推进
 - **severity**: high
 
 ### [pending] 双击 Allow：幂等不 panic，不重复 respond
@@ -69,7 +69,7 @@ printf 'disposable content\n' > /tmp/cteno-permission-flow/scratch.txt
 ### [pending] Read-only 工具始终不走审批路径
 - **message**: 任意 mode 下让 agent 调 `read` / `list_subagents` / `memory recall`
 - **expect**: 直接执行，无 permission-request 发出
-- **anti-pattern**: 弹 Modal；误判为 mutating 走审批；read 卡在 120s timeout
+- **anti-pattern**: 弹 input-gate；误判为 mutating 走审批；read 卡在权限等待状态
 - **severity**: medium
 
 ### [pending] 不存在 executor 的 session：host 端改 mode 仍成功
@@ -77,6 +77,36 @@ printf 'disposable content\n' > /tmp/cteno-permission-flow/scratch.txt
 - **expect**: `permission_handler.set_mode` 生效；executor.set_permission_mode 被跳过（debug log），RPC 返回 ok
 - **anti-pattern**: RPC 报 "Session executor unavailable" 错误；host 端 mode 也没改
 - **severity**: medium
+
+### [pending] Cteno：`perm_*` 批准后不同 `call_*` 执行不生成权限工具卡片
+- **message**: Cteno session 触发 `glob` 或 shell 审批；记录 `PermissionRequest.request_id` 为 `perm_*`；用户点击 Allow；随后观察真实 tool-call id 为 `call_*`
+- **expect**: 后端日志出现 `PermissionResponse RECV/DELIVER` 与实际工具执行；pending `perm_*` 只作为输入框上方 input-gate 显示，不进入聊天记录；真实 `call_*` 工具以独立 running/completed 卡片展示
+- **anti-pattern**: Allow 已经送达后 `perm_*` 权限卡片仍无限 loading；把 `call_*` 错合并到 `perm_*`；重复弹出同一个权限请求；PermissionFooter 出现在聊天内工具卡片底部
+- **severity**: high
+
+### [pending] Cteno：刷新页面后 pending/completed 权限状态从本地 SQLite 恢复
+- **message**: Cteno session 触发一条需要审批的工具；在权限弹窗出现后刷新前端；再点击 Allow，并在工具完成后再次刷新
+- **expect**: 第一次刷新后仍能看到待处理权限并可继续响应；Allow 后 `agent_sessions.agent_state` / `agent_state_version` 更新；第二次刷新后 UI 不再丢失权限状态，也不会把已批准卡片恢复成 pending/running
+- **anti-pattern**: 刷新后权限窗口消失且无法继续操作；前端仅依赖实时 Tauri event；已完成权限刷新后重新转圈
+- **severity**: high
+
+### [pending] Cteno：权限弹窗期间重启 daemon 后默认拒绝并解除 input-gate
+- **message**: Cteno session 触发一条需要审批的 shell 命令；不要点击 Allow/Deny；直接重启桌面 daemon；前端重新拉取 `list-sessions`
+- **expect**: 旧 `agentState.requests` 被清空；同一 permissionId 进入 `agentState.completedRequests`，`status=denied` 且保留原 tool/arguments；`agent_state_version` 递增；会话不再显示“需要权限”，输入框恢复可发送新消息
+- **anti-pattern**: 重启后仍然显示 pending 权限并阻断输入；点击旧 Allow 后试图发给已经不存在的 vendor process；completedRequests 丢失 tool/arguments 导致 reducer 无法显示拒绝结果
+- **severity**: high
+
+### [pending] Cteno：执行中切 permission mode 排队到下一轮
+- **message**: Cteno session 以 Default mode 开始一个会持续输出或等待权限的 turn；当前 turn 仍 running 时从 UI/RPC 切到 `bypassPermissions`；不要 abort，等本轮结束后再发一条会触发 mutating tool 的消息
+- **expect**: 切换 RPC 在 1 秒内返回 ok，UI 不弹 `set_permission_mode timeout after 5s`；本轮不被中断；下一轮开始前 adapter 发送 queued `SetPermissionMode`，mutating tool 按新 mode 决策
+- **anti-pattern**: 切换时 Local RPC 报 timeout；为了切 mode 杀掉当前 turn；新 mode 立刻污染当前已运行中的 tool 决策；下一轮仍沿用旧 mode
+- **severity**: high
+
+### [pending] Cteno permission_mode 真正影响下一轮工具决策
+- **message**: Cteno session 依次设置 `plan`、`read_only`、`bypassPermissions` 三种 mode；每次切换后新开一轮，要求写入 `/tmp/cteno-permission-flow/mode-check.txt` 并读取 `scratch.txt`。
+- **expect**: `plan` 轮不触发前端 Modal 且拒绝工具执行；`read_only` 轮只能完成读取，写入受只读 sandbox 阻止；`bypassPermissions` 轮不弹审批并允许写入。日志能看到 stdio runner 在每轮构造 permission checker/sandbox 时读取最新 mode。
+- **anti-pattern**: mode 只写入 `agent_config` 但 runtime 行为不变；`plan` 仍执行写入；`read_only` 仍能修改文件；`bypassPermissions` 仍发 `PermissionRequest`。
+- **severity**: high
 
 ---
 

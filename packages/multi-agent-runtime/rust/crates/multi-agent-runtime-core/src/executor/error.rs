@@ -13,7 +13,7 @@ pub enum AgentExecutorError {
     #[error("capability not supported by this executor: {capability}")]
     Unsupported {
         /// Human-readable capability identifier (e.g. `"list_sessions"`).
-        capability: &'static str,
+        capability: String,
     },
 
     /// The underlying subprocess exited unexpectedly.

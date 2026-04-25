@@ -72,7 +72,35 @@ describe('reducerTracer', () => {
                 messageId: 'msg1',
                 prompt: 'Search for files'
             });
+            expect(state.toolIdToTaskId.get('tool1')).toBe('msg1');
             expect(state.promptToTaskId.get('Search for files')).toBe('msg1');
+        });
+
+        it('should identify Cteno dispatch_task as a sidechain parent tool', () => {
+            const state = createTracer();
+            const messages: NormalizedMessage[] = [
+                {
+                    id: 'msg1',
+                    localId: null,
+                    createdAt: 1000,
+                    role: 'agent',
+                    isSidechain: false,
+                    content: [{
+                        type: 'tool-call',
+                        id: 'dispatch1',
+                        name: 'dispatch_task',
+                        input: { task: 'Run worker in background' },
+                        description: null,
+                        uuid: 'uuid1',
+                        parentUUID: null
+                    }]
+                }
+            ];
+
+            traceMessages(state, messages);
+
+            expect(state.toolIdToTaskId.get('dispatch1')).toBe('msg1');
+            expect(state.promptToTaskId.get('Run worker in background')).toBe('msg1');
         });
 
         it('should assign sidechainId to sidechain root messages', () => {
@@ -117,6 +145,89 @@ describe('reducerTracer', () => {
             expect(traced).toHaveLength(1);
             expect(traced[0].sidechainId).toBe('task1');
             expect(state.uuidToSidechainId.get('sidechain-uuid')).toBe('task1');
+        });
+
+        it('should assign Claude Code sidechain messages by parent tool use id', () => {
+            const state = createTracer();
+
+            const taskMessage: NormalizedMessage = {
+                id: 'task1',
+                localId: null,
+                createdAt: 1000,
+                role: 'agent',
+                isSidechain: false,
+                content: [{
+                    type: 'tool-call',
+                    id: 'tool1',
+                    name: 'Task',
+                    input: { prompt: 'Search for files' },
+                    description: null,
+                    uuid: 'task-uuid',
+                    parentUUID: null
+                }]
+            };
+
+            traceMessages(state, [taskMessage]);
+
+            const claudeSidechainMessage: NormalizedMessage = {
+                id: 'sidechain1',
+                localId: null,
+                createdAt: 2000,
+                role: 'agent',
+                isSidechain: true,
+                content: [{
+                    type: 'text',
+                    text: 'Subagent result from Claude',
+                    uuid: 'sidechain-uuid',
+                    parentUUID: null,
+                    parentToolUseId: 'tool1'
+                }]
+            };
+
+            const traced = traceMessages(state, [claudeSidechainMessage]);
+
+            expect(traced).toHaveLength(1);
+            expect(traced[0].sidechainId).toBe('task1');
+            expect(state.uuidToSidechainId.get('sidechain-uuid')).toBe('task1');
+        });
+
+        it('should assign Cteno dispatch_task sidechain messages by parent tool use id', () => {
+            const state = createTracer();
+
+            traceMessages(state, [{
+                id: 'dispatch-message',
+                localId: null,
+                createdAt: 1000,
+                role: 'agent',
+                isSidechain: false,
+                content: [{
+                    type: 'tool-call',
+                    id: 'dispatch1',
+                    name: 'dispatch_task',
+                    input: { task: 'Run worker in background' },
+                    description: null,
+                    uuid: 'task-uuid',
+                    parentUUID: null
+                }]
+            }]);
+
+            const traced = traceMessages(state, [{
+                id: 'sidechain1',
+                localId: null,
+                createdAt: 2000,
+                role: 'agent',
+                isSidechain: true,
+                content: [{
+                    type: 'text',
+                    text: '[Task Complete] worker\n\nDone',
+                    uuid: 'sidechain-uuid',
+                    parentUUID: null,
+                    parentToolUseId: 'dispatch1'
+                }]
+            }]);
+
+            expect(traced).toHaveLength(1);
+            expect(traced[0].sidechainId).toBe('dispatch-message');
         });
 
         it('should handle sidechain messages with parent relationships', () => {

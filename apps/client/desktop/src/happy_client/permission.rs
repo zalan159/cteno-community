@@ -5,7 +5,7 @@
 //! 1. Update AgentState.requests via `update-state` Socket.IO event
 //! 2. Send ACP `permission-request` message
 //! 3. Send push notification (fire-and-forget)
-//! 4. Await user response via `{sessionId}:permission` RPC (120s timeout)
+//! 4. Await user response via `{sessionId}:permission` RPC
 //! 5. Move to AgentState.completedRequests
 
 use super::socket::HappySocket;
@@ -25,8 +25,7 @@ use tokio::sync::oneshot;
 /// disconnect+reconnect the RPC re-binding landed on a NEW handler, while any
 /// turn/normalizer spawned before the reconnect still held the OLD handler —
 /// so `register_pending_request` and `handle_rpc_response` operated on
-/// different maps and user approvals were silently dropped (→ 120s timeout →
-/// auto-deny, which Claude saw as a user rejection).
+/// different maps and user approvals were silently dropped.
 ///
 /// The registry makes handlers session-scoped and survives connection churn:
 /// `get_or_create_handler(session_id, …)` hands back the same `Arc` for the
@@ -69,6 +68,18 @@ pub fn get_or_create_handler(
 pub fn remove_handler(session_id: &str) -> Option<Arc<PermissionHandler>> {
     let mut guard = handler_registry().write().unwrap();
     guard.remove(session_id)
+}
+
+/// Whether this process still has a live permission waiter for the session.
+/// Host session listing uses this to distinguish a normal frontend refresh
+/// from a daemon restart: persisted `agentState.requests` are only stale when
+/// no in-process handler can receive the user's reply anymore.
+pub fn has_live_pending_requests(session_id: &str) -> bool {
+    let guard = handler_registry().read().unwrap();
+    guard
+        .get(session_id)
+        .map(|handler| handler.has_pending_requests())
+        .unwrap_or(false)
 }
 
 // Permission data types now live in `cteno_agent_runtime::permission`.  The
@@ -287,13 +298,14 @@ impl PermissionHandler {
     pub fn is_read_only(tool_name: &str, input: &Value) -> bool {
         match tool_name {
             // Pure read-only tools
-            "read" | "websearch" | "query_subagent" | "list_subagents" => true,
+            "read" | "websearch" | "query_subagent" | "list_subagents" | "tool_search"
+            | "update_plan" => true,
 
             // Memory tool: all operations (recall/save/read/list) are local workspace only
             "memory" => true,
 
             // Persona read-only tools
-            "list_task_sessions" | "get_session_output" | "update_personality" => true,
+            "list_task_sessions" | "update_personality" => true,
 
             _ => false,
         }
@@ -356,23 +368,17 @@ impl PermissionHandler {
             .await;
         });
 
-        // Wait for response with 120s timeout
-        let result = match tokio::time::timeout(tokio::time::Duration::from_secs(120), rx).await {
-            Ok(Ok(response)) => {
+        // Wait for a user decision. Permissions are an input gate, so they do
+        // not auto-deny or auto-abort just because the user is away.
+        let result = match rx.await {
+            Ok(response) => {
                 log::info!("[Permission] Received response for {}: approved={}, decision={:?}, mode={:?}, allow_tools={:?}",
                     call_id, response.approved, response.decision, response.mode, response.allow_tools);
                 self.process_response(response, call_id, tool_name)
             }
-            Ok(Err(_)) => {
+            Err(_) => {
                 log::warn!("[Permission] Channel closed for {}", call_id);
                 PermissionCheckResult::Denied("Permission channel closed".to_string())
-            }
-            Err(_) => {
-                log::warn!(
-                    "[Permission] Timeout waiting for permission: {} — aborting agent",
-                    call_id
-                );
-                PermissionCheckResult::Aborted
             }
         };
 
@@ -523,11 +529,15 @@ impl PermissionHandler {
         rx
     }
 
-    /// Remove a previously-registered pending request (e.g. on timeout /
-    /// abort). Idempotent.
+    /// Remove a previously-registered pending request (e.g. on channel close
+    /// or abort). Idempotent.
     pub fn clear_pending_request(&self, call_id: &str) {
         let mut pending = self.pending_requests.lock().unwrap();
         pending.remove(call_id);
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        !self.pending_requests.lock().unwrap().is_empty()
     }
 
     /// Evaluate pre-approval shortcuts for a tool call without opening a

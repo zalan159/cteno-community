@@ -35,7 +35,32 @@ struct SyncContext {
     profile_id: String,
 }
 
+fn parse_cloud_session_sync_enabled(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off" | "disabled"
+    )
+}
+
+pub(crate) fn cloud_session_sync_enabled() -> bool {
+    if let Ok(value) = std::env::var("CTENO_CLOUD_SYNC_ENABLED") {
+        return parse_cloud_session_sync_enabled(Some(&value));
+    }
+    if let Ok(value) = std::env::var("EXPO_PUBLIC_CLOUD_SYNC_ENABLED") {
+        return parse_cloud_session_sync_enabled(Some(&value));
+    }
+    true
+}
+
 pub fn install() {
+    if !cloud_session_sync_enabled() {
+        log::info!("SessionSyncService not installed: cloud session sync disabled");
+        return;
+    }
+
     let service: Arc<dyn SessionSyncService> = Arc::new(HappyServerSyncService::default());
     if install_session_sync_service(service).is_err() {
         log::debug!("SessionSyncService already installed");
@@ -117,6 +142,10 @@ fn extract_message_fields(
 }
 
 async fn load_sync_context() -> Result<SyncContext, String> {
+    if !cloud_session_sync_enabled() {
+        return Err("Cloud session sync disabled".to_string());
+    }
+
     let spawn_config = crate::local_services::spawn_config()?;
     let runtime_ctx = crate::local_services::agent_runtime_context()?;
     let (auth_token, encryption_key, encryption_variant, data_key_public) =
@@ -471,6 +500,16 @@ mod tests {
             },
         );
         (service, local_sink)
+    }
+
+    #[test]
+    fn parses_cloud_session_sync_flag() {
+        assert!(parse_cloud_session_sync_enabled(None));
+        assert!(parse_cloud_session_sync_enabled(Some("true")));
+        assert!(parse_cloud_session_sync_enabled(Some("1")));
+        assert!(!parse_cloud_session_sync_enabled(Some("false")));
+        assert!(!parse_cloud_session_sync_enabled(Some("0")));
+        assert!(!parse_cloud_session_sync_enabled(Some("off")));
     }
 
     #[tokio::test]

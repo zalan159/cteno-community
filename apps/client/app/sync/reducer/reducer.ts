@@ -228,6 +228,75 @@ export type ReducerResult = {
     hasReadyEvent?: boolean;
 };
 
+function updateLatestTodosFromTool(state: ReducerState, tool: ToolCall, timestamp: number) {
+    const normalizedToolName = tool.name.trim().toLowerCase();
+    if (normalizedToolName !== 'todowrite' && normalizedToolName !== 'update_plan' && normalizedToolName !== 'update plan') {
+        return;
+    }
+    const todos = normalizeTodosForState(planItemsFromInput(tool.input));
+    if (!todos) {
+        return;
+    }
+    if (!state.latestTodos || timestamp > state.latestTodos.timestamp) {
+        state.latestTodos = {
+            todos,
+            timestamp
+        };
+    }
+}
+
+function planItemsFromInput(input: any): unknown {
+    return input?.todos ?? input?.newTodos ?? input?.items ?? input?.plan;
+}
+
+function normalizeTodosForState(rawTodos: unknown): Array<{
+    content: string;
+    status: 'pending' | 'in_progress' | 'completed';
+    priority: 'high' | 'medium' | 'low';
+    id: string;
+}> | null {
+    if (!Array.isArray(rawTodos)) {
+        return null;
+    }
+    const todos = rawTodos
+        .map((todo: any, index) => {
+            const content = typeof todo?.content === 'string'
+                ? todo.content
+                : typeof todo?.task === 'string'
+                    ? todo.task
+                    : typeof todo?.text === 'string'
+                        ? todo.text
+                        : typeof todo?.title === 'string'
+                            ? todo.title
+                            : typeof todo?.step === 'string'
+                                ? todo.step
+                                : '';
+            if (!content.trim()) {
+                return null;
+            }
+            const rawStatus = typeof todo?.status === 'string' ? todo.status.trim().toLowerCase() : '';
+            const status: 'pending' | 'in_progress' | 'completed' = rawStatus === 'completed' || rawStatus === 'complete' || rawStatus === 'done'
+                ? 'completed'
+                : rawStatus === 'in_progress' || rawStatus === 'in-progress' || rawStatus === 'inprogress' || rawStatus === 'running'
+                    ? 'in_progress'
+                    : rawStatus === 'pending' || rawStatus === 'queued'
+                        ? 'pending'
+                    : todo?.completed === true || todo?.done === true
+                        ? 'completed'
+                        : 'pending';
+            return {
+                content,
+                status,
+                priority: todo?.priority === 'high' || todo?.priority === 'medium' || todo?.priority === 'low'
+                    ? todo.priority
+                    : 'medium',
+                id: typeof todo?.id === 'string' ? todo.id : `todo-${index}`,
+            };
+        })
+        .filter((todo): todo is NonNullable<typeof todo> => todo !== null);
+    return todos.length > 0 ? todos : null;
+}
+
 export function reducer(state: ReducerState, messages: NormalizedMessage[], agentState?: AgentState | null): ReducerResult {
     if (ENABLE_LOGGING) {
         console.log(`[REDUCER] Called with ${messages.length} messages, agentState: ${agentState ? 'YES' : 'NO'}`);
@@ -367,69 +436,15 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
         console.log(`[REDUCER] Phase 0: Processing AgentState`);
     }
     if (agentState) {
-        // Process pending permission requests
+        // Process pending permission requests as state only. The permission UI
+        // is rendered from session.agentState above the composer; creating a
+        // tool message here makes the prompt fragile and couples it to chat
+        // virtualization/collapse behavior.
         if (agentState.requests) {
             for (const [permId, request] of Object.entries(agentState.requests)) {
                 // Skip if this permission is also in completedRequests (completed takes precedence)
                 if (agentState.completedRequests && agentState.completedRequests[permId]) {
                     continue;
-                }
-
-                // Check if we already have a message for this permission ID
-                const existingMessageId = state.toolIdToMessageId.get(permId);
-                if (existingMessageId) {
-                    // Update existing tool message with permission info
-                    const message = state.messages.get(existingMessageId);
-                    if (message?.tool && !message.tool.permission) {
-                        if (ENABLE_LOGGING) {
-                            console.log(`[REDUCER] Updating existing tool ${permId} with permission`);
-                        }
-                        message.tool.permission = {
-                            id: permId,
-                            status: 'pending'
-                        };
-                        changed.add(existingMessageId);
-                    }
-                } else {
-                    if (ENABLE_LOGGING) {
-                        console.log(`[REDUCER] Creating new message for permission ${permId}`);
-                    }
-
-                    // Create a new tool message for the permission request
-                    // Use Date.now() (browser clock) instead of request.createdAt (machine clock)
-                    // because agentState updates arrive before ACP messages (which go through DB storage),
-                    // and machine/server clock skew can cause permission messages to appear before thinking messages.
-                    let mid = allocateId();
-                    const permCreatedAt = Date.now();
-                    let toolCall: ToolCall = {
-                        name: request.tool,
-                        state: 'running' as const,
-                        input: request.arguments,
-                        createdAt: permCreatedAt,
-                        startedAt: null,
-                        completedAt: null,
-                        description: null,
-                        result: undefined,
-                        permission: {
-                            id: permId,
-                            status: 'pending'
-                        }
-                    };
-
-                    state.messages.set(mid, {
-                        id: mid,
-                        realID: null,
-                        role: 'agent',
-                        createdAt: permCreatedAt,
-                        text: null,
-                        tool: toolCall,
-                        event: null,
-                    });
-
-                    // Store by permission ID (which will match tool ID)
-                    state.toolIdToMessageId.set(permId, mid);
-
-                    changed.add(mid);
                 }
 
                 // Store permission details for quick lookup
@@ -499,7 +514,20 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
 
                         // Update tool state based on permission status
                         if (completed.status === 'approved') {
-                            if (message.tool.state !== 'completed' && message.tool.state !== 'error' && message.tool.state !== 'running') {
+                            // Cteno emits approval prompts as independent `perm_*` request ids and
+                            // later executes the real tool with a separate `call_*` id. Those
+                            // approval cards must stop spinning once completed. For other vendors,
+                            // the permission id commonly matches the eventual tool-call id, so keep
+                            // the old "approved means waiting for execution" behavior.
+                            const isDetachedPermissionPrompt = /^perm[_-]/.test(permId);
+                            if (isDetachedPermissionPrompt && !message.tool.startedAt && !message.tool.callId) {
+                                if (message.tool.state !== 'completed') {
+                                    message.tool.state = 'completed';
+                                    message.tool.completedAt = completed.completedAt || Date.now();
+                                    message.tool.result = message.tool.result ?? 'Approved';
+                                    hasChanged = true;
+                                }
+                            } else if (message.tool.state !== 'completed' && message.tool.state !== 'error' && message.tool.state !== 'running') {
                                 message.tool.state = 'running';
                                 hasChanged = true;
                             }
@@ -555,44 +583,9 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                         continue;
                     }
 
-                    // Create a new message for completed permission without tool
-                    // Use Date.now() for same reason as pending permissions (clock skew avoidance)
-                    let mid = allocateId();
-                    const completedCreatedAt = Date.now();
-                    let toolCall: ToolCall = {
-                        name: completed.tool || 'unknown',
-                        state: completed.status === 'approved' ? 'completed' : 'error',
-                        input: completed.arguments,
-                        createdAt: completedCreatedAt,
-                        startedAt: null,
-                        completedAt: completed.completedAt || completedCreatedAt,
-                        description: null,
-                        result: completed.status === 'approved'
-                            ? 'Approved'
-                            : (completed.reason ? { error: completed.reason } : undefined),
-                        permission: {
-                            id: permId,
-                            status: completed.status,
-                            reason: completed.reason || undefined,
-                            mode: completed.mode || undefined,
-                            allowedTools: completed.allowedTools || undefined,
-                            decision: completed.decision || undefined
-                        }
-                    };
-
-                    state.messages.set(mid, {
-                        id: mid,
-                        realID: null,
-                        role: 'agent',
-                        createdAt: completedCreatedAt,
-                        text: null,
-                        tool: toolCall,
-                        event: null,
-                    });
-
-                    state.toolIdToMessageId.set(permId, mid);
-
-                    // Store permission details
+                    // Completed permission without a corresponding tool is
+                    // still not a chat message. Keep it in the permission
+                    // index so a later real tool/result can merge the status.
                     state.permissions.set(permId, {
                         tool: completed.tool || 'unknown',
                         arguments: completed.arguments,
@@ -604,8 +597,6 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                         allowedTools: completed.allowedTools || undefined,
                         decision: completed.decision || undefined
                     });
-
-                    changed.add(mid);
                 }
             }
         }
@@ -792,16 +783,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                             }
                             changed.add(existingMessageId);
 
-                            // Track TodoWrite tool inputs when updating existing messages
-                            if (message.tool.name === 'TodoWrite' && message.tool.state === 'running' && message.tool.input?.todos) {
-                                // Only update if this is newer than existing todos
-                                if (!state.latestTodos || message.tool.createdAt > state.latestTodos.timestamp) {
-                                    state.latestTodos = {
-                                        todos: message.tool.input.todos,
-                                        timestamp: message.tool.createdAt
-                                    };
-                                }
-                            }
+                            updateLatestTodosFromTool(state, message.tool, message.tool.createdAt);
                         }
                     } else {
                         if (ENABLE_LOGGING) {
@@ -861,16 +843,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                         state.toolIdToMessageId.set(c.id, mid);
                         changed.add(mid);
 
-                        // Track TodoWrite tool inputs
-                        if (toolCall.name === 'TodoWrite' && toolCall.state === 'running' && toolCall.input?.todos) {
-                            // Only update if this is newer than existing todos
-                            if (!state.latestTodos || toolCall.createdAt > state.latestTodos.timestamp) {
-                                state.latestTodos = {
-                                    todos: toolCall.input.todos,
-                                    timestamp: toolCall.createdAt
-                                };
-                            }
-                        }
+                        updateLatestTodosFromTool(state, toolCall, toolCall.createdAt);
                     }
                 }
             }
@@ -905,6 +878,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
             if (startedAt !== null) {
                 message.tool.startedAt = startedAt;
             }
+            updateLatestTodosFromTool(state, message.tool, msg.createdAt);
             changed.add(messageId);
         }
     }
@@ -936,6 +910,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                     message.tool.state = c.is_error ? 'error' : 'completed';
                     message.tool.result = c.content;
                     message.tool.completedAt = msg.createdAt;
+                    updateLatestTodosFromTool(state, message.tool, msg.createdAt);
 
                     // Update permission data if provided by backend
                     if (c.permissions) {

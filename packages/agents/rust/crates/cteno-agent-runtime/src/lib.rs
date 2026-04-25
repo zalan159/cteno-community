@@ -37,6 +37,7 @@ pub mod session_memory;
 pub mod skillhub;
 pub mod subagent;
 pub mod system_prompt;
+pub mod task_graph;
 pub mod tool;
 pub mod tool_executors;
 pub mod tool_hooks;

@@ -7,7 +7,7 @@ import { encodeBase64 } from '@/encryption/base64';
 import { storage } from './storage';
 import { ApiEphemeralUpdateSchema, ApiMessage, ApiUpdateContainerSchema } from './apiTypes';
 import type { ApiEphemeralActivityUpdate } from './apiTypes';
-import { Session, Machine } from './storageTypes';
+import { Session, Machine, Persona } from './storageTypes';
 import { InvalidateSync } from '@/utils/sync';
 import { ActivityUpdateAccumulator } from './reducer/activityUpdateAccumulator';
 import { randomUUID } from 'expo-crypto';
@@ -31,9 +31,10 @@ import { log } from '@/log';
 import { gitStatusSync } from './gitStatusSync';
 import { projectManager } from './projectManager';
 import { frontendLog, isTauri as isTauriEnv } from '@/utils/tauri';
+import { canUseCloudServerAccess } from '@/config/capabilities';
 
-import { machineListSessions, machineReconnectSession } from './ops';
-import { fetchVendorUsage } from './apiVendorUsage';
+import { machineListSessions, machineReconnectSession, machineRefreshProxyProfiles } from './ops';
+import { fetchVendorQuota } from './apiVendorQuota';
 import { EncryptionCache } from './encryption/encryptionCache';
 import { systemPrompt } from './prompt/systemPrompt';
 import { getFriendsList, getUserProfile } from './apiFriends';
@@ -82,6 +83,44 @@ type PendingRelaySessionMessagesRequest = {
     timeout: ReturnType<typeof setTimeout>;
     resolve: (response: RelaySessionMessagesResponse) => void;
     reject: (error: Error) => void;
+};
+
+type PendingPersonaBinding = {
+    personaId: string;
+    pendingSessionId: string;
+    machineId: string;
+    attemptId?: string;
+    vendor?: string;
+    createdAt: number;
+};
+
+type QueuedPendingPersonaMessage = {
+    localId: string;
+    text: string;
+    displayText?: string;
+    images?: Array<{ media_type: string; data: string }>;
+    createdAt: number;
+};
+
+type PersonaSessionReadyHostEvent = {
+    type: 'persona-session-ready';
+    personaId: string;
+    pendingSessionId?: string;
+    attemptId?: string;
+    vendor?: string;
+    machineId?: string;
+    sessionId: string;
+    session?: Omit<Session, 'presence'> & { presence?: 'online' | number };
+};
+
+type PersonaSessionFailedHostEvent = {
+    type: 'persona-session-failed';
+    personaId: string;
+    pendingSessionId?: string;
+    attemptId?: string;
+    vendor?: string;
+    machineId?: string;
+    error?: string;
 };
 
 class RelaySessionMessagesError extends Error {
@@ -365,6 +404,31 @@ function extractTaskLifecycleEntry(rawContent: any, createdAt: number): SessionT
     return null;
 }
 
+function formatTransientExecutorError(message: string, recoverable?: boolean): string {
+    return recoverable ? `${message}\n\n可以修复后重试。` : message;
+}
+
+function transientNoticeFromRawRecord(rawRecord: RawRecord | null): string | null {
+    const content =
+        rawRecord?.content && !Array.isArray(rawRecord.content) && typeof rawRecord.content === 'object'
+            ? (rawRecord.content as Record<string, unknown>)
+            : null;
+    if (content?.type !== 'acp') {
+        return null;
+    }
+    const data =
+        content.data && typeof content.data === 'object'
+            ? (content.data as Record<string, unknown>)
+            : null;
+    if (data?.type !== 'error' || typeof data.message !== 'string') {
+        return null;
+    }
+    return formatTransientExecutorError(
+        data.message,
+        typeof data.recoverable === 'boolean' ? data.recoverable : undefined,
+    );
+}
+
 function normalizePromptSuggestions(suggestions: unknown): string[] | null {
     if (!Array.isArray(suggestions)) {
         return null;
@@ -458,7 +522,14 @@ function applyTokenCountToSession(sessionId: string, usage: SessionUsageSnapshot
     });
 }
 
-function normalizeContextUsagePayload(payload: unknown): number | null {
+type ContextUsageSnapshot = {
+    contextTokens: number;
+    contextWindowTokens?: number;
+    autoCompactTokenLimit?: number;
+    timestamp: number;
+};
+
+function normalizeContextUsagePayload(payload: unknown, timestamp: number): ContextUsageSnapshot | null {
     if (!payload || typeof payload !== 'object') {
         return null;
     }
@@ -468,15 +539,53 @@ function normalizeContextUsagePayload(payload: unknown): number | null {
     if (totalTokens == null || !Number.isFinite(totalTokens) || totalTokens < 0) {
         return null;
     }
-    return totalTokens;
+    const maxTokens = typeof data.max_tokens === 'number' && Number.isFinite(data.max_tokens) && data.max_tokens > 0
+        ? data.max_tokens
+        : undefined;
+    const autoCompactTokenLimit =
+        typeof data.auto_compact_token_limit === 'number' &&
+        Number.isFinite(data.auto_compact_token_limit) &&
+        data.auto_compact_token_limit > 0
+            ? data.auto_compact_token_limit
+            : undefined;
+    return {
+        contextTokens: totalTokens,
+        ...(maxTokens !== undefined ? { contextWindowTokens: maxTokens } : {}),
+        ...(autoCompactTokenLimit !== undefined ? { autoCompactTokenLimit } : {}),
+        timestamp,
+    };
 }
 
-function applyContextUsageToSession(sessionId: string, contextTokens: number) {
+function applyContextUsageToSession(sessionId: string, usage: ContextUsageSnapshot) {
     storage.setState((state) => {
         const session = state.sessions[sessionId];
-        if (!session || session.contextTokens === contextTokens) {
+        if (!session) {
             return state;
         }
+
+        const currentUsage =
+            state.sessionMessages[sessionId]?.reducerState.latestUsage ?? session.latestUsage ?? null;
+        const nextLatestUsage: SessionUsageSnapshot = {
+            inputTokens: currentUsage?.inputTokens ?? 0,
+            outputTokens: currentUsage?.outputTokens ?? 0,
+            cacheCreation: currentUsage?.cacheCreation ?? 0,
+            cacheRead: currentUsage?.cacheRead ?? 0,
+            contextSize: usage.contextTokens,
+            timestamp: usage.timestamp,
+        };
+
+        const sameLatestUsage =
+            currentUsage?.contextSize === nextLatestUsage.contextSize &&
+            currentUsage?.timestamp === nextLatestUsage.timestamp;
+        const sameSessionSnapshot =
+            session.contextTokens === usage.contextTokens &&
+            (usage.contextWindowTokens === undefined || session.contextWindowTokens === usage.contextWindowTokens) &&
+            (usage.autoCompactTokenLimit === undefined || session.autoCompactTokenLimit === usage.autoCompactTokenLimit);
+        if (sameLatestUsage && sameSessionSnapshot) {
+            return state;
+        }
+
+        const sessionMessages = state.sessionMessages[sessionId];
 
         return {
             ...state,
@@ -484,9 +593,24 @@ function applyContextUsageToSession(sessionId: string, contextTokens: number) {
                 ...state.sessions,
                 [sessionId]: {
                     ...session,
-                    contextTokens,
+                    contextTokens: usage.contextTokens,
+                    latestUsage: nextLatestUsage,
+                    ...(usage.contextWindowTokens !== undefined ? { contextWindowTokens: usage.contextWindowTokens } : {}),
+                    ...(usage.autoCompactTokenLimit !== undefined ? { autoCompactTokenLimit: usage.autoCompactTokenLimit } : {}),
                 },
             },
+            ...(sessionMessages ? {
+                sessionMessages: {
+                    ...state.sessionMessages,
+                    [sessionId]: {
+                        ...sessionMessages,
+                        reducerState: {
+                            ...sessionMessages.reducerState,
+                            latestUsage: nextLatestUsage,
+                        },
+                    },
+                },
+            } : {}),
         };
     });
 }
@@ -539,26 +663,39 @@ function applyPersistedSessionEffects(
             : null;
     const contextUsageUpdate =
         contentType === 'acp' && dataType === 'context_usage'
-            ? normalizeContextUsagePayload(data)
+            ? normalizeContextUsagePayload(data, createdAt)
             : null;
     const isAcpMessage = contentType === 'acp' && dataType === 'message';
     const isThinkingMessage = contentType === 'acp' && dataType === 'thinking';
-    const clearStreaming = isTaskComplete || isAcpMessage || isThinkingMessage || isAcpErrorMessage;
 
     const session = storage.getState().sessions[sessionId];
     if (session) {
+        // Message reloads replay a page of persisted history on every local
+        // append. During an active turn, older completed ACP records from
+        // previous turns must not clear the current transient streaming
+        // bubble. The current turn starts at `thinkingAt`; only persisted
+        // records created after that point are allowed to affect live status.
+        const isStaleForActiveTurn =
+            session.thinking === true &&
+            typeof session.thinkingAt === 'number' &&
+            createdAt < session.thinkingAt;
+        const shouldApplyLiveState = !isStaleForActiveTurn;
+        const shouldClearStreaming =
+            shouldApplyLiveState &&
+            (isTaskComplete || isAcpMessage || isThinkingMessage || isAcpErrorMessage);
         const nextSession: Session = {
             ...session,
             updatedAt: Math.max(session.updatedAt, createdAt),
-            ...(isTaskComplete ? { thinking: false } : {}),
-            ...(isTaskStarted ? { thinking: true, promptSuggestions: [] } : {}),
-            ...(sessionStatePatch ?? {}),
-            ...(promptSuggestions !== null ? { promptSuggestions } : {}),
-            ...((isAcpErrorMessage && !isRecoverableAcpError) ? { thinking: false } : {}),
+            ...(shouldApplyLiveState && isTaskComplete ? { thinking: false } : {}),
+            ...(shouldApplyLiveState && isTaskStarted ? { thinking: true, promptSuggestions: [], streamingNotice: undefined } : {}),
+            ...(shouldApplyLiveState ? (sessionStatePatch ?? {}) : {}),
+            ...(shouldApplyLiveState && promptSuggestions !== null ? { promptSuggestions } : {}),
+            ...(shouldApplyLiveState && (isAcpErrorMessage && !isRecoverableAcpError) ? { thinking: false } : {}),
+            ...(shouldApplyLiveState && (isAcpMessage || isThinkingMessage || (isAcpErrorMessage && !isRecoverableAcpError)) ? { streamingNotice: undefined } : {}),
             // Streaming bubbles live in the list footer. Once the persisted
             // ACP record arrives, clear them so completed thinking does not
             // stay pinned below later messages.
-            ...(clearStreaming ? { streamingText: undefined, streamingThinking: undefined } : {}),
+            ...(shouldClearStreaming ? { streamingText: undefined, streamingThinking: undefined } : {}),
         };
         applySessions([nextSession]);
     }
@@ -566,7 +703,7 @@ function applyPersistedSessionEffects(
     if (tokenCountUpdate) {
         applyTokenCountToSession(sessionId, tokenCountUpdate);
     }
-    if (contextUsageUpdate !== null) {
+    if (contextUsageUpdate) {
         applyContextUsageToSession(sessionId, contextUsageUpdate);
     }
 }
@@ -593,6 +730,11 @@ class Sync {
     private pendingSettings: Partial<Settings> = loadPendingSettings();
     private localShellMachineId: string | null = null;
     private pendingRelaySessionMessagesRequests = new Map<string, PendingRelaySessionMessagesRequest>();
+    private pendingPersonaBindings = new Map<string, PendingPersonaBinding>();
+    private pendingPersonaSessionByPersona = new Map<string, string>();
+    private pendingPersonaOutbox = new Map<string, QueuedPendingPersonaMessage[]>();
+    private completedPersonaSessions = new Map<string, { pendingSessionId: string; sessionId: string }>();
+    private failedPersonaSessions = new Map<string, PersonaSessionFailedHostEvent>();
 
     // One-shot callbacks for first-load detection (bypasses InvalidateSync queue)
     private _onSessionsFirstLoad: (() => void) | null = null;
@@ -695,9 +837,117 @@ class Sync {
                         }
                     );
 
-                    log.log('📥 local-session listeners registered (state-update, alive, message-appended)');
+                    await listen<{ sessionId: string; payload: string }>(
+                        'local-session:transient',
+                        (event) => {
+                            const { sessionId, payload } = event.payload ?? ({} as any);
+                            if (!sessionId || typeof payload !== 'string') return;
+                            const notice = transientNoticeFromRawRecord(parseLocalShellRawRecord(payload));
+                            if (!notice) return;
+                            const session = storage.getState().sessions[sessionId];
+                            if (!session) return;
+                            this.applySessions([{
+                                ...session,
+                                streamingText: undefined,
+                                streamingThinking: undefined,
+                                streamingNotice: notice,
+                                thinking: false,
+                            }]);
+                        }
+                    );
+
+                    // SubAgent lifecycle events from cteno-agent's
+                    // SubAgentManager (Spawned / Started / Completed /
+                    // Failed / Stopped). The Rust-side `subagent_mirror`
+                    // already updated its in-memory registry when this
+                    // event fires; we just notify any listening hooks
+                    // (currently `useBackgroundTasks` for BackgroundRunsModal)
+                    // so they re-fetch via the `list-subagents` RPC. The
+                    // mirror is the canonical source — no client-side
+                    // mirror needed.
+                    await listen<{ sessionId: string }>(
+                        'local-session:subagents-updated',
+                        (event) => {
+                            const sessionId = event.payload?.sessionId;
+                            if (!sessionId) return;
+                            log.log(`📥 local-session:subagents-updated ${sessionId}`);
+                            try {
+                                window.dispatchEvent(
+                                    new CustomEvent('cteno:subagents-updated', {
+                                        detail: { sessionId },
+                                    })
+                                );
+                            } catch (e) {
+                                log.log(`Failed to dispatch cteno:subagents-updated: ${e}`);
+                            }
+                        }
+                    );
+
+                    log.log('📥 local-session listeners registered (state-update, alive, message-appended, transient, subagents-updated)');
                 } catch (e) {
                     log.log(`Failed to register local-session listeners: ${e}`);
+                }
+            })();
+
+            // Host event bus: typed, transport-agnostic domain events emitted
+            // by the daemon. The Rust side fans each event to every installed
+            // HostEventSink; the Tauri sink forwards the serialised HostEvent
+            // verbatim on `local-host-event` so both community (no socket)
+            // and commercial builds receive updates locally.
+            (async () => {
+                try {
+                    const { listen } = await import('@tauri-apps/api/event');
+
+                    await listen<{
+                        type: 'persona-session-ready' | 'persona-session-failed' | 'a2ui-updated' | 'background-task-updated';
+                        personaId?: string;
+                        pendingSessionId?: string;
+                        attemptId?: string;
+                        vendor?: string;
+                        machineId?: string;
+                        sessionId?: string;
+                        session?: Omit<Session, 'presence'> & { presence?: 'online' | number };
+                        agentId?: string;
+                        task?: unknown;
+                        error?: string;
+                    }>('local-host-event', (event) => {
+                        const payload = event.payload;
+                        if (!payload || typeof payload !== 'object') return;
+                        switch (payload.type) {
+                            case 'persona-session-ready':
+                                void this.handlePersonaSessionReady(payload as PersonaSessionReadyHostEvent);
+                                if (payload.personaId) {
+                                    agentPushListeners.forEach(listener =>
+                                        listener(payload.personaId as string, 'persona_session_ready')
+                                    );
+                                }
+                                break;
+                            case 'persona-session-failed':
+                                this.handlePersonaSessionFailed(payload as PersonaSessionFailedHostEvent);
+                                if (payload.personaId) {
+                                    agentPushListeners.forEach(listener =>
+                                        listener(payload.personaId as string, 'persona_session_failed')
+                                    );
+                                }
+                                break;
+                            case 'a2ui-updated':
+                                if (payload.agentId) {
+                                    agentPushListeners.forEach(listener =>
+                                        listener(payload.agentId as string, 'a2ui_updated')
+                                    );
+                                }
+                                break;
+                            case 'background-task-updated':
+                                apiSocket.dispatchLocalMessage('background-task-update', payload.task ?? {});
+                                break;
+                            default:
+                                log.log(`📥 local-host-event: unknown type ${(payload as any).type}`);
+                        }
+                    });
+
+                    log.log('📥 local-host-event listener registered');
+                } catch (e) {
+                    log.log(`Failed to register local-host-event listener: ${e}`);
                 }
             })();
         }
@@ -733,6 +983,8 @@ class Sync {
 
         // Await profile sync to have fresh profile
         await this.profileSync.awaitQueue();
+
+        this.refreshLocalProxyProfiles();
     }
 
     async restore(credentials: AuthCredentials, encryption: Encryption) {
@@ -742,6 +994,7 @@ class Sync {
         this.anonID = encryption.anonID;
         this.serverID = parseToken(credentials.token);
         await this.#init();
+        this.refreshLocalProxyProfiles();
     }
 
     /**
@@ -873,13 +1126,34 @@ class Sync {
         storage.getState().applyMachines(machines, true);
         this.applySessions(sessions);
         storage.getState().applyReady();
+        this.refreshLocalProxyProfiles();
         frontendLog(
             `🏠 initializeLocalMode: ready with ${machines.length} machines and ${sessions.length} sessions`,
         );
     }
 
+    public refreshLocalProxyProfiles = () => {
+        if (!this.credentials?.token?.trim() || !isServerAvailable()) {
+            return;
+        }
+
+        void (async () => {
+            const machineId = await this.resolveLocalShellMachineId();
+            if (!machineId) {
+                return;
+            }
+
+            try {
+                const result = await machineRefreshProxyProfiles(machineId);
+                frontendLog(`[proxyProfiles] refreshed local cache for ${machineId}: ${JSON.stringify(result)}`);
+            } catch (error) {
+                frontendLog(`[proxyProfiles] failed to refresh local cache: ${String(error)}`, 'warn');
+            }
+        })();
+    }
+
     private hasServerAccess = (): boolean => {
-        return !!this.credentials?.token?.trim() && isServerAvailable();
+        return canUseCloudServerAccess(this.credentials?.token);
     }
 
     private getAvailableServerUrl = (): string | null => {
@@ -917,6 +1191,31 @@ class Sync {
         }
 
         pending.resolve(response);
+    }
+
+    private handleMessageAppended = (payload: unknown) => {
+        if (!payload || typeof payload !== 'object') {
+            return;
+        }
+        const data = payload as { sid?: unknown; message?: unknown; transient?: unknown };
+        if (data.transient !== true || typeof data.sid !== 'string' || typeof data.message !== 'string') {
+            return;
+        }
+        const notice = transientNoticeFromRawRecord(parseLocalShellRawRecord(data.message));
+        if (!notice) {
+            return;
+        }
+        const session = storage.getState().sessions[data.sid];
+        if (!session) {
+            return;
+        }
+        this.applySessions([{
+            ...session,
+            streamingText: undefined,
+            streamingThinking: undefined,
+            streamingNotice: notice,
+            thinking: false,
+        }]);
     }
 
     private applyCachedSessionMessages = (
@@ -1174,8 +1473,190 @@ class Sync {
         void this.loadVisibleSessionMessages(sessionId, { force: true });
     }
 
+    registerPendingPersonaSession(persona: Persona, machineId: string, options?: { pendingSessionId?: string; attemptId?: string; vendor?: string }) {
+        const pendingSessionId = options?.pendingSessionId || persona.chatSessionId;
+        if (!pendingSessionId?.startsWith('pending-')) {
+            return;
+        }
 
-    async sendMessage(sessionId: string, text: string, displayText?: string, images?: Array<{ media_type: string; data: string }>) {
+        const completed = this.completedPersonaSessions.get(persona.id);
+        if (completed?.pendingSessionId === pendingSessionId) {
+            const personas = storage.getState().cachedPersonas;
+            if (personas.some((item) => item.id === persona.id && item.chatSessionId !== completed.sessionId)) {
+                storage.getState().applyPersonas(personas.map((item) => (
+                    item.id === persona.id
+                        ? { ...item, chatSessionId: completed.sessionId }
+                        : item
+                )));
+            }
+            return;
+        }
+
+        const now = Date.now();
+        const vendor = options?.vendor || persona.agent || 'cteno';
+        this.pendingPersonaBindings.set(pendingSessionId, {
+            personaId: persona.id,
+            pendingSessionId,
+            machineId,
+            attemptId: options?.attemptId,
+            vendor,
+            createdAt: now,
+        });
+        this.pendingPersonaSessionByPersona.set(persona.id, pendingSessionId);
+
+        if (!storage.getState().sessions[pendingSessionId]) {
+            this.applySessions([{
+                id: pendingSessionId,
+                seq: 0,
+                createdAt: now,
+                updatedAt: now,
+                active: true,
+                activeAt: now,
+                metadata: {
+                    path: persona.workdir || '~',
+                    host: 'local-shell',
+                    name: persona.name || vendor,
+                    machineId,
+                    flavor: vendor,
+                    vendor,
+                    modelId: persona.modelId || undefined,
+                    pending: true,
+                    personaId: persona.id,
+                    summary: {
+                        text: '',
+                        updatedAt: now,
+                    },
+                } as any,
+                metadataVersion: 0,
+                agentState: null,
+                agentStateVersion: 0,
+                thinking: true,
+                thinkingAt: now,
+                thinkingStatus: '启动中',
+                permissionMode: 'default',
+                runtimeEffort: 'default',
+                sandboxPolicy: 'workspace_write',
+                modelMode: vendor === 'gemini' ? 'gemini-2.5-pro' : 'default',
+            }]);
+            storage.getState().setSessionMessagesStatus(pendingSessionId, {
+                isLoaded: true,
+                isSyncing: false,
+                relayError: null,
+            });
+        }
+
+        const failed = this.failedPersonaSessions.get(persona.id);
+        if (failed?.pendingSessionId === pendingSessionId) {
+            this.handlePersonaSessionFailed(failed);
+        }
+    }
+
+    private async handlePersonaSessionReady(payload: PersonaSessionReadyHostEvent) {
+        const pendingSessionId = payload.pendingSessionId
+            || this.pendingPersonaSessionByPersona.get(payload.personaId);
+        if (!pendingSessionId || !payload.sessionId) {
+            log.log(`persona-session-ready missing ids: ${JSON.stringify(payload)}`);
+            return;
+        }
+        this.completedPersonaSessions.set(payload.personaId, {
+            pendingSessionId,
+            sessionId: payload.sessionId,
+        });
+        this.failedPersonaSessions.delete(payload.personaId);
+
+        let session = payload.session;
+        const machineId = payload.machineId || this.pendingPersonaBindings.get(pendingSessionId)?.machineId;
+        if (!session && machineId) {
+            try {
+                const sessions = await machineListSessions(machineId);
+                session = sessions.find((item) => item.id === payload.sessionId);
+            } catch (error) {
+                log.log(`persona-session-ready could not fetch session ${payload.sessionId}: ${error}`);
+            }
+        }
+
+        if (session) {
+            storage.getState().bindPendingPersonaSession(pendingSessionId, session);
+        } else {
+            const existing = storage.getState().sessions[pendingSessionId];
+            if (existing) {
+                storage.getState().bindPendingPersonaSession(pendingSessionId, {
+                    ...existing,
+                    id: payload.sessionId,
+                    active: true,
+                    activeAt: Date.now(),
+                    updatedAt: Date.now(),
+                    thinking: false,
+                    thinkingStatus: undefined,
+                    metadata: {
+                        ...(existing.metadata ?? {}),
+                        pending: false,
+                        machineId,
+                        vendor: payload.vendor || existing.metadata?.vendor,
+                    } as any,
+                } as any);
+            }
+        }
+
+        const personas = storage.getState().cachedPersonas;
+        const nextPersonas = personas.map((persona) => (
+            persona.id === payload.personaId
+                ? { ...persona, chatSessionId: payload.sessionId }
+                : persona
+        ));
+        if (nextPersonas !== personas) {
+            storage.getState().applyPersonas(nextPersonas);
+        }
+
+        this.pendingPersonaBindings.delete(pendingSessionId);
+        this.pendingPersonaSessionByPersona.delete(payload.personaId);
+
+        const queue = (this.pendingPersonaOutbox.get(pendingSessionId) ?? [])
+            .slice()
+            .sort((a, b) => a.createdAt - b.createdAt);
+        this.pendingPersonaOutbox.delete(pendingSessionId);
+
+        for (const item of queue) {
+            await this.sendMessage(
+                payload.sessionId,
+                item.text,
+                item.displayText,
+                item.images,
+                { localId: item.localId, skipOptimistic: true }
+            );
+        }
+    }
+
+    private handlePersonaSessionFailed(payload: PersonaSessionFailedHostEvent) {
+        const pendingSessionId = payload.pendingSessionId
+            || this.pendingPersonaSessionByPersona.get(payload.personaId);
+        if (!pendingSessionId) {
+            return;
+        }
+        this.failedPersonaSessions.set(payload.personaId, payload);
+        const session = storage.getState().sessions[pendingSessionId];
+        if (session) {
+            this.applySessions([{
+                ...session,
+                active: false,
+                activeAt: Date.now(),
+                updatedAt: Date.now(),
+                thinking: false,
+                thinkingStatus: undefined,
+                streamingNotice: payload.error ? `启动失败：${payload.error}` : '启动失败',
+            }]);
+        }
+        log.log(`persona-session-failed ${payload.personaId}: ${payload.error || 'unknown error'}`);
+    }
+
+
+    async sendMessage(
+        sessionId: string,
+        text: string,
+        displayText?: string,
+        images?: Array<{ media_type: string; data: string }>,
+        options: { localId?: string; skipOptimistic?: boolean } = {},
+    ) {
         // Get session data from storage
         const session = storage.getState().sessions[sessionId];
         if (!session) {
@@ -1189,11 +1670,11 @@ class Sync {
 
         // Read model mode - for Gemini, default to gemini-2.5-pro if not set
         const flavor = session.metadata?.flavor;
-        const isGemini = flavor === 'gemini';
+        const isGemini = flavor === 'gemini' || session.metadata?.vendor === 'gemini';
         const modelMode = session.modelMode || (isGemini ? 'gemini-2.5-pro' : 'default');
 
         // Generate local ID
-        const localId = randomUUID();
+        const localId = options.localId || randomUUID();
 
         // Determine sentFrom based on platform
         let sentFrom: string;
@@ -1257,8 +1738,25 @@ class Sync {
         // Add to messages - normalize the raw record
         const createdAt = Date.now();
         const normalizedMessage = normalizeRawMessage(localId, localId, createdAt, content);
-        if (normalizedMessage) {
+        if (normalizedMessage && !options.skipOptimistic) {
             this.upsertSessionMessages(sessionId, [normalizedMessage]);
+        }
+
+        if (sessionId.startsWith('pending-')) {
+            const queue = this.pendingPersonaOutbox.get(sessionId) ?? [];
+            queue.push({ localId, text, displayText, images, createdAt });
+            this.pendingPersonaOutbox.set(sessionId, queue);
+            this.applySessions([{
+                ...session,
+                updatedAt: createdAt,
+                active: true,
+                activeAt: createdAt,
+                thinking: true,
+                thinkingAt: createdAt,
+                thinkingStatus: '启动中',
+            }]);
+            log.log(`queued message for pending persona session ${sessionId}`);
+            return;
         }
 
         // Try local IPC path first (Tauri desktop — bypasses server entirely)
@@ -1278,7 +1776,7 @@ class Sync {
                 }
 
                 // Create Tauri Channel for streaming deltas
-                const onEvent = new Channel<{ event: string; data?: { text?: string; message?: string } }>();
+                const onEvent = new Channel<{ event: string; data?: { text?: string; message?: string; recoverable?: boolean } }>();
                 // Typewriter state: queue of pending characters to animate
                 let typewriterQueue = '';
                 let typewriterTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1324,7 +1822,7 @@ class Sync {
                     }
                 };
 
-                onEvent.onmessage = (msg: { event: string; data?: { text?: string; message?: string } }) => {
+                onEvent.onmessage = (msg: { event: string; data?: { text?: string; message?: string; recoverable?: boolean } }) => {
                     const sess = storage.getState().sessions[sessionId];
                     if (!sess) return;
                     switch (msg.event) {
@@ -1332,7 +1830,7 @@ class Sync {
                             typewriterQueue = '';
                             if (typewriterTimer) { clearTimeout(typewriterTimer); typewriterTimer = null; }
                             lastTypewriterTickAt = nowForTypewriter();
-                            this.applySessions([{ ...sess, streamingText: undefined, streamingThinking: undefined, thinking: true }]);
+                            this.applySessions([{ ...sess, streamingText: undefined, streamingThinking: undefined, streamingNotice: undefined, thinking: true }]);
                             break;
                         case 'text-delta': {
                             const text = msg.data?.text || '';
@@ -1367,7 +1865,15 @@ class Sync {
                             flushTypewriter();
                             const s = storage.getState().sessions[sessionId];
                             if (s) {
-                                this.applySessions([{ ...s, streamingText: undefined, streamingThinking: undefined, thinking: false }]);
+                                this.applySessions([{
+                                    ...s,
+                                    streamingText: undefined,
+                                    streamingThinking: undefined,
+                                    streamingNotice: msg.data?.message && msg.data.recoverable
+                                        ? formatTransientExecutorError(msg.data.message, true)
+                                        : undefined,
+                                    thinking: false,
+                                }]);
                             }
                             break;
                         }
@@ -1539,6 +2045,14 @@ class Sync {
 
     public getCredentials() {
         return this.credentials;
+    }
+
+    public setLocalModeCredentials(credentials: AuthCredentials | null) {
+        if (credentials) {
+            this.credentials = credentials;
+            this.serverID = parseToken(credentials.token);
+            this.refreshLocalProxyProfiles();
+        }
     }
 
     private fetchMachines = async () => {
@@ -2121,6 +2635,7 @@ class Sync {
         // Subscribe to message updates
         apiSocket.onMessage('update', this.handleUpdate.bind(this));
         apiSocket.onMessage('ephemeral', this.handleEphemeralUpdate.bind(this));
+        apiSocket.onMessage('message-appended', this.handleMessageAppended.bind(this));
         apiSocket.onMessage('relay:session-messages-response', this.handleRelaySessionMessagesResponse);
 
         // Periodic machine status refresh (every 30 seconds)
@@ -2129,21 +2644,21 @@ class Sync {
             this.machinesSync.invalidate();
         }, 30000);
 
-        // Periodic vendor-usage poll (every 60s, aligned with the daemon's
+        // Periodic vendor-quota poll (every 60s, aligned with the daemon's
         // own probe interval). Reads the daemon's cached snapshot for every
         // known machine — local first, remote once the server connection is up.
-        const pollVendorUsage = async () => {
+        const pollVendorQuota = async () => {
             const ids = new Set<string>(Object.keys(storage.getState().machines));
             // Resolve the local shell id on-demand — `subscribeToUpdates` may
             // run before the machine list has loaded during cold boot.
             const localId = await this.resolveLocalShellMachineId().catch(() => null);
             if (localId) ids.add(localId);
             for (const id of ids) {
-                fetchVendorUsage(id).catch(() => {});
+                fetchVendorQuota(id).catch(() => {});
             }
         };
-        pollVendorUsage();
-        setInterval(pollVendorUsage, 60000);
+        pollVendorQuota();
+        setInterval(pollVendorQuota, 60000);
 
         // Subscribe to connection state changes
         apiSocket.onReconnected(() => {
@@ -2569,13 +3084,18 @@ export async function syncRestore(credentials: AuthCredentials) {
     await syncInit(credentials, true);
 }
 
-export async function syncInitLocalMode() {
+export async function syncInitLocalMode(credentials?: AuthCredentials | null) {
     if (isInitialized) {
         console.warn('Sync already initialized: ignoring');
         return;
     }
     isInitialized = true;
+    sync.setLocalModeCredentials(credentials ?? null);
     await sync.initializeLocalMode();
+}
+
+export function syncSetLocalModeCredentials(credentials: AuthCredentials | null) {
+    sync.setLocalModeCredentials(credentials);
 }
 
 async function syncInit(credentials: AuthCredentials, restore: boolean) {

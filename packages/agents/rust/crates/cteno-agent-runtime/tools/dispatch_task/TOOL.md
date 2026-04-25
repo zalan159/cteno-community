@@ -121,10 +121,10 @@ Each task in the graph can specify its own `profile_id`. Choose based on task re
 1. Call `memory_recall` FIRST to check for relevant past experience
 2. Formulate clear task instructions (include file paths, expected outputs)
 3. Call this tool with `task` (single) or `tasks` (graph)
-4. **Wait for results** — workers auto-push `[Task Complete]` messages
-5. For task graphs, you'll also receive `[Task Group Complete]` with a summary
-6. Use `send_to_session` to provide additional instructions if needed
-7. When satisfied, use `close_task_session` to close completed tasks
+4. **End your current turn immediately after dispatch** — give the user a brief one-line acknowledgement ("已派发，等通知中…") and stop. The runtime will auto-wake your session with `[Task Complete]` messages as each worker finishes; you do NOT need to poll.
+5. **DO NOT call `get_session_output` to check DAG progress.** That tool is for inspecting a single ad-hoc task session, not for tracking dispatched DAG nodes. Polling is wasted tokens and prevents the runtime's autonomous-wake notifications from showing in the UI as user-bubbles.
+6. When the runtime wakes you with `[Task Complete] X` handoff(s), summarize the new results for the user and decide whether to dispatch follow-up tasks.
+7. After every node finishes, you'll be woken with each remaining handoff in turn.
 
 ## Example: Task Graph
 

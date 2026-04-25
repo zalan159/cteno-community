@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, ActivityIndicator, Pressable, Linking } from 'react-native';
+import { View, Pressable, Linking } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolViewProps } from './_all';
@@ -30,7 +30,6 @@ export const BrowserNavigateView = React.memo<ToolViewProps>(({ tool }) => {
         return (
             <View style={styles.container}>
                 <View style={styles.row}>
-                    <ActivityIndicator size="small" />
                     <Text style={styles.runningText} numberOfLines={1}>
                         {url ? `Loading ${url}` : 'Navigating...'}
                     </Text>

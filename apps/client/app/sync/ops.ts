@@ -5,12 +5,14 @@
 
 import { apiSocket } from './apiSocket';
 import { fetchPublicProxyModels } from './apiBalance';
-import { mergeModelsWithServerProxyModels } from './modelOptions';
+import { filterProxyModelsForAuth, mergeModelsWithServerProxyModels } from './modelOptions';
 import {
     loadCachedVendorModelCatalog,
     saveCachedVendorModelCatalog,
 } from './modelCatalogCache';
 import { sync } from './sync';
+import { isServerAvailable } from './serverConfig';
+import { TokenStorage } from '@/auth/tokenStorage';
 import { storage } from './storage';
 import { kvGet, kvSet } from './apiKv';
 import { frontendLog } from '@/utils/tauri';
@@ -753,6 +755,7 @@ export interface VendorMeta {
     loggedIn?: boolean | null;
     capabilities: AgentCapabilities;
     status?: VendorStatusMeta;
+    connection?: VendorConnectionMeta;
 }
 
 export interface ResolvedVendorStatusMeta {
@@ -763,13 +766,14 @@ export interface ResolvedVendorStatusMeta {
     connection: VendorConnectionMeta;
 }
 
-export interface ResolvedVendorMeta extends Omit<VendorMeta, 'installed' | 'loggedIn' | 'status'> {
+export interface ResolvedVendorMeta extends Omit<VendorMeta, 'installed' | 'loggedIn' | 'status' | 'connection'> {
     installed: boolean;
     loggedIn: boolean | null;
     status: ResolvedVendorStatusMeta;
 }
 
 export function resolveVendorMeta(vendor: VendorMeta): ResolvedVendorMeta {
+    const { connection: topLevelConnection, ...vendorWithoutTopLevelConnection } = vendor;
     const installed = vendor.installed ?? vendor.available;
     const installState = vendor.status?.installState ?? (installed ? 'installed' : 'notInstalled');
     const authState = vendor.status?.authState
@@ -786,7 +790,7 @@ export function resolveVendorMeta(vendor: VendorMeta): ResolvedVendorMeta {
                 : null);
 
     return {
-        ...vendor,
+        ...vendorWithoutTopLevelConnection,
         available: installed,
         installed,
         loggedIn,
@@ -795,7 +799,7 @@ export function resolveVendorMeta(vendor: VendorMeta): ResolvedVendorMeta {
             authState,
             accountAuthenticated: vendor.status?.accountAuthenticated,
             machineAuthenticated: vendor.status?.machineAuthenticated,
-            connection: vendor.status?.connection ?? {
+            connection: vendor.status?.connection ?? topLevelConnection ?? {
                 state: 'unknown',
                 checkedAtUnixMs: 0,
             },
@@ -845,11 +849,27 @@ interface VendorMetaLike {
     installed?: boolean;
     loggedIn?: boolean | null;
     logged_in?: boolean | null;
+    connection?: VendorConnectionMetaLike | null;
     status?: VendorStatusMetaLike | null;
     capabilities?: AgentCapabilities & {
         runtimeControls?: RuntimeControlsLike;
         runtime_controls?: RuntimeControlsLike;
     };
+}
+
+interface ProbeVendorConnectionEnvelope {
+    success?: boolean;
+    vendor?: VendorName;
+    connection?: VendorConnectionMetaLike | null;
+    error?: string | null;
+}
+
+type ProbeVendorConnectionRpcResponse = VendorConnectionMetaLike | ProbeVendorConnectionEnvelope;
+
+function isProbeVendorConnectionEnvelope(
+    raw: ProbeVendorConnectionRpcResponse,
+): raw is ProbeVendorConnectionEnvelope {
+    return 'success' in raw || 'connection' in raw || 'vendor' in raw || 'error' in raw;
 }
 
 function normalizeVendorConnectionMeta(
@@ -954,6 +974,7 @@ function normalizeVendorMetaFromRpc(raw: VendorMetaLike): VendorMeta {
     const permissionFallback = legacyPermissionControl(capabilities.setPermissionMode);
 
     const status = normalizeVendorStatusMeta(raw.status);
+    const connection = normalizeVendorConnectionMeta(raw.connection);
     const meta: VendorMeta = {
         name: raw.name,
         available: raw.available !== false,
@@ -977,8 +998,32 @@ function normalizeVendorMetaFromRpc(raw: VendorMetaLike): VendorMeta {
     if (loggedIn === true || loggedIn === false || loggedIn === null) {
         meta.loggedIn = loggedIn;
     }
-    if (status) meta.status = status;
+    if (status || connection) {
+        meta.status = {
+            ...(status ?? {}),
+            ...(connection ? { connection } : {}),
+        };
+    }
     return meta;
+}
+
+function normalizeProbeVendorConnectionResponse(
+    raw: ProbeVendorConnectionRpcResponse,
+    vendor: VendorName,
+): VendorConnectionMeta {
+    if (isProbeVendorConnectionEnvelope(raw)) {
+        if (raw.success === false) {
+            throw new Error(raw.error || `Failed to probe ${vendor} connection`);
+        }
+        return normalizeVendorConnectionMeta(raw.connection) ?? {
+            state: 'unknown',
+            checkedAtUnixMs: 0,
+        };
+    }
+    return normalizeVendorConnectionMeta(raw) ?? {
+        state: 'unknown',
+        checkedAtUnixMs: 0,
+    };
 }
 
 function getCurrentSession(sessionId: string): Session | null {
@@ -1299,13 +1344,15 @@ export async function probeVendorConnection(
 ): Promise<VendorConnectionMeta> {
     if (!machineId) {
         const { invoke } = await import('@tauri-apps/api/core');
-        return (await invoke('probe_vendor_connection', { vendor })) as VendorConnectionMeta;
+        const raw = (await invoke('probe_vendor_connection', { vendor })) as ProbeVendorConnectionRpcResponse;
+        return normalizeProbeVendorConnectionResponse(raw, vendor);
     }
-    return await apiSocket.machineRPC<VendorConnectionMeta, { vendor: VendorName }>(
+    const raw = await apiSocket.machineRPC<ProbeVendorConnectionRpcResponse, { vendor: VendorName }>(
         machineId,
         'probe_vendor_connection',
         { vendor },
     );
+    return normalizeProbeVendorConnectionResponse(raw, vendor);
 }
 
 // ========== LLM Profile Management RPCs ==========
@@ -1330,6 +1377,9 @@ export interface ModelOptionDisplay {
     supportsVision?: boolean;
     supportsComputerUse?: boolean;
     apiFormat?: 'anthropic' | 'openai' | 'gemini';
+    thinking?: boolean;
+    supportsFunctionCalling?: boolean;
+    supportsImageOutput?: boolean;
     description?: string;
     isDefault?: boolean;
     defaultReasoningEffort?: import('./storageTypes').RuntimeEffort | null;
@@ -1354,6 +1404,9 @@ export interface LlmProfileInput {
     compress: LlmEndpointInput;
     supports_vision?: boolean;
     supports_computer_use?: boolean;
+    thinking?: boolean;
+    supports_function_calling?: boolean;
+    supports_image_output?: boolean;
     api_format?: 'anthropic' | 'openai' | 'gemini';
 }
 
@@ -1387,7 +1440,24 @@ interface RefreshProxyProfilesResponse {
     defaultProfileId: string;
 }
 
-async function machineRefreshProxyProfiles(machineId: string): Promise<RefreshProxyProfilesResponse> {
+function inferCtenoReasoningEfforts(model: ModelOptionDisplay): import('./storageTypes').RuntimeEffort[] {
+    if (model.supportedReasoningEfforts?.length) {
+        return model.supportedReasoningEfforts;
+    }
+
+    if (model.thinking !== true) {
+        return ['default'];
+    }
+
+    const modelId = (model.chat?.model || model.id || '').toLowerCase();
+    if (modelId.includes('deepseek-v4')) {
+        return ['default', 'high', 'max'];
+    }
+
+    return ['default', 'high', 'max'];
+}
+
+export async function machineRefreshProxyProfiles(machineId: string): Promise<RefreshProxyProfilesResponse> {
     const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('Proxy model refresh timed out')), 4000)
     );
@@ -1407,6 +1477,12 @@ export interface LlmProfileFull {
     name: string;
     chat: LlmEndpointInput;
     compress: LlmEndpointInput;
+    supports_vision?: boolean;
+    supports_computer_use?: boolean;
+    thinking?: boolean;
+    supports_function_calling?: boolean;
+    supports_image_output?: boolean;
+    api_format?: 'anthropic' | 'openai' | 'gemini';
 }
 
 export interface ExportProfilesResponse {
@@ -1575,14 +1651,20 @@ export async function machineListModels(
                 };
             }
 
-            const publicModelsPromise = fetchPublicProxyModels().catch((error) => {
-                console.warn('Failed to fetch models from app server:', error);
-                return null;
-            });
+            const authToken = sync.getCredentials()?.token ?? TokenStorage.peekCredentials()?.token;
+            const includeProxyModels = !!authToken?.trim() && isServerAvailable();
+            const publicModelsPromise = includeProxyModels
+                ? fetchPublicProxyModels().catch((error) => {
+                    console.warn('Failed to fetch models from app server:', error);
+                    return null;
+                })
+                : Promise.resolve(null);
 
-            await machineRefreshProxyProfiles(machineId).catch((error) => {
-                console.warn('Failed to refresh proxy models on machine:', error);
-            });
+            if (includeProxyModels) {
+                await machineRefreshProxyProfiles(machineId).catch((error) => {
+                    console.warn('Failed to refresh proxy models on machine:', error);
+                });
+            }
 
             const profileResult = await machineListProfiles(machineId);
             const publicModels = await publicModelsPromise;
@@ -1590,18 +1672,24 @@ export async function machineListModels(
             const mergedModels = proxyModelsToMerge.length
                 ? mergeModelsWithServerProxyModels(profileResult.profiles || [], proxyModelsToMerge)
                 : (profileResult.profiles || []);
-            const models = mergedModels
+            const authFilteredModels = filterProxyModelsForAuth(mergedModels, includeProxyModels);
+            const models = authFilteredModels
                 .map((model) => ({
                     ...model,
                     sourceType: (model.isProxy ? 'proxy' : 'byok') as 'proxy' | 'byok',
+                    supportedReasoningEfforts: inferCtenoReasoningEfforts(model),
                 }));
+            const fallbackDefaultModelId = models[0]?.id
+                || (includeProxyModels ? profileResult.defaultProfileId : undefined)
+                || 'default';
             const defaultModelId = models.some((model) => model.id === profileResult.defaultProfileId)
                 ? profileResult.defaultProfileId
-                : (models[0]?.id || profileResult.defaultProfileId || 'default');
+                : fallbackDefaultModelId;
 
             frontendLog(`[machineListModels] ${JSON.stringify({
                 machineId,
                 vendor: normalizedVendor,
+                includeProxyModels,
                 publicModelCount: proxyModelsToMerge.length,
                 publicModelIds: proxyModelsToMerge.slice(0, 12).map((model) => model.id),
                 profileCount: (profileResult.profiles || []).length,
@@ -1655,6 +1743,24 @@ export async function machineSaveProfile(machineId: string, profile: LlmProfileI
         machineId,
         'save-profile',
         { profile }
+    );
+}
+
+/**
+ * Save a Coding Plan model group atomically and set the recommended profile as default.
+ */
+export async function machineSaveCodingPlanProfiles(
+    machineId: string,
+    profiles: LlmProfileInput[],
+    defaultProfileId: string
+): Promise<{ success: boolean; count?: number; defaultProfileId?: string; error?: string }> {
+    return await apiSocket.machineRPC<
+        { success: boolean; count?: number; defaultProfileId?: string; error?: string },
+        { profiles: LlmProfileInput[]; defaultProfileId: string }
+    >(
+        machineId,
+        'save-coding-plan-profiles',
+        { profiles, defaultProfileId }
     );
 }
 
@@ -2575,10 +2681,10 @@ export async function machineCreatePersona(
         workdir?: string;
         agent?: VendorName;
     }
-): Promise<{ success: boolean; persona?: Persona; error?: string }> {
+): Promise<{ success: boolean; persona?: Persona; error?: string; pendingSessionId?: string; attemptId?: string; lifecycle?: 'creating' | 'ready' }> {
     try {
         const result = await apiSocket.machineRPC<
-            { success: boolean; persona?: Persona; error?: string },
+            { success: boolean; persona?: Persona; error?: string; pendingSessionId?: string; attemptId?: string; lifecycle?: 'creating' | 'ready' },
             typeof params
         >(
             machineId,

@@ -22,7 +22,7 @@ const COMPRESS_MODEL_INPUT_FRACTION: f32 = 0.7;
 /// Each tier: (model_id, context_window_tokens, max_input_tokens_for_this_tier)
 ///   - max_input = context_window * COMPRESS_MODEL_INPUT_FRACTION
 const COMPRESS_TIERS: &[(&str, usize)] = &[
-    ("deepseek-chat", 128_000),           // DeepSeek V3, input < ~90K tokens
+    ("deepseek-v4-flash", 1_000_000),     // DeepSeek V4 Flash, input < ~700K tokens
     ("minimax/minimax-m2.5", 200_000),    // MiniMax M2.5, input < ~140K tokens
     ("bailian/qwen3.5-flash", 1_000_000), // 千问 3.5 Flash, input < ~700K tokens
 ];
@@ -53,11 +53,11 @@ impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
             min_messages_for_compression: 20,
-            // DeepSeek supports a 128k context window (prompt + completion).
+            // DeepSeek V4 Flash supports a 1M context window (prompt + completion).
             // We trigger compression at 50% usage to preserve headroom.
-            context_window_tokens: 128_000,
-            token_threshold_fraction: 0.8, // Compress at 80% => ~102k
-            compression_model: "deepseek-chat".to_string(),
+            context_window_tokens: 1_000_000,
+            token_threshold_fraction: 0.8, // Compress at 80% => ~800k
+            compression_model: "deepseek-v4-flash".to_string(),
             max_compression_tokens: 2000,
         }
     }
@@ -70,6 +70,7 @@ fn context_window_for_model(model: &str) -> u32 {
         m if m.contains("minimax") => 200_000,
         m if m.contains("qwen") => 200_000,
         m if m.contains("glm-") => 200_000,
+        m if m.contains("deepseek-v4") => 1_000_000,
         m if m.contains("deepseek") => 128_000,
         m if m.contains("claude") => 200_000,
         m if m.contains("gpt-4") => 128_000,
@@ -292,7 +293,7 @@ impl CompressionService {
     /// Select the best compression model tier based on estimated input tokens.
     ///
     /// Tiers (cheapest first):
-    ///   1. deepseek-chat (128K)
+    ///   1. deepseek-v4-flash (1M)
     ///   2. minimax-m2.5 (200K)
     ///   3. qwen3.5-flash (1M)
     ///
@@ -318,7 +319,7 @@ impl CompressionService {
     /// following the "handoff summary" pattern from OpenAI Codex CLI.
     ///
     /// Automatically selects the cheapest compression model that can fit the input:
-    ///   - deepseek-chat (128K) → minimax-m2.5 (200K) → qwen3.5-flash (1M)
+    ///   - deepseek-v4-flash (1M) → minimax-m2.5 (200K) → qwen3.5-flash (1M)
     async fn generate_handoff_summary(
         &self,
         client: &LLMClient,
@@ -377,6 +378,7 @@ Conversation to summarize:
                 self.config.max_compression_tokens,
                 None,  // No streaming for compression
                 false, // No thinking for compression
+                None,
             )
             .await
         {
@@ -672,17 +674,17 @@ mod tests {
 
     #[test]
     fn test_select_compress_tier() {
-        // Small input → deepseek-chat (128K)
+        // Small input → deepseek-v4-flash (1M)
         let (model, _) = CompressionService::select_compress_tier(50_000);
-        assert_eq!(model, "deepseek-chat");
+        assert_eq!(model, "deepseek-v4-flash");
 
-        // Medium input (> 128K * 0.7 = 89.6K) → minimax-m2.5
+        // Still fits DeepSeek V4 Flash's 1M window.
         let (model, _) = CompressionService::select_compress_tier(100_000);
-        assert_eq!(model, "minimax/minimax-m2.5");
+        assert_eq!(model, "deepseek-v4-flash");
 
-        // Large input (> 200K * 0.7 = 140K) → qwen3.5-flash
+        // Large input still fits DeepSeek V4 Flash's 700K input budget.
         let (model, _) = CompressionService::select_compress_tier(150_000);
-        assert_eq!(model, "bailian/qwen3.5-flash");
+        assert_eq!(model, "deepseek-v4-flash");
 
         // Very large input (> 1M * 0.7 = 700K) → still qwen3.5-flash (largest tier)
         let (model, _) = CompressionService::select_compress_tier(800_000);

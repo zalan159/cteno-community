@@ -253,9 +253,9 @@ const rawAgentRecordSchema = z.discriminatedUnion('type', [z.object({
     provider: z.enum(['gemini', 'codex', 'claude', 'opencode', 'cteno']),
     data: z.discriminatedUnion('type', [
         // Core message types
-        z.object({ type: z.literal('reasoning'), message: z.string() }),
-        z.object({ type: z.literal('message'), message: z.string() }),
-        z.object({ type: z.literal('thinking'), text: z.string() }),
+        z.object({ type: z.literal('reasoning'), message: z.string() }).passthrough(),
+        z.object({ type: z.literal('message'), message: z.string() }).passthrough(),
+        z.object({ type: z.literal('thinking'), text: z.string() }).passthrough(),
         z.object({ type: z.literal('image'), source: z.object({ type: z.string(), media_type: z.string(), data: z.string() }).optional(), image_url: z.string().optional() }),
         z.object({
             type: z.literal('error'),
@@ -269,12 +269,12 @@ const rawAgentRecordSchema = z.discriminatedUnion('type', [z.object({
             input: z.any(),
             name: z.string(),
             id: z.string()
-        }),
+        }).passthrough(),
         z.object({
             type: z.literal('tool-call-delta'),
             callId: z.string(),
             patch: z.any(),
-        }),
+        }).passthrough(),
         z.object({
             type: z.literal('tool-result'),
             callId: z.string(),
@@ -286,7 +286,7 @@ const rawAgentRecordSchema = z.discriminatedUnion('type', [z.object({
             content: rawToolResultPayloadSchema.optional(),
             id: z.string(),
             isError: z.boolean().optional()
-        }),
+        }).passthrough(),
         // Hyphenated tool-call-result (for backwards compatibility with CLI)
         z.object({
             type: z.literal('tool-call-result'),
@@ -441,11 +441,13 @@ type NormalizedAgentContent =
         text: string;
         uuid: string;
         parentUUID: string | null;
+        parentToolUseId?: string | null;
     } | {
         type: 'thinking';
         thinking: string;
         uuid: string;
         parentUUID: string | null;
+        parentToolUseId?: string | null;
     } | {
         type: 'image';
         source?: {
@@ -464,12 +466,14 @@ type NormalizedAgentContent =
         description: string | null;
         uuid: string;
         parentUUID: string | null;
+        parentToolUseId?: string | null;
     } | {
         type: 'tool-call-delta';
         id: string;
         patch: any;
         uuid: string;
         parentUUID: string | null;
+        parentToolUseId?: string | null;
     } | {
         type: 'tool-result'
         tool_use_id: string;
@@ -477,6 +481,7 @@ type NormalizedAgentContent =
         is_error: boolean;
         uuid: string;
         parentUUID: string | null;
+        parentToolUseId?: string | null;
         permissions?: {
             date: number;
             result: 'approved' | 'denied';
@@ -491,6 +496,7 @@ type NormalizedAgentContent =
         type: 'sidechain'
         uuid: string;
         prompt: string
+        parentToolUseId?: string | null;
     };
 
 function formatExecutorErrorMessage(message: string, recoverable: boolean): string {
@@ -562,19 +568,22 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                 if (!raw.content.data.uuid) {
                     return null;
                 }
+                const parentToolUseId = raw.content.data.parent_tool_use_id ?? null;
                 let content: NormalizedAgentContent[] = [];
                 for (let c of raw.content.data.message.content) {
                     if (c.type === 'text') {
                         content.push({
                             ...c,  // WOLOG: Preserve all fields including unknown ones
                             uuid: raw.content.data.uuid,
-                            parentUUID: raw.content.data.parentUuid ?? null
+                            parentUUID: raw.content.data.parentUuid ?? null,
+                            parentToolUseId
                         } as NormalizedAgentContent);
                     } else if (c.type === 'thinking') {
                         content.push({
                             ...c,  // WOLOG: Preserve all fields including unknown ones (signature, etc.)
                             uuid: raw.content.data.uuid,
-                            parentUUID: raw.content.data.parentUuid ?? null
+                            parentUUID: raw.content.data.parentUuid ?? null,
+                            parentToolUseId
                         } as NormalizedAgentContent);
                     } else if (c.type === 'tool_use') {
                         let description: string | null = null;
@@ -586,7 +595,8 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                             type: 'tool-call',
                             description,
                             uuid: raw.content.data.uuid,
-                            parentUUID: raw.content.data.parentUuid ?? null
+                            parentUUID: raw.content.data.parentUuid ?? null,
+                            parentToolUseId
                         } as NormalizedAgentContent);
                     }
                 }
@@ -595,7 +605,7 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: raw.content.data.isSidechain ?? false,
+                    isSidechain: raw.content.data.isSidechain ?? !!parentToolUseId,
                     content,
                     meta: raw.meta,
                     usage: raw.content.data.message.usage
@@ -606,7 +616,8 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                 }
 
                 // Handle sidechain user messages
-                if (raw.content.data.isSidechain && raw.content.data.message && typeof raw.content.data.message.content === 'string') {
+                const parentToolUseId = raw.content.data.parent_tool_use_id ?? null;
+                if ((raw.content.data.isSidechain || parentToolUseId) && raw.content.data.message && typeof raw.content.data.message.content === 'string') {
                     // Return as a special agent message with sidechain content
                     return {
                         id,
@@ -617,7 +628,8 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                         content: [{
                             type: 'sidechain',
                             uuid: raw.content.data.uuid,
-                            prompt: raw.content.data.message.content
+                            prompt: raw.content.data.message.content,
+                            parentToolUseId
                         }]
                     };
                 }
@@ -643,9 +655,10 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                     content.push({
                         type: 'text',
                         text: raw.content.data.message.content,
-                        uuid: raw.content.data.uuid,
-                        parentUUID: raw.content.data.parentUuid ?? null
-                    });
+                                uuid: raw.content.data.uuid,
+                                parentUUID: raw.content.data.parentUuid ?? null,
+                                parentToolUseId
+                            });
                 } else {
                     for (let c of raw.content.data.message.content) {
                         if (c.type === 'tool_result') {
@@ -656,6 +669,7 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                                 is_error: c.is_error || false,
                                 uuid: raw.content.data.uuid,
                                 parentUUID: raw.content.data.parentUuid ?? null,
+                                parentToolUseId,
                                 permissions: c.permissions ? {
                                     date: c.permissions.date,
                                     result: c.permissions.result,
@@ -672,7 +686,7 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: raw.content.data.isSidechain ?? false,
+                    isSidechain: raw.content.data.isSidechain ?? !!parentToolUseId,
                     content,
                     meta: raw.meta
                 };
@@ -766,17 +780,24 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
         // ACP (Agent Communication Protocol) - unified format for all agent providers
         if (raw.content.type === 'acp') {
             if (raw.content.data.type === 'message') {
+                const data = raw.content.data as typeof raw.content.data & {
+                    isSidechain?: boolean;
+                    parentToolUseId?: string;
+                    uuid?: string;
+                    parentUuid?: string | null;
+                };
                 return {
                     id,
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: false,
+                    isSidechain: data.isSidechain ?? false,
                     content: [{
                         type: 'text',
-                        text: raw.content.data.message,
-                        uuid: id,
-                        parentUUID: null
+                        text: data.message,
+                        uuid: data.uuid ?? id,
+                        parentUUID: data.parentUuid ?? null,
+                        parentToolUseId: data.parentToolUseId ?? null
                     }],
                     meta: raw.meta
                 } satisfies NormalizedMessage;
@@ -798,71 +819,99 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                 } satisfies NormalizedMessage;
             }
             if (raw.content.data.type === 'reasoning') {
+                const data = raw.content.data as typeof raw.content.data & {
+                    isSidechain?: boolean;
+                    parentToolUseId?: string;
+                    uuid?: string;
+                    parentUuid?: string | null;
+                };
                 return {
                     id,
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: false,
+                    isSidechain: data.isSidechain ?? false,
                     content: [{
                         type: 'thinking',
-                        thinking: raw.content.data.message,
-                        uuid: id,
-                        parentUUID: null
+                        thinking: data.message,
+                        uuid: data.uuid ?? id,
+                        parentUUID: data.parentUuid ?? null,
+                        parentToolUseId: data.parentToolUseId ?? null
                     }],
                     meta: raw.meta
                 } satisfies NormalizedMessage;
             }
             if (raw.content.data.type === 'tool-call') {
+                const data = raw.content.data as typeof raw.content.data & {
+                    isSidechain?: boolean;
+                    parentToolUseId?: string;
+                    uuid?: string;
+                    parentUuid?: string | null;
+                };
                 return {
                     id,
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: false,
+                    isSidechain: data.isSidechain ?? false,
                     content: [{
                         type: 'tool-call',
-                        id: raw.content.data.callId,
-                        name: raw.content.data.name || 'unknown',
-                        input: raw.content.data.input,
+                        id: data.callId,
+                        name: data.name || 'unknown',
+                        input: data.input,
                         description: null,
-                        uuid: raw.content.data.id,
-                        parentUUID: null
+                        uuid: data.uuid ?? data.id,
+                        parentUUID: data.parentUuid ?? null,
+                        parentToolUseId: data.parentToolUseId ?? null
                     }],
                     meta: raw.meta
                 } satisfies NormalizedMessage;
             }
             if (raw.content.data.type === 'tool-call-delta') {
+                const data = raw.content.data as typeof raw.content.data & {
+                    isSidechain?: boolean;
+                    parentToolUseId?: string;
+                    uuid?: string;
+                    parentUuid?: string | null;
+                };
                 return {
                     id,
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: false,
+                    isSidechain: data.isSidechain ?? false,
                     content: [{
                         type: 'tool-call-delta',
-                        id: raw.content.data.callId,
-                        patch: raw.content.data.patch,
-                        uuid: id,
-                        parentUUID: null,
+                        id: data.callId,
+                        patch: data.patch,
+                        uuid: data.uuid ?? id,
+                        parentUUID: data.parentUuid ?? null,
+                        parentToolUseId: data.parentToolUseId ?? null
                     }],
                     meta: raw.meta
                 } satisfies NormalizedMessage;
             }
             if (raw.content.data.type === 'tool-result') {
+                const data = raw.content.data as typeof raw.content.data & {
+                    isSidechain?: boolean;
+                    parentToolUseId?: string;
+                    uuid?: string;
+                    parentUuid?: string | null;
+                };
                 return {
                     id,
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: false,
+                    isSidechain: data.isSidechain ?? false,
                     content: [{
                         type: 'tool-result',
-                        tool_use_id: raw.content.data.callId,
-                        content: flattenToolResultPayload(raw.content.data.content, raw.content.data.output),
-                        is_error: raw.content.data.isError ?? false,
-                        uuid: raw.content.data.id,
-                        parentUUID: null
+                        tool_use_id: data.callId,
+                        content: flattenToolResultPayload(data.content, data.output),
+                        is_error: data.isError ?? false,
+                        uuid: data.uuid ?? data.id,
+                        parentUUID: data.parentUuid ?? null,
+                        parentToolUseId: data.parentToolUseId ?? null
                     }],
                     meta: raw.meta
                 } satisfies NormalizedMessage;
@@ -887,17 +936,24 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                 } satisfies NormalizedMessage;
             }
             if (raw.content.data.type === 'thinking') {
+                const data = raw.content.data as typeof raw.content.data & {
+                    isSidechain?: boolean;
+                    parentToolUseId?: string;
+                    uuid?: string;
+                    parentUuid?: string | null;
+                };
                 return {
                     id,
                     localId,
                     createdAt,
                     role: 'agent',
-                    isSidechain: false,
+                    isSidechain: data.isSidechain ?? false,
                     content: [{
                         type: 'thinking',
-                        thinking: raw.content.data.text,
-                        uuid: id,
-                        parentUUID: null
+                        thinking: data.text,
+                        uuid: data.uuid ?? id,
+                        parentUUID: data.parentUuid ?? null,
+                        parentToolUseId: data.parentToolUseId ?? null
                     }],
                     meta: raw.meta
                 } satisfies NormalizedMessage;
@@ -965,24 +1021,11 @@ export function normalizeRawMessage(id: string, localId: string | null, createdA
                 } satisfies NormalizedMessage;
             }
             if (raw.content.data.type === 'permission-request') {
-                // Map permission-request to tool-call for UI to show permission dialog
-                return {
-                    id,
-                    localId,
-                    createdAt,
-                    role: 'agent',
-                    isSidechain: false,
-                    content: [{
-                        type: 'tool-call',
-                        id: raw.content.data.permissionId,
-                        name: raw.content.data.toolName,
-                        input: raw.content.data.options ?? {},
-                        description: raw.content.data.description ?? null,
-                        uuid: id,
-                        parentUUID: null
-                    }],
-                    meta: raw.meta
-                } satisfies NormalizedMessage;
+                // Permission prompts are session input-gate state, not chat
+                // history. They render from session.agentState above the
+                // composer so refresh/reconnect does not depend on a message
+                // card staying mounted.
+                return null;
             }
             // Task lifecycle events (task_started, task_complete, turn_aborted),
             // session-state, prompt-suggestion, token_count, context_usage

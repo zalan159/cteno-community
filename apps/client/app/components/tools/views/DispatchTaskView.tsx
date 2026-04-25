@@ -5,6 +5,7 @@ import { Ionicons, Octicons } from '@expo/vector-icons';
 import Svg, { Path, Defs, Marker, Polygon } from 'react-native-svg';
 import type { ToolViewProps } from './_all';
 import { Text } from '@/components/StyledText';
+import type { Message } from '@/sync/typesMessage';
 
 interface TaskNode {
     id: string;
@@ -24,6 +25,51 @@ interface GraphResult {
 interface SingleResult {
     session_id: string;
     message: string;
+}
+
+function collectTimeline(messages: Message[]): Array<{ id: string; text: string }> {
+    const items: Array<{ id: string; text: string }> = [];
+
+    function visit(message: Message) {
+        if (message.kind === 'agent-text' || message.kind === 'user-text') {
+            const text = message.text.trim();
+            if (text.length > 0) {
+                items.push({ id: message.id, text });
+            }
+            return;
+        }
+
+        if (message.kind === 'tool-call') {
+            for (const child of message.children) {
+                visit(child);
+            }
+        }
+    }
+
+    for (const message of messages) {
+        visit(message);
+    }
+
+    return items.slice(Math.max(0, items.length - 6));
+}
+
+function TaskTimeline({ messages }: { messages: Message[] }) {
+    const timeline = collectTimeline(messages);
+    if (timeline.length === 0) {
+        return null;
+    }
+
+    return (
+        <View style={styles.timeline}>
+            {timeline.map((item, index) => (
+                <View key={`${item.id}-${index}`} style={styles.timelineItem}>
+                    <Text style={styles.timelineText} numberOfLines={5}>
+                        {item.text}
+                    </Text>
+                </View>
+            ))}
+        </View>
+    );
 }
 
 // Topological layering
@@ -82,7 +128,7 @@ function buildLayout(layers: TaskNode[][]) {
 }
 
 // Single task card
-function SingleTaskCard({ tool }: { tool: ToolViewProps['tool'] }) {
+function SingleTaskCard({ tool, messages }: { tool: ToolViewProps['tool']; messages: Message[] }) {
     const task = tool.input?.task as string;
     let result: SingleResult | null = null;
 
@@ -101,12 +147,13 @@ function SingleTaskCard({ tool }: { tool: ToolViewProps['tool'] }) {
                     <Text style={styles.sessionId}>{result.session_id}</Text>
                 </View>
             )}
+            <TaskTimeline messages={messages} />
         </View>
     );
 }
 
 // DAG view: SVG edges + absolute-positioned RN nodes
-function TaskGraphView({ tool }: ToolViewProps) {
+function TaskGraphView({ tool, messages }: ToolViewProps) {
     const tasks: TaskNode[] = tool.input?.tasks || [];
     let result: GraphResult | null = null;
 
@@ -235,6 +282,7 @@ function TaskGraphView({ tool }: ToolViewProps) {
                     );
                 })}
             </View>
+            <TaskTimeline messages={messages ?? []} />
         </View>
     );
 }
@@ -246,7 +294,7 @@ export const DispatchTaskView = (props: ToolViewProps) => {
         return <TaskGraphView {...props} />;
     }
 
-    return <SingleTaskCard tool={tool} />;
+    return <SingleTaskCard tool={tool} messages={props.messages ?? []} />;
 };
 
 const dagStyles = StyleSheet.create((theme) => ({
@@ -302,5 +350,20 @@ const styles = StyleSheet.create((theme) => ({
         fontSize: 12,
         color: theme.colors.text,
         fontWeight: '500',
+    },
+    timeline: {
+        gap: 6,
+        paddingTop: 2,
+    },
+    timelineItem: {
+        borderLeftWidth: 2,
+        borderLeftColor: theme.colors.divider,
+        paddingLeft: 8,
+        paddingVertical: 2,
+    },
+    timelineText: {
+        fontSize: 13,
+        lineHeight: 18,
+        color: theme.colors.textSecondary,
     },
 }));

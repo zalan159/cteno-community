@@ -8,13 +8,13 @@
 //!   the full built-in set so the ReAct loop has real tools.
 //! - Future Tauri host (`apps/client/desktop`): can call the same function to
 //!   avoid duplicating the tool inventory; host-specific tools (memory,
-//!   skill, wait, a2ui_render, start_subagent, dispatch_task, …) are
-//!   registered separately with their respective provider hooks.
+//!   skill, wait, a2ui_render, …) are registered separately with their
+//!   respective provider hooks.
 //!
 //! Tools that *require* a host provider (SkillRegistryProvider,
-//! PersonaDispatchProvider, A2uiStoreProvider, MachineSocketProvider,
-//! SpawnConfigProvider, SessionWaker, SubagentBootstrapProvider,
-//! AgentOwnerProvider, CommandInterceptorProvider) are intentionally absent
+//! PersonaDispatchProvider, A2uiStoreProvider, SpawnConfigProvider,
+//! SessionWaker, AgentOwnerProvider,
+//! CommandInterceptorProvider, HostEventEmitter) are intentionally absent
 //! from this list. Registering them without their hooks would surface
 //! "hook not installed" errors at call time — better to omit them entirely
 //! so the LLM never sees them.
@@ -33,10 +33,10 @@ use crate::tool::{ToolCategory, ToolConfig};
 use crate::tool_executors::oss_upload::OssUploader;
 use crate::tool_executors::{
     BrowserActionExecutor, BrowserAdapterExecutor, BrowserCdpExecutor, BrowserManageExecutor,
-    BrowserNavigateExecutor, BrowserNetworkExecutor, ComputerUseExecutor, CoordScale, EditExecutor,
-    FetchExecutor, GetSessionOutputExecutor, GlobExecutor, GrepExecutor, ImageGenerationExecutor,
-    QuerySubAgentExecutor, ReadExecutor, RunManagerExecutor, ScreenshotExecutor, ShellExecutor,
-    StopSubAgentExecutor, ToolSearchExecutor, UpdatePlanExecutor, UploadArtifactExecutor,
+    BrowserNavigateExecutor, BrowserNetworkExecutor, ComputerUseExecutor, CoordScale,
+    DispatchTaskExecutor, EditExecutor, FetchExecutor, GlobExecutor,
+    GrepExecutor, ImageGenerationExecutor, ReadExecutor, RunManagerExecutor, ScreenshotExecutor,
+    ShellExecutor, ToolSearchExecutor, UpdatePlanExecutor, UploadArtifactExecutor,
     WebSearchExecutor, WriteExecutor,
 };
 
@@ -115,7 +115,7 @@ pub fn register_all_builtin_executors(
     registry.register(
         sys(
             "update_plan",
-            "Update the agent's task plan (TodoWrite equivalent).",
+            "Update the agent's task plan.",
             update_plan_schema(),
         ),
         Arc::new(UpdatePlanExecutor::new()),
@@ -141,32 +141,18 @@ pub fn register_all_builtin_executors(
         Arc::new(ToolSearchExecutor::new()),
     );
 
-    // --- session introspection ---
+    // --- session-local task orchestration ---
+    //
+    // `dispatch_task` is the product-level Cteno task primitive. Single-task
+    // dispatch and DAG dispatch both flow through it, while low-level
+    // SubAgentManager primitives (start/query/stop_subagent) remain available
+    // to code/RPC/debug paths but are intentionally hidden from the default
+    // ReAct tool surface. Exposing both levels caused models to start a
+    // subagent and then poll it with query_subagent instead of waiting for the
+    // runtime completion notification.
     registry.register(
-        sys(
-            "get_session_output",
-            "Retrieve the last N messages from a task session.",
-            get_session_output_schema(),
-        ),
-        Arc::new(GetSessionOutputExecutor::new(data_dir.clone())),
-    );
-
-    // --- subagent query / stop (start_subagent lives host-side) ---
-    registry.register(
-        sys(
-            "query_subagent",
-            "Query status and results of SubAgent tasks.",
-            query_subagent_schema(),
-        ),
-        Arc::new(QuerySubAgentExecutor::new()),
-    );
-    registry.register(
-        sys(
-            "stop_subagent",
-            "Stop a running SubAgent task.",
-            stop_subagent_schema(),
-        ),
-        Arc::new(StopSubAgentExecutor::new()),
+        dispatch_task_config(),
+        Arc::new(DispatchTaskExecutor::new()),
     );
 
     // --- happy-server-assisted tools ---
@@ -308,6 +294,23 @@ fn sys(id: &str, description: &str, schema: Value) -> ToolConfig {
     }
 }
 
+fn dispatch_task_config() -> ToolConfig {
+    ToolConfig {
+        id: "dispatch_task".to_string(),
+        name: "dispatch_task".to_string(),
+        description: "Dispatch one background task or a DAG/task graph to runtime-managed SubAgents. Use this whenever the user says DAG, task graph, dependency graph, complex task group, parallel tasks, or fan-in/fan-out.".to_string(),
+        category: ToolCategory::System,
+        input_schema: dispatch_task_schema(),
+        instructions: "For a DAG/task graph, call dispatch_task with the `tasks` array. Each node must include `id` and `task`; use `depends_on` for dependencies. Root nodes omit `depends_on` and run concurrently. Do not search the filesystem for files named dag/task_graph when the user asks to run a DAG; dispatch it with this tool. Do not call start_subagent/query_subagent for normal orchestration; results are delivered automatically when subagents finish.".to_string(),
+        supports_background: false,
+        should_defer: false,
+        always_load: true,
+        search_hint: Some("dag task graph dependency graph subagent dispatch".to_string()),
+        is_read_only: false,
+        is_concurrency_safe: false,
+    }
+}
+
 fn shell_schema() -> Value {
     json!({
         "type": "object",
@@ -443,30 +446,49 @@ fn tool_search_schema() -> Value {
         "required": ["query"]
     })
 }
-fn get_session_output_schema() -> Value {
+fn dispatch_task_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "session_id": {"type": "string"},
-            "last_n": {"type": "integer"}
-        },
-        "required": ["session_id"]
-    })
-}
-fn query_subagent_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "id": {"type": "string"},
-            "list": {"type": "boolean"}
+            "task": {
+                "type": "string",
+                "description": "Single task description. Use tasks instead for a DAG."
+            },
+            "id": {
+                "type": "string",
+                "description": "Optional single-task id."
+            },
+            "tasks": {
+                "type": "array",
+                "description": "DAG/task graph nodes. Use this array for DAG, task graph, dependency graph, parallel task group, fan-in, or fan-out requests. Root nodes omit depends_on; downstream nodes wait for all dependencies.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "task": {"type": "string"},
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "profile_id": {"type": "string"},
+                        "skill_ids": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "workdir": {"type": "string"},
+                        "agent_type": {"type": "string"}
+                    },
+                    "required": ["id", "task"]
+                }
+            },
+            "profile_id": {"type": "string"},
+            "skill_ids": {
+                "type": "array",
+                "items": {"type": "string"}
+            },
+            "workdir": {"type": "string"},
+            "agent_type": {"type": "string"}
         }
-    })
-}
-fn stop_subagent_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {"id": {"type": "string"}},
-        "required": ["id"]
     })
 }
 fn upload_artifact_schema() -> Value {
@@ -568,4 +590,31 @@ fn stub_profile_store() -> Arc<TokioRwLock<ProfileStore>> {
         default_profile_id: "runtime-stub".to_string(),
     };
     Arc::new(TokioRwLock::new(store))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tool_surface_exposes_dispatch_task_not_subagent_primitives() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run_manager = Arc::new(RunManager::new(temp.path().join("runs")));
+        let mut registry = ToolRegistry::new();
+
+        register_all_builtin_executors(&mut registry, temp.path().to_path_buf(), run_manager);
+
+        assert!(registry.has_tool("dispatch_task"));
+        assert!(!registry.has_tool("start_subagent"));
+        assert!(!registry.has_tool("query_subagent"));
+        assert!(!registry.has_tool("stop_subagent"));
+
+        let dispatch_tool = registry
+            .get_tool_schema_by_name("dispatch_task")
+            .expect("dispatch_task schema");
+        assert!(dispatch_tool.description.contains("DAG/task graph"));
+        assert!(dispatch_tool
+            .description
+            .contains("Do not search the filesystem"));
+    }
 }

@@ -287,6 +287,20 @@ pub struct LLMClient {
 pub type OpenRouterClient = LLMClient;
 
 impl LLMClient {
+    fn normalize_deepseek_thinking_effort(
+        model: &str,
+        effort: Option<&str>,
+    ) -> Option<&'static str> {
+        if !model.to_ascii_lowercase().contains("deepseek-v4") {
+            return None;
+        }
+        match effort.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+            Some("low") | Some("medium") | Some("high") => Some("high"),
+            Some("xhigh") | Some("max") | Some("maximal") => Some("max"),
+            _ => None,
+        }
+    }
+
     fn build_http_client(disable_proxy_autodiscovery: bool) -> reqwest::Client {
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_secs(LLM_HTTP_TIMEOUT_SECS));
@@ -421,6 +435,7 @@ impl LLMClient {
         max_tokens: u32,
         stream_callback: Option<&StreamCallback>,
         enable_thinking: bool,
+        reasoning_effort: Option<&str>,
     ) -> Result<LLMResponse, String> {
         // Proxy mode uses a flat endpoint; direct mode appends /v1/messages;
         // OpenRouter base_url already includes /api/v1 so just /messages.
@@ -509,6 +524,10 @@ impl LLMClient {
         // Enable thinking mode when server-configured (temperature already set by profile)
         if enable_thinking {
             request_body["thinking"] = json!({"type": "enabled"});
+            if let Some(effort) = Self::normalize_deepseek_thinking_effort(model, reasoning_effort)
+            {
+                request_body["output_config"] = json!({"effort": effort});
+            }
             log::info!("[LLM] Enabled thinking mode for model: {}", model);
         }
 
@@ -1580,6 +1599,8 @@ impl LLMClient {
         temperature: f32,
         max_tokens: u32,
         stream_callback: Option<&StreamCallback>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
     ) -> Result<LLMResponse, String> {
         if let Some(response_text) = self.mock_response_text() {
             return self
@@ -1615,6 +1636,15 @@ impl LLMClient {
 
         if !system_prompt.is_empty() {
             request_body["instructions"] = json!(system_prompt);
+        }
+
+        if enable_thinking {
+            request_body["thinking"] = json!({"type": "enabled"});
+            if let Some(effort) = Self::normalize_deepseek_thinking_effort(model, reasoning_effort)
+            {
+                request_body["reasoning_effort"] = json!(effort);
+            }
+            log::info!("[LLM] Enabled OpenAI-format thinking mode for model: {}", model);
         }
 
         let input = self.build_openai_input(messages);

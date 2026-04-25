@@ -227,6 +227,18 @@ export const zhHans: TranslationStructure = {
         enhancedSessionWizard: '增强会话向导',
         enhancedSessionWizardEnabled: '配置文件优先启动器已激活',
         enhancedSessionWizardDisabled: '使用标准会话启动器',
+        desktopTools: '桌面工具',
+        desktopToolsDescription: '让本机其他桌面 agent 应用也能调用 Cteno 的命令行工具。',
+        ctenoctlExternalTools: '给外部应用使用 ctenoctl',
+        ctenoctlExternalToolsSubtitle: '安装到用户 PATH，让 Cteno 外部的 Codex、Claude、Gemini 也能调用 memory 工具。',
+        ctenoctlInstalled: ({ path }: { path: string }) => `已安装到 ${path}。外部应用需要重启后生效。`,
+        ctenoctlInstalledNeedsRestart: ({ path }: { path: string }) => `已安装到 ${path}。重启外部应用后会读取新的 PATH。`,
+        ctenoctlNeedsPath: ({ hint }: { hint: string }) => `已安装，但 PATH 还需要处理：${hint}`,
+        ctenoctlStatusFailed: ({ error }: { error: string }) => `无法读取安装状态：${error}`,
+        ctenoctlUnsupported: '当前平台不支持安装 ctenoctl 到 PATH。',
+        ctenoctlInstall: '安装',
+        ctenoctlUpdate: '更新',
+        ctenoctlInstallSuccess: 'ctenoctl 已安装到用户 PATH。请重启外部应用后再在那里使用。',
     },
 
     errors: {

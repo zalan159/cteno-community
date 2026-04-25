@@ -596,6 +596,15 @@ impl MCPRegistry {
             .collect()
     }
 
+    /// Snapshot persisted server configs for projection into vendor-native
+    /// config files. Running services are intentionally not exposed.
+    pub fn server_configs(&self) -> Vec<MCPServerConfig> {
+        self.servers
+            .values()
+            .map(|state| state.config.clone())
+            .collect()
+    }
+
     /// Get all tools from a specific server
     pub fn get_server_tools(&self, server_id: &str) -> Vec<MCPToolInfo> {
         self.servers

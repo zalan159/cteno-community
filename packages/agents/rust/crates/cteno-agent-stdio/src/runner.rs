@@ -3,7 +3,8 @@
 //!
 //! - A `user_message` triggers `execute_autonomous_agent_with_session`.
 //! - Streaming content from the runtime (via the `AcpMessageSender` callback
-//!   and `StreamCallback`) is translated into outbound protocol messages.
+//!   and `StreamCallback`) is forwarded as ACP payloads without semantic
+//!   translation at the stdio boundary.
 //! - Tool permission checks are turned into `permission_request` outbound
 //!   messages; the matching `permission_response` resolves a per-turn
 //!   `oneshot`.
@@ -15,12 +16,14 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
+use cteno_agent_runtime::agent_queue::AgentMessageQueue;
 use cteno_agent_runtime::agent_session::AgentSessionManager;
 use cteno_agent_runtime::autonomous_agent::{
-    execute_autonomous_agent_with_session, AcpMessageSender, PermissionChecker,
+    build_native_tool_surface_for_turn, execute_autonomous_agent_with_session, AcpMessageSender,
+    PermissionChecker,
 };
 use cteno_agent_runtime::hooks;
-use cteno_agent_runtime::llm::StreamCallback;
+use cteno_agent_runtime::llm::{ImageSource, StreamCallback};
 use cteno_agent_runtime::llm_profile::{self, ApiFormat};
 use cteno_agent_runtime::permission::{PermissionCheckResult, PermissionDecision};
 
@@ -28,7 +31,7 @@ use tokio::sync::oneshot;
 
 use crate::io::OutboundWriter;
 use crate::pending::{new_permission_id, PendingPermissions};
-use crate::protocol::{Outbound, TurnUsage};
+use crate::protocol::{AcpDelivery, Attachment, AttachmentKind, ContextUsage, Outbound, TurnUsage};
 use crate::session::SessionState;
 
 const DIRECT_API_KEY_ENV_KEYS: &[&str] =
@@ -67,6 +70,13 @@ fn cfg_u32(cfg: &Value, key: &str, default: u32) -> u32 {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32)
         .unwrap_or(default)
+}
+
+fn cfg_optional_u32(cfg: &Value, key: &str) -> Option<u32> {
+    cfg.get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| *v > 0)
 }
 
 fn cfg_profile_id(cfg: &Value) -> Option<String> {
@@ -249,11 +259,8 @@ pub(crate) fn apply_model_control(
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let resolved_profile_id = resolve_profile_id_for_model(
-        &model,
-        previous_profile_id.as_deref(),
-        app_data_dir,
-    );
+    let resolved_profile_id =
+        resolve_profile_id_for_model(&model, previous_profile_id.as_deref(), app_data_dir);
 
     match &resolved_profile_id {
         Some(pid) => {
@@ -401,110 +408,117 @@ async fn send_turn_error(writer: &OutboundWriter, session_id: &str, message: Str
             final_text: String::new(),
             iteration_count: 0,
             usage: TurnUsage::default(),
+            context_usage: None,
         })
         .await;
 }
 
-/// Translate a runtime ACP message JSON Value into the stdio protocol.
-/// Drops messages we do not know how to render.
-fn translate_acp(session_id: &str, payload: &Value) -> Option<Outbound> {
-    let ty = payload.get("type").and_then(|v| v.as_str())?;
-    match ty {
-        "thinking" => {
-            let content = payload
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(Outbound::Delta {
-                session_id: session_id.to_string(),
-                kind: "thinking".to_string(),
-                content,
-            })
-        }
-        "tool-call" => {
-            let tool_use_id = payload
-                .get("callId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let name = payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input = payload.get("input").cloned().unwrap_or(Value::Null);
-            Some(Outbound::ToolUse {
-                session_id: session_id.to_string(),
-                tool_use_id,
-                name,
-                input,
-            })
-        }
-        "tool-result" => {
-            let tool_use_id = payload
-                .get("callId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let output = payload
-                .get("output")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let is_error = payload
-                .get("isError")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            Some(Outbound::ToolResult {
-                session_id: session_id.to_string(),
-                tool_use_id,
-                output,
-                is_error,
-            })
-        }
-        // Images, skill-activation-success, etc. are dropped for now.
-        _ => None,
+pub(crate) fn acp_outbound(session_id: &str, delivery: AcpDelivery, data: Value) -> Outbound {
+    Outbound::Acp {
+        session_id: session_id.to_string(),
+        delivery,
+        data,
     }
 }
 
-/// Translate a `StreamCallback` Value into a text/thinking delta.
-fn translate_stream(session_id: &str, payload: &Value) -> Option<Outbound> {
-    let ty = payload.get("type").and_then(|v| v.as_str())?;
-    match ty {
-        "text-delta" | "text" => {
-            let content = payload
-                .get("delta")
-                .or_else(|| payload.get("text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if content.is_empty() {
-                return None;
+fn cfg_allowed_tools(cfg: &Value) -> Option<Vec<String>> {
+    let value = cfg.get("allowed_tools")?;
+    if let Some(items) = value.as_array() {
+        let tools: Vec<String> = items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        return Some(tools);
+    }
+    value.as_str().map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn cfg_permission_mode(cfg: &Value) -> &str {
+    cfg.get("permission_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+}
+
+fn sandbox_policy_for_mode(
+    mode: &str,
+    additional_directories: &[String],
+) -> cteno_agent_runtime::tool_executors::SandboxPolicy {
+    use cteno_agent_runtime::tool_executors::SandboxPolicy;
+    match mode {
+        "bypass_permissions" | "danger_full_access" => SandboxPolicy::Unrestricted,
+        "plan" | "read_only" => SandboxPolicy::ReadOnly,
+        _ => SandboxPolicy::WorkspaceWrite {
+            additional_writable_roots: additional_directories
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        },
+    }
+}
+
+fn permission_checker_for_mode(
+    mode: &str,
+    session_id: String,
+    writer: OutboundWriter,
+    pending_permissions: PendingPermissions,
+) -> Option<PermissionChecker> {
+    match mode {
+        "bypass_permissions" | "danger_full_access" | "read_only" => None,
+        "plan" => Some(Arc::new(
+            move |tool_name: String, _call_id: String, _input: Value| {
+                Box::pin(async move {
+                    PermissionCheckResult::Denied(format!(
+                        "Plan mode: tool execution is disabled ({tool_name})"
+                    ))
+                })
+            },
+        )),
+        _ => Some(build_permission_checker(
+            session_id,
+            writer,
+            pending_permissions,
+        )),
+    }
+}
+
+fn attachments_to_images(attachments: &[Attachment]) -> Option<Vec<ImageSource>> {
+    let images: Vec<ImageSource> = attachments
+        .iter()
+        .filter(|attachment| matches!(attachment.kind, AttachmentKind::Image))
+        .filter_map(|attachment| {
+            let media_type = attachment
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "image/png".to_string());
+            if let Some(data) = attachment.data.clone().filter(|s| !s.is_empty()) {
+                return Some(ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type,
+                    data,
+                });
             }
-            Some(Outbound::Delta {
-                session_id: session_id.to_string(),
-                kind: "text".to_string(),
-                content,
-            })
-        }
-        "thinking-delta" | "thinking" => {
-            let content = payload
-                .get("delta")
-                .or_else(|| payload.get("text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if content.is_empty() {
-                return None;
-            }
-            Some(Outbound::Delta {
-                session_id: session_id.to_string(),
-                kind: "thinking".to_string(),
-                content,
-            })
-        }
-        _ => None,
+            attachment
+                .source
+                .clone()
+                .filter(|s| !s.is_empty())
+                .map(|source| ImageSource {
+                    source_type: "url".to_string(),
+                    media_type,
+                    data: source,
+                })
+        })
+        .collect();
+    if images.is_empty() {
+        None
+    } else {
+        Some(images)
     }
 }
 
@@ -566,12 +580,75 @@ fn build_permission_checker(
     })
 }
 
+fn api_format_label(api_format: &ApiFormat) -> &'static str {
+    match api_format {
+        ApiFormat::Anthropic => "anthropic-compatible",
+        ApiFormat::OpenAI => "openai-compatible",
+        ApiFormat::Gemini => "gemini-compatible",
+    }
+}
+
+/// Runtime identity context for the resolved Cteno profile.
+///
+/// The transport/API format is not the model provider identity. For example,
+/// DeepSeek profiles can use an Anthropic-compatible endpoint; without this
+/// explicit context, models sometimes infer "Claude" from the wire protocol.
+fn build_model_identity_context(
+    profile_id: Option<&str>,
+    model: &str,
+    api_format: &ApiFormat,
+    supports_vision: bool,
+    supports_computer_use: bool,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push("<model_identity>".to_string());
+    lines.push("Agent: cteno-agent".to_string());
+    lines.push(format!("Current model: {model}"));
+    if let Some(profile_id) = profile_id {
+        lines.push(format!("Current profile: {profile_id}"));
+    }
+    lines.push(format!(
+        "API format: {}; transport compatibility, not model identity.",
+        api_format_label(api_format)
+    ));
+    lines.push(
+        "Do not identify as Claude/Anthropic unless Current model/profile says so.".to_string(),
+    );
+    lines.push(format!(
+        "Vision: {}",
+        if supports_vision { "yes" } else { "no" }
+    ));
+    lines.push(format!(
+        "Computer-use: {}",
+        if supports_computer_use { "yes" } else { "no" }
+    ));
+    lines.push("</model_identity>".to_string());
+    lines.join("\n")
+}
+
+fn fallback_system_prompt(workdir: Option<&str>, supports_function_calling: bool) -> String {
+    let workspace_path = workdir
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    cteno_agent_runtime::system_prompt::build_system_prompt(
+        &cteno_agent_runtime::system_prompt::PromptOptions {
+            workspace_path,
+            include_tool_style: supports_function_calling,
+            ..Default::default()
+        },
+    )
+}
+
 /// Run a single user turn against the runtime.
 pub async fn run_turn(
     state: &SessionState,
     user_message: String,
+    task_id: Option<String>,
+    attachments: Vec<Attachment>,
     writer: OutboundWriter,
     pending_permissions: PendingPermissions,
+    message_queue: Option<Arc<AgentMessageQueue>>,
 ) {
     let session_id = state.session_id.clone();
     let cfg = &state.agent_config;
@@ -590,9 +667,12 @@ pub async fn run_turn(
         model,
         temperature,
         max_tokens,
+        context_window_tokens,
         api_format,
         supports_vision,
+        supports_computer_use,
         enable_thinking,
+        reasoning_effort,
         supports_function_calling,
         supports_image_output,
         use_proxy,
@@ -646,6 +726,8 @@ pub async fn run_turn(
         // 6612 characters, you requested 8192 output tokens" errors from
         // OpenRouter when the active profile says 32000.
         let max_tokens = profile.chat.max_tokens;
+        let context_window_tokens = profile.chat.context_window_tokens;
+        let reasoning_effort = cfg_effort(cfg);
         profile_id_for_tools = Some(profile_id);
         (
             resolved.api_key,
@@ -653,9 +735,12 @@ pub async fn run_turn(
             profile.chat.model.clone(),
             temperature,
             max_tokens,
+            context_window_tokens,
             profile.api_format.clone(),
             profile.supports_vision,
+            profile.supports_computer_use,
             profile.thinking,
+            reasoning_effort,
             profile.supports_function_calling,
             profile.supports_image_output,
             resolved.use_proxy,
@@ -676,6 +761,7 @@ pub async fn run_turn(
             .unwrap_or_else(|| "deepseek-chat".to_string());
         let temperature = cfg_f32(cfg, "temperature", 0.2);
         let max_tokens = cfg_u32(cfg, "max_tokens", 4096);
+        let context_window_tokens = cfg_optional_u32(cfg, "context_window_tokens");
         let api_format = match cfg
             .get("api_format")
             .and_then(|v| v.as_str())
@@ -692,17 +778,27 @@ pub async fn run_turn(
             model,
             temperature,
             max_tokens,
+            context_window_tokens,
             api_format,
             false,
             false,
+            false,
+            None,
             true,
             false,
             false,
         )
     };
     let system_prompt = state.system_prompt.clone().unwrap_or_else(|| {
-        "You are cteno-agent, a helpful autonomous coding assistant.".to_string()
+        fallback_system_prompt(state.workdir.as_deref(), supports_function_calling)
     });
+    let model_identity_context = build_model_identity_context(
+        profile_id_for_tools.as_deref(),
+        &model,
+        &api_format,
+        supports_vision,
+        supports_computer_use,
+    );
 
     // ---------------- Callbacks ----------------
     let writer_for_acp = writer.clone();
@@ -711,9 +807,9 @@ pub async fn run_turn(
         let writer = writer_for_acp.clone();
         let session_id = session_for_acp.clone();
         Box::pin(async move {
-            if let Some(msg) = translate_acp(&session_id, &payload) {
-                writer.send(msg).await;
-            }
+            writer
+                .send(acp_outbound(&session_id, AcpDelivery::Persisted, payload))
+                .await;
         })
     });
 
@@ -723,14 +819,19 @@ pub async fn run_turn(
         let writer = writer_for_stream.clone();
         let session_id = session_for_stream.clone();
         Box::pin(async move {
-            if let Some(msg) = translate_stream(&session_id, &payload) {
-                writer.send(msg).await;
-            }
+            writer
+                .send(acp_outbound(&session_id, AcpDelivery::Transient, payload))
+                .await;
         })
     });
 
-    let permission_checker =
-        build_permission_checker(session_id.clone(), writer.clone(), pending_permissions);
+    let permission_mode = cfg_permission_mode(cfg).to_string();
+    let permission_checker = permission_checker_for_mode(
+        &permission_mode,
+        session_id.clone(),
+        writer.clone(),
+        pending_permissions,
+    );
 
     // If a workdir was supplied at init time, persist it into the session's
     // context_data so executors pick it up via extract_session_workdir_from_context.
@@ -746,7 +847,14 @@ pub async fn run_turn(
 
     // Load native tools from the installed registry (builtin + any
     // host-injected tools registered so far).
-    let tools = cteno_agent_runtime::autonomous_agent::fetch_native_tools().await;
+    let allowed_tools = cfg_allowed_tools(cfg);
+    let (tools, mut runtime_tool_context) =
+        build_native_tool_surface_for_turn(supports_function_calling, allowed_tools.as_deref())
+            .await;
+    let sandbox_policy = sandbox_policy_for_mode(&permission_mode, &state.additional_directories);
+    let user_images = attachments_to_images(&attachments);
+    let mut runtime_context_messages = vec![model_identity_context];
+    runtime_context_messages.append(&mut runtime_tool_context);
 
     // ---------------- Invoke runtime ----------------
     state.abort_flag.store(false, Ordering::SeqCst);
@@ -763,12 +871,13 @@ pub async fn run_turn(
         &tools,
         temperature,
         max_tokens,
+        context_window_tokens,
         Some(&session_id),
         None,
-        None,
+        Some(runtime_context_messages),
         Some(acp_sender),
         None,
-        Some(permission_checker),
+        permission_checker,
         None,
         profile_id_for_tools.as_deref(),
         Some(state.abort_flag.clone()),
@@ -776,7 +885,7 @@ pub async fn run_turn(
         None,
         None,
         None,
-        None,
+        message_queue,
         use_proxy,
         Some(stream_cb),
         None,
@@ -784,19 +893,44 @@ pub async fn run_turn(
         api_format,
         supports_vision,
         enable_thinking,
+        reasoning_effort.as_deref(),
         supports_function_calling,
         supports_image_output,
-        None,
-        None,
+        user_images,
+        Some(&sandbox_policy),
     )
     .await;
 
     match result {
         Ok(res) => {
+            if !res.response.is_empty() {
+                writer
+                    .send(acp_outbound(
+                        &session_id,
+                        AcpDelivery::Persisted,
+                        json!({
+                            "type": "message",
+                            "message": res.response,
+                        }),
+                    ))
+                    .await;
+            }
+            if let Some(task_id) = task_id.as_deref() {
+                writer
+                    .send(acp_outbound(
+                        &session_id,
+                        AcpDelivery::Persisted,
+                        json!({
+                            "type": "task_complete",
+                            "id": task_id,
+                        }),
+                    ))
+                    .await;
+            }
             writer
                 .send(Outbound::TurnComplete {
                     session_id,
-                    final_text: res.response,
+                    final_text: String::new(),
                     iteration_count: res.iteration_count,
                     usage: TurnUsage {
                         input_tokens: res.total_usage.input_tokens,
@@ -804,6 +938,15 @@ pub async fn run_turn(
                         cache_creation_input_tokens: res.total_usage.cache_creation_input_tokens,
                         cache_read_input_tokens: res.total_usage.cache_read_input_tokens,
                     },
+                    context_usage: res
+                        .context_usage
+                        .as_ref()
+                        .map(|context_usage| ContextUsage {
+                            total_tokens: context_usage.total_tokens,
+                            max_tokens: context_usage.max_tokens,
+                            raw_max_tokens: context_usage.raw_max_tokens,
+                            auto_compact_token_limit: context_usage.auto_compact_token_limit,
+                        }),
                 })
                 .await;
         }
@@ -814,12 +957,25 @@ pub async fn run_turn(
                     message: err,
                 })
                 .await;
+            if let Some(task_id) = task_id.as_deref() {
+                writer
+                    .send(acp_outbound(
+                        &session_id,
+                        AcpDelivery::Persisted,
+                        json!({
+                            "type": "task_complete",
+                            "id": task_id,
+                        }),
+                    ))
+                    .await;
+            }
             writer
                 .send(Outbound::TurnComplete {
                     session_id,
                     final_text: String::new(),
                     iteration_count: 0,
                     usage: TurnUsage::default(),
+                    context_usage: None,
                 })
                 .await;
         }
@@ -893,6 +1049,71 @@ mod tests {
     }
 
     #[test]
+    fn permission_mode_selects_sandbox_policy() {
+        let additional = vec!["/tmp/cteno-extra".to_string()];
+
+        let default_policy = sandbox_policy_for_mode("default", &additional);
+        match default_policy {
+            cteno_agent_runtime::tool_executors::SandboxPolicy::WorkspaceWrite {
+                additional_writable_roots,
+            } => {
+                assert_eq!(additional_writable_roots.len(), 1);
+                assert_eq!(
+                    additional_writable_roots[0],
+                    std::path::PathBuf::from("/tmp/cteno-extra")
+                );
+            }
+            other => panic!("expected workspace-write sandbox, got {other:?}"),
+        }
+
+        assert!(matches!(
+            sandbox_policy_for_mode("plan", &additional),
+            cteno_agent_runtime::tool_executors::SandboxPolicy::ReadOnly
+        ));
+        assert!(matches!(
+            sandbox_policy_for_mode("read_only", &additional),
+            cteno_agent_runtime::tool_executors::SandboxPolicy::ReadOnly
+        ));
+        assert!(matches!(
+            sandbox_policy_for_mode("bypass_permissions", &additional),
+            cteno_agent_runtime::tool_executors::SandboxPolicy::Unrestricted
+        ));
+    }
+
+    #[test]
+    fn image_attachments_become_runtime_images() {
+        let attachments = vec![
+            Attachment {
+                kind: AttachmentKind::Text,
+                mime_type: Some("text/plain".to_string()),
+                source: None,
+                data: Some("ignore me".to_string()),
+            },
+            Attachment {
+                kind: AttachmentKind::Image,
+                mime_type: Some("image/jpeg".to_string()),
+                source: None,
+                data: Some("base64-payload".to_string()),
+            },
+            Attachment {
+                kind: AttachmentKind::Image,
+                mime_type: None,
+                source: Some("file:///tmp/photo.png".to_string()),
+                data: None,
+            },
+        ];
+
+        let images = attachments_to_images(&attachments).expect("images");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].source_type, "base64");
+        assert_eq!(images[0].media_type, "image/jpeg");
+        assert_eq!(images[0].data, "base64-payload");
+        assert_eq!(images[1].source_type, "url");
+        assert_eq!(images[1].media_type, "image/png");
+        assert_eq!(images[1].data, "file:///tmp/photo.png");
+    }
+
+    #[test]
     fn apply_model_control_updates_legacy_and_new_shapes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut legacy_cfg = json!({
@@ -930,6 +1151,40 @@ mod tests {
         );
         assert_eq!(cfg_model(&new_cfg).as_deref(), Some("claude-opus-4-1"));
         assert_eq!(cfg_effort(&new_cfg), None);
+    }
+
+    #[test]
+    fn model_identity_context_names_resolved_model_not_transport_provider() {
+        let context = build_model_identity_context(
+            Some("proxy-deepseek-reasoner"),
+            "deepseek-reasoner",
+            &ApiFormat::Anthropic,
+            false,
+            false,
+        );
+
+        assert!(context.contains("Agent: cteno-agent"));
+        assert!(context.contains("Current model: deepseek-reasoner"));
+        assert!(context.contains("Current profile: proxy-deepseek-reasoner"));
+        assert!(context.contains("API format: anthropic-compatible"));
+        assert!(context.contains("not model identity"));
+        assert!(context.contains("Do not identify as Claude/Anthropic"));
+        assert!(!context.contains("Current model: Claude"));
+    }
+
+    #[test]
+    fn fallback_system_prompt_loads_project_agents_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "# Project rules\n\nAlways prefer project-local instructions.",
+        )
+        .expect("write AGENTS.md");
+
+        let prompt = fallback_system_prompt(dir.path().to_str(), true);
+
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(prompt.contains("Always prefer project-local instructions."));
     }
 
     /// When the previous profile was a proxy profile and the new model name
@@ -1015,12 +1270,7 @@ mod tests {
         .expect("write proxy cache");
 
         let mut cfg = json!({ "profile_id": "proxy-deepseek-reasoner" });
-        apply_model_control(
-            &mut cfg,
-            "deepseek-reasoner".to_string(),
-            None,
-            dir.path(),
-        );
+        apply_model_control(&mut cfg, "deepseek-reasoner".to_string(), None, dir.path());
         assert_eq!(
             cfg_profile_id(&cfg).as_deref(),
             Some("proxy-deepseek-reasoner"),
@@ -1029,12 +1279,7 @@ mod tests {
 
         // Dual: a user-local session switching model stays user-local.
         let mut cfg = json!({ "profile_id": "default" });
-        apply_model_control(
-            &mut cfg,
-            "deepseek-reasoner".to_string(),
-            None,
-            dir.path(),
-        );
+        apply_model_control(&mut cfg, "deepseek-reasoner".to_string(), None, dir.path());
         assert_eq!(
             cfg_profile_id(&cfg).as_deref(),
             Some("default"),

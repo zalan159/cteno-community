@@ -2,6 +2,7 @@
 //! every agent vendor (Cteno, Claude, Codex, …).
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use super::capabilities::{AgentCapabilities, ExecutorSemanticCapabilities};
 use super::error::AgentExecutorError;
@@ -46,6 +47,27 @@ impl Clone for ConnectionHandle {
         }
     }
 }
+
+/// Callback invoked when a vendor autonomously starts a new turn (i.e. a
+/// turn not initiated by `send_message` — e.g. a background subagent
+/// completed and woke the session, or a scheduled task fired).
+///
+/// Receives:
+/// - the native session id
+/// - an optional **synthetic user-message text** that triggered the turn
+///   (e.g. concatenated `[Task Complete] X\n\n result` blocks for queued
+///   subagent handoffs). The host SHOULD render this as a user-bubble in
+///   the session transcript before consuming the stream — without it, the
+///   autonomous turn looks like the agent talking to itself.
+/// - an event stream that ends when the autonomous turn completes
+///   (`ExecutorEvent::TurnComplete` observed). The host is responsible for
+///   consuming the stream — typically by spawning a task that feeds events
+///   into a normalizer / UI renderer keyed by the session id.
+///
+/// Vendors that lack this capability return `Unsupported` from
+/// `set_autonomous_turn_handler` and never invoke the callback.
+pub type AutonomousTurnHandler =
+    Arc<dyn Fn(String, Option<String>, EventStream) + Send + Sync>;
 
 /// Vendor-agnostic session-level contract.
 ///
@@ -108,7 +130,7 @@ pub trait AgentExecutor: Send + Sync + 'static {
         _response: serde_json::Value,
     ) -> Result<(), AgentExecutorError> {
         Err(AgentExecutorError::Unsupported {
-            capability: "respond_to_elicitation",
+            capability: "respond_to_elicitation".to_string(),
         })
     }
 
@@ -134,6 +156,20 @@ pub trait AgentExecutor: Send + Sync + 'static {
         session: &SessionRef,
         model: ModelSpec,
     ) -> Result<ModelChangeOutcome, AgentExecutorError>;
+
+    /// Register or replace the autonomous-turn stream callback.
+    ///
+    /// Implementors may ignore handler updates when `autonomous_turn` capability
+    /// is `false`. The default implementation rejects the request with
+    /// `Unsupported`.
+    async fn set_autonomous_turn_handler(
+        &self,
+        _handler: Option<AutonomousTurnHandler>,
+    ) -> Result<(), AgentExecutorError> {
+        Err(AgentExecutorError::Unsupported {
+            capability: "set_autonomous_turn_handler".to_string(),
+        })
+    }
 
     /// Additive normalized model-change seam for future adapter migration.
     ///
@@ -192,7 +228,7 @@ pub trait AgentExecutor: Send + Sync + 'static {
         _spec: ConnectionSpec,
     ) -> Result<ConnectionHandle, AgentExecutorError> {
         Err(AgentExecutorError::Unsupported {
-            capability: "open_connection",
+            capability: "open_connection".to_string(),
         })
     }
 
@@ -201,7 +237,7 @@ pub trait AgentExecutor: Send + Sync + 'static {
     /// [`ConnectionHandle`] must not be reused.
     async fn close_connection(&self, _handle: ConnectionHandle) -> Result<(), AgentExecutorError> {
         Err(AgentExecutorError::Unsupported {
-            capability: "close_connection",
+            capability: "close_connection".to_string(),
         })
     }
 
@@ -214,7 +250,7 @@ pub trait AgentExecutor: Send + Sync + 'static {
         _handle: &ConnectionHandle,
     ) -> Result<ConnectionHealth, AgentExecutorError> {
         Err(AgentExecutorError::Unsupported {
-            capability: "check_connection",
+            capability: "check_connection".to_string(),
         })
     }
 

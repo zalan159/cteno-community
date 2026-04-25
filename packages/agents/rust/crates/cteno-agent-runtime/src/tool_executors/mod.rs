@@ -1,10 +1,10 @@
 //! Tool Executors migrated from apps/client/desktop/src/tool_executors.
 //!
 //! These are session-internal executors (ReAct loop uses them directly).
-//! Orchestration executors (ask_persona, dispatch_task, scheduler, etc.) stay
-//! in the app crate because they depend on host-side types (PersonaManager,
-//! SchedulerHandle, SessionRegistry) and are registered into the shared
-//! ToolRegistry at boot time.
+//! Orchestration that is session-internal (notably `dispatch_task` DAG
+//! execution) lives here. Cross-session orchestration (ask_persona,
+//! scheduler, etc.) stays in the app crate because it depends on host-side
+//! types such as PersonaManager, SchedulerHandle, and SessionRegistry.
 
 pub mod a2ui_render;
 pub mod browser_action;
@@ -15,10 +15,10 @@ pub mod browser_navigate;
 pub mod browser_network;
 pub mod builtin;
 pub mod computer_use;
+pub mod dispatch_task;
 pub mod edit;
 pub mod fetch;
 pub mod file_tracker;
-pub mod get_session_output;
 pub mod glob;
 pub mod grep;
 pub mod image_generation;
@@ -50,9 +50,9 @@ pub use browser_navigate::BrowserNavigateExecutor;
 pub use browser_network::BrowserNetworkExecutor;
 pub use builtin::register_all_builtin_executors;
 pub use computer_use::ComputerUseExecutor;
+pub use dispatch_task::DispatchTaskExecutor;
 pub use edit::EditExecutor;
 pub use fetch::FetchExecutor;
-pub use get_session_output::GetSessionOutputExecutor;
 pub use glob::GlobExecutor;
 pub use grep::GrepExecutor;
 pub use image_generation::ImageGenerationExecutor;

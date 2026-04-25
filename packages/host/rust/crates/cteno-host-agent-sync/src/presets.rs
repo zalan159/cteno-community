@@ -1,9 +1,9 @@
 //! Canonical spec builders for host-managed resources.
 //!
-//! The built-in `cteno-memory` MCP server entry is the big one: every session
-//! that reconciles should end up with this exact shape written into each
-//! vendor's config, so all four vendors spawn the same stdio server with the
-//! same project/global dirs.
+//! `cteno-memory` is kept here only for old migrations/tests. New cross-vendor
+//! memory access is exposed through `ctenoctl memory` instructions in
+//! `AGENTS.md`, so vendor sessions do not spawn per-session memory MCP
+//! subprocesses.
 
 use std::{collections::BTreeMap, path::Path};
 

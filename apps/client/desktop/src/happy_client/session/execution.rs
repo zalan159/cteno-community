@@ -137,6 +137,19 @@ async fn is_vendor_native_model_id(vendor: &str, model_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn default_vendor_model_id(vendor: &str) -> Option<String> {
+    crate::commands::collect_vendor_models(vendor)
+        .await
+        .ok()
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.id.clone())
+                .or_else(|| models.first().map(|model| model.id.clone()))
+        })
+}
+
 pub(super) async fn resolve_execution_profile(
     session_id: &str,
     config: &SessionAgentConfig,
@@ -178,6 +191,16 @@ pub(super) async fn resolve_execution_profile(
         vendor_native_agent_for_session(session_id, &config.db_path, resolution)
     {
         if is_vendor_native_model_id(&vendor, &profile_id).await {
+            Some(vendor)
+        } else if let Some(fallback_model_id) = default_vendor_model_id(&vendor).await {
+            log::warn!(
+                "[Session {}] Vendor-native model '{}' is not available for vendor={}; falling back to '{}'",
+                session_id,
+                profile_id,
+                vendor,
+                fallback_model_id
+            );
+            profile_id = fallback_model_id;
             Some(vendor)
         } else {
             None
@@ -473,6 +496,12 @@ pub(super) async fn prepare_agent_runtime(
         );
     }
 
+    // Legacy desktop-side host spawning path (pre-stdio). Build a factory
+    // that ignores the subagent session id and reuses the parent's
+    // pre-built sender as-is — mirrors the historical behavior at this
+    // callsite. New flows (cteno-agent stdio bootstrap) build a real
+    // session-tagged factory in `hooks_mvp::make_subagent_acp_sender_factory`.
+    let acp_sender_for_factory = acp_sender.clone();
     let sub_agent_ctx = crate::agent::executor::SubAgentContext {
         db_path: config.db_path.clone(),
         builtin_skills_dir: config.builtin_skills_dir.clone(),
@@ -482,11 +511,14 @@ pub(super) async fn prepare_agent_runtime(
         profile_id: Some(profile.profile_id.clone()),
         use_proxy: profile.use_proxy,
         profile_model: Some(profile.model.clone()),
-        acp_sender: Some(acp_sender.clone()),
+        acp_sender_factory: Some(std::sync::Arc::new(move |_sub_session_id: String| {
+            acp_sender_for_factory.clone()
+        })),
         permission_checker: Some(permission_checker.clone()),
         abort_flag: Some(abort_flag),
         thinking_flag: Some(thinking_flag),
         api_format: profile.api_format.clone(),
+        sandbox_policy: None,
     };
 
     let base_prompt = if profile.supports_function_calling {
@@ -803,6 +835,7 @@ async fn run_executor_turn(
     // once the executor surface supports image attachments end-to-end.
     let user_message = UserMessage {
         content: user_text.to_string(),
+        task_id: Some(task_id.clone()),
         attachments: Vec::new(),
         parent_tool_use_id: None,
         injected_tools: Vec::new(),
@@ -1040,13 +1073,14 @@ mod tests {
             Box::pin(async {})
         });
 
+        let task_id = format!("task-{vendor}");
         let normalizer = ExecutorNormalizer::new(
             session_id.clone(),
             socket,
             SessionMessageCodec::plaintext(),
             Some(stream_callback),
             permission_handler,
-            format!("task-{vendor}"),
+            task_id.clone(),
             executor.clone(),
             session_ref.clone(),
             "http://127.0.0.1:1".to_string(),
@@ -1058,6 +1092,7 @@ mod tests {
 
         let user_message = UserMessage {
             content: "Write exactly two short sentences explaining why streaming replies feel responsive.".to_string(),
+            task_id: Some(task_id.clone()),
             attachments: Vec::new(),
             parent_tool_use_id: None,
             injected_tools: Vec::new(),
@@ -1201,6 +1236,7 @@ mod tests {
         let db_path = temp.path().join("db").join("cteno.db");
         let registry = Arc::new(
             ExecutorRegistry::build(build_session_store(db_path.clone()))
+                .await
                 .expect("build executor registry"),
         );
 

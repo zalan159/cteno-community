@@ -152,6 +152,13 @@ pub struct AgentCapabilities {
     /// Whether an in-flight turn can be interrupted via
     /// [`AgentExecutor::interrupt`](super::trait_def::AgentExecutor::interrupt).
     pub supports_interrupt: bool,
+    /// Whether this executor supports autonomous turns and can accept a callback
+    /// handler to intercept/transform the stream.
+    ///
+    /// Defaults to `false`; adapters that support the capability must set it
+    /// to `true`.
+    #[serde(default)]
+    pub autonomous_turn: bool,
 }
 
 impl AgentCapabilities {

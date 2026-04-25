@@ -3,8 +3,10 @@
 # 用法：
 #   ./scripts/export-community-snapshot.sh [target-dir] [--publish]
 # 默认 target-dir = ./community-snapshot
-# --publish: 导出后直接 init/commit/force-push 到 COMMUNITY_REMOTE（默认
-#   https://github.com/zalan159/cteno-community.git，main 分支）
+# --publish: 把 target-dir 当成 COMMUNITY_REMOTE 的本地 clone，增量提交并
+#   普通 push（不会 force-push、不会丢历史）。首次执行时会自动 git clone。
+#   COMMUNITY_REMOTE 默认 https://github.com/zalan159/cteno-community.git，
+#   分支 COMMUNITY_BRANCH 默认 main。
 
 set -euo pipefail
 
@@ -14,7 +16,7 @@ for arg in "$@"; do
   case "$arg" in
     --publish) PUBLISH=1 ;;
     --help|-h)
-      sed -n '2,7p' "$0"
+      sed -n '2,9p' "$0"
       exit 0 ;;
     *) POSITIONAL+=("$arg") ;;
   esac
@@ -30,13 +32,61 @@ echo "=== Cteno community snapshot export ==="
 echo "Source: $REPO_ROOT"
 echo "Target: $TARGET"
 echo "HEAD:   $HEAD_COMMIT"
+[ "$PUBLISH" = "1" ] && echo "Publish: $COMMUNITY_REMOTE ($COMMUNITY_BRANCH)"
 echo ""
 
-if [ -e "$TARGET" ]; then
-  echo "Target exists; clearing"
-  rm -rf "$TARGET"
+# Publish 模式：把 TARGET 当远端的本地 clone 复用。需要保留 .git 历史，所以
+# 不能 rm -rf。如果 TARGET 不存在 → clone；存在且是该 remote 的 clone →
+# fetch + reset；存在但属于别的 remote / 不是 git 仓 → 报错避免误覆盖。
+# 然后清理 worktree 中的非 .git 内容（避免上次导出的旧文件保留），再 rsync
+# 新内容覆盖。
+if [ "$PUBLISH" = "1" ]; then
+  if [ -d "$TARGET/.git" ]; then
+    existing_remote=$(git -C "$TARGET" remote get-url origin 2>/dev/null || echo "")
+    if [ -n "$existing_remote" ] && [ "$existing_remote" != "$COMMUNITY_REMOTE" ]; then
+      echo "ERROR: $TARGET is already a git clone of '$existing_remote', refusing to overwrite."
+      echo "       Move it aside or delete it manually first."
+      exit 1
+    fi
+    if [ -z "$existing_remote" ]; then
+      git -C "$TARGET" remote add origin "$COMMUNITY_REMOTE"
+    fi
+    echo "Reusing existing clone at $TARGET (fetching origin/$COMMUNITY_BRANCH)"
+    git -C "$TARGET" fetch --depth 1 origin "$COMMUNITY_BRANCH" || \
+      echo "  (fetch failed — assuming empty remote; will create branch on first push)"
+    if git -C "$TARGET" rev-parse --verify "origin/$COMMUNITY_BRANCH" >/dev/null 2>&1; then
+      git -C "$TARGET" checkout -B "$COMMUNITY_BRANCH" "origin/$COMMUNITY_BRANCH" >/dev/null
+      git -C "$TARGET" reset --hard "origin/$COMMUNITY_BRANCH" >/dev/null
+    fi
+  elif [ -e "$TARGET" ]; then
+    echo "ERROR: $TARGET exists but is not a git clone. Refusing to clobber in publish mode."
+    echo "       Move it aside or delete it first, or rerun without --publish to re-export only."
+    exit 1
+  else
+    echo "Cloning $COMMUNITY_REMOTE → $TARGET"
+    git clone --depth 1 --branch "$COMMUNITY_BRANCH" "$COMMUNITY_REMOTE" "$TARGET" 2>/dev/null || {
+      echo "Branch $COMMUNITY_BRANCH not found on remote (or remote is empty); initialising fresh"
+      git clone --depth 1 "$COMMUNITY_REMOTE" "$TARGET" 2>/dev/null || {
+        mkdir -p "$TARGET"
+        git -C "$TARGET" init -b "$COMMUNITY_BRANCH" -q
+        git -C "$TARGET" remote add origin "$COMMUNITY_REMOTE"
+      }
+    }
+    if ! git -C "$TARGET" symbolic-ref -q HEAD >/dev/null 2>&1; then
+      git -C "$TARGET" checkout -B "$COMMUNITY_BRANCH" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Wipe everything except .git so removed-from-monorepo files actually
+  # disappear from the snapshot (rsync without --delete leaves stale files).
+  find "$TARGET" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+else
+  if [ -e "$TARGET" ]; then
+    echo "Target exists; clearing"
+    rm -rf "$TARGET"
+  fi
+  mkdir -p "$TARGET"
 fi
-mkdir -p "$TARGET"
 
 # 用 rsync + 白名单 + exclude。这里导出的是公开客户端 / 本地 agent runtime；
 # 官方 Happy Server、landing/console、计费、生产运维材料留在私有仓。
@@ -44,6 +94,7 @@ RSYNC_EXCLUDES=(
   # Closed-source cloud service and billing surface
   --exclude='apps/happy-server/'
   --exclude='apps/landing-page/'
+  --exclude='apps/live/'
   --exclude='packages/commercial/'
   --exclude='commercial/'
   --exclude='landing/'
@@ -67,6 +118,8 @@ RSYNC_EXCLUDES=(
   --exclude='eval/auth-*.md'
   --exclude='tests/eval/openrouter-*.md'
   --exclude='eval/openrouter-*.md'
+  --exclude='tests/eval/client-package-boundaries.md'
+  --exclude='eval/client-package-boundaries.md'
   --exclude='scripts/sync-unified-secrets.mjs'
   --exclude='sync-unified-secrets.mjs'
   --exclude='scripts/run-server-relay-gate.sh'
@@ -231,6 +284,7 @@ assert_no_match() {
 # Sanity check：确认官方云服务、landing、计费与运维材料没漏出来
 assert_absent_path "$TARGET/apps/happy-server" "Happy Server"
 assert_absent_path "$TARGET/apps/landing-page" "Landing page"
+assert_absent_path "$TARGET/apps/live" "commercial live client"
 assert_absent_path "$TARGET/packages/commercial" "commercial client crates"
 assert_absent_path "$TARGET/landing" "legacy landing page"
 assert_absent_path "$TARGET/ops" "production ops scripts"
@@ -274,6 +328,7 @@ assert_absent_path "$TARGET/apps/client/scripts/publish-ota.ts" "hosted OTA publ
 
 assert_no_match 'PaymentOrder|BalanceLedger|ALIPAY_|OPENROUTER_MANAGEMENT_KEY|OFOX_API_KEY|WECHAT_APP_SECRET|REVENUE_CAT|RevenueCat' "billing/server secret"
 assert_no_match '免费模型余额|OTA pipeline|server manifest|Secure end-to-end encrypted communication via Happy Server|版本说明上传|上传版本说明' "internal release note"
+assert_no_match 'Cteno Live|live-douyin|抖音直播伴侣|主播版' "commercial live"
 
 if grep -rI "ESCROW_KEY" "$TARGET" 2>/dev/null \
   | grep -v "/docs/" \
@@ -295,14 +350,16 @@ echo ""
 if [ "$PUBLISH" = "1" ]; then
   echo "=== Publishing to $COMMUNITY_REMOTE ($COMMUNITY_BRANCH) ==="
   cd "$TARGET"
-  git init -b "$COMMUNITY_BRANCH" -q
-  git add .
-  git -c user.email="$(git -C "$REPO_ROOT" config user.email)" \
-      -c user.name="$(git -C "$REPO_ROOT" config user.name)" \
-      commit -q -m "Snapshot from monorepo $HEAD_COMMIT"
-  git remote add origin "$COMMUNITY_REMOTE"
-  git push --force origin "$COMMUNITY_BRANCH"
-  echo "Published $HEAD_COMMIT to $COMMUNITY_REMOTE ($COMMUNITY_BRANCH)"
+  git add -A
+  if git diff --cached --quiet; then
+    echo "No changes vs $COMMUNITY_BRANCH — skipping commit & push"
+  else
+    git -c user.email="$(git -C "$REPO_ROOT" config user.email)" \
+        -c user.name="$(git -C "$REPO_ROOT" config user.name)" \
+        commit -q -m "Snapshot from monorepo $HEAD_COMMIT"
+    git push origin "$COMMUNITY_BRANCH"
+    echo "Published $HEAD_COMMIT to $COMMUNITY_REMOTE ($COMMUNITY_BRANCH)"
+  fi
 else
   echo "Next steps (manual) — or rerun with --publish to auto-push:"
   echo "  1. cd $TARGET"

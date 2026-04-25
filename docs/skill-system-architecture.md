@@ -223,13 +223,21 @@ LLM 阅读指令，使用基础 tools 执行
 
 ### Fork 模式
 
-当 `context: fork` 时，`activate_fork_skill()` (line 143)：
+当 `context: fork` 时，目标语义是：fork 出来的工作仍属于当前 agent session 的内部子任务，由当前 vendor runtime 管理其 subagent / DAG / wait / merge 生命周期。Host 只提供必要的 session 元数据、权限闭环和事件传输，不拥有 fork 状态机。
+
+当前 legacy 实现里，`activate_fork_skill()` (line 143) 仍通过 PersonaManager 创建独立 task session：
 
 1. 从 input 提取 owner/persona ID
 2. 通过 PersonaManager dispatch_task 创建独立 agent session
 3. 返回 `{ sessionId, status }` 给调用方
 4. Fork 出的 agent 在独立 session 中执行 skill 指令
 5. 结果通过 `notify_task_result()` 推回原 session
+
+迁移方向：
+
+1. Cteno fork/subagent 能力收敛到 `cteno-agent-runtime`
+2. Claude / Codex / Gemini 由各自 adapter 映射到原生子任务能力或明确降级
+3. `dispatch_task`/PersonaManager 保留为兼容入口，不继续扩展为新的通用 DAG 引擎
 
 ---
 
@@ -288,7 +296,8 @@ Skills API 回退 → 按 skill ID 查找并激活
 │                                                  │
 │  activate_skill():                               │
 │    ├─ inline: 变量替换 → shell 执行 → 返回 XML    │
-│    └─ fork:   dispatch_task → 独立 session        │
+│    └─ fork:   vendor runtime subtask              │
+│              (legacy: dispatch_task → session)    │
 │                                                  │
 │  list/create/search/install/delete/...           │
 └─────────────────────────────────────────────────┘

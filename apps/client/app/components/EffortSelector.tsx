@@ -68,7 +68,9 @@ export function EffortSelector({
         if (!availableLevels || availableLevels.length === 0) {
             return EFFORT_OPTIONS;
         }
-        const allowed = new Set<RuntimeEffort>(['default', ...availableLevels]);
+        const allowed = new Set<RuntimeEffort>(availableLevels.includes('default')
+            ? availableLevels
+            : ['default', ...availableLevels]);
         return EFFORT_OPTIONS.filter((option) => allowed.has(option.value));
     }, [availableLevels]);
 

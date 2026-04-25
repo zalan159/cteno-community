@@ -22,7 +22,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -30,6 +30,41 @@ pub struct TurnUsage {
     pub cache_creation_input_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub total_tokens: u32,
+    pub max_tokens: u32,
+    pub raw_max_tokens: u32,
+    pub auto_compact_token_limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpDelivery {
+    Transient,
+    Persisted,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+    Text,
+    File,
+    Other,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Attachment {
+    pub kind: AttachmentKind,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub data: Option<String>,
 }
 
 /// Metadata for a host-owned tool injected into the session's tool surface.
@@ -55,6 +90,9 @@ pub enum Inbound {
         session_id: String,
         #[serde(default)]
         workdir: Option<String>,
+        /// Additional directories exposed to the session sandbox.
+        #[serde(default)]
+        additional_directories: Vec<String>,
         /// Optional free-form agent configuration (model, temperature, ...).
         /// The runner reads a small subset; unknown keys are ignored.
         #[serde(default)]
@@ -77,9 +115,24 @@ pub enum Inbound {
         machine_id: Option<String>,
     },
     /// Send a user turn into the session.
-    UserMessage { session_id: String, content: String },
+    UserMessage {
+        session_id: String,
+        content: String,
+        #[serde(default)]
+        task_id: Option<String>,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
+    },
     /// Best-effort abort of the current turn.
-    Abort { session_id: String },
+    Abort {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Close a session and release session-scoped resources (MCP registries,
+    /// pending turn handle, etc.) without necessarily shutting down the stdio
+    /// process.
+    CloseSession { session_id: String },
     /// Update the session's active model selection for subsequent turns.
     SetModel {
         session_id: String,
@@ -146,35 +199,18 @@ pub enum Inbound {
 }
 
 /// Messages cteno-agent writes to stdout.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outbound {
     /// Session initialised and ready for user messages.
     Ready { session_id: String },
 
-    /// Incremental streaming content.
-    Delta {
+    /// Runtime-native ACP payload. The stdio boundary transports it without
+    /// translating into Cteno-specific semantic frames.
+    Acp {
         session_id: String,
-        /// "text" | "thinking"
-        kind: String,
-        content: String,
-    },
-
-    /// A tool call has been dispatched.
-    ToolUse {
-        session_id: String,
-        tool_use_id: String,
-        name: String,
-        input: Value,
-    },
-
-    /// A tool call has produced output.
-    ToolResult {
-        session_id: String,
-        tool_use_id: String,
-        output: String,
-        #[serde(default)]
-        is_error: bool,
+        delivery: AcpDelivery,
+        data: Value,
     },
 
     /// Request the host to approve/deny a tool call. Host must reply with
@@ -203,6 +239,8 @@ pub enum Outbound {
         iteration_count: usize,
         #[serde(default)]
         usage: TurnUsage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_usage: Option<ContextUsage>,
     },
 
     /// Fatal or non-fatal error surface.
@@ -213,9 +251,9 @@ pub enum Outbound {
     /// `host_call_response` carrying the matching `request_id`.
     ///
     /// - `hook_name` selects the logical hook family (e.g. `agent_owner`,
-    ///   `skillhub`, `machine_socket`).
+    ///   `skillhub`, `local_notification`).
     /// - `method` selects the method within that family (e.g. `session_owner`,
-    ///   `list_skills`, `push_to_frontend`).
+    ///   `list_skills`, `send_local_notification`).
     /// - `params` is arbitrary JSON payload defined per method; the host and
     ///   agent adapters agree on the shape.
     HostCallRequest {
@@ -224,6 +262,71 @@ pub enum Outbound {
         hook_name: String,
         method: String,
         params: Value,
+    },
+
+    AutonomousTurnStart {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+        /// Synthetic user-message text that triggered this turn (e.g. the
+        /// concatenated `[Task Complete] X\n\n result` blocks drained from
+        /// the runtime queue when subagents completed). The host renders it
+        /// as a user-bubble in the persona transcript so the user can see
+        /// what fed into this turn — without it, the autonomous turn looks
+        /// like the agent talking to itself.
+        #[serde(default)]
+        synthetic_user_message: Option<String>,
+    },
+
+    /// SubAgent lifecycle transition emitted by the agent's
+    /// `SubAgentManager`. Routed by the cteno adapter's dispatcher to the
+    /// host's `SessionEventSink::on_subagent_lifecycle`, which mirrors
+    /// the SubAgent state into a desktop registry so the
+    /// `BackgroundRunsModal` can render live progress without polling
+    /// any RPC.
+    SubAgentLifecycle {
+        /// Parent persona session that owns this subagent.
+        session_id: String,
+        event: SubAgentLifecycleEvent,
+    },
+}
+
+/// Wire payload for `Outbound::SubAgentLifecycle`. Mirrors the runtime's
+/// `SubAgentLifecycleEventDto` (intentionally kept as a separate type so
+/// the wire format can evolve without dragging the runtime DTO with it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubAgentLifecycleEvent {
+    Spawned {
+        subagent_id: String,
+        agent_id: String,
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        created_at_ms: i64,
+    },
+    Started {
+        subagent_id: String,
+        started_at_ms: i64,
+    },
+    Updated {
+        subagent_id: String,
+        iteration_count: u32,
+    },
+    Completed {
+        subagent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        completed_at_ms: i64,
+    },
+    Failed {
+        subagent_id: String,
+        error: String,
+        completed_at_ms: i64,
+    },
+    Stopped {
+        subagent_id: String,
+        completed_at_ms: i64,
     },
 }
 
@@ -236,6 +339,7 @@ mod tests {
         let json = serde_json::json!({
             "type": "init",
             "session_id": "s-1",
+            "additional_directories": ["/tmp/extra"],
             "auth_token": "acc-tok-xyz",
             "user_id": "u-42",
             "machine_id": "m-abc"
@@ -247,14 +351,146 @@ mod tests {
                 auth_token,
                 user_id,
                 machine_id,
+                additional_directories,
                 ..
             } => {
                 assert_eq!(session_id, "s-1");
                 assert_eq!(auth_token.as_deref(), Some("acc-tok-xyz"));
                 assert_eq!(user_id.as_deref(), Some("u-42"));
                 assert_eq!(machine_id.as_deref(), Some("m-abc"));
+                assert_eq!(additional_directories, vec!["/tmp/extra"]);
             }
             _ => panic!("expected Init variant"),
+        }
+    }
+
+    #[test]
+    fn outbound_acp_round_trip() {
+        let msg = Outbound::Acp {
+            session_id: "s-acp".to_string(),
+            delivery: AcpDelivery::Persisted,
+            data: serde_json::json!({
+                "type": "tool-call",
+                "callId": "call-1",
+                "name": "read",
+                "input": {"path": "README.md"},
+                "futureField": true
+            }),
+        };
+        let json = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(json["type"], "acp");
+        assert_eq!(json["delivery"], "persisted");
+        assert_eq!(json["data"]["futureField"], true);
+    }
+
+    #[test]
+    fn outbound_subagent_lifecycle_round_trips() {
+        let cases = vec![
+            Outbound::SubAgentLifecycle {
+                session_id: "p1".into(),
+                event: SubAgentLifecycleEvent::Spawned {
+                    subagent_id: "s1".into(),
+                    agent_id: "worker".into(),
+                    task: "do thing".into(),
+                    label: Some("step 1".into()),
+                    created_at_ms: 12345,
+                },
+            },
+            Outbound::SubAgentLifecycle {
+                session_id: "p1".into(),
+                event: SubAgentLifecycleEvent::Started {
+                    subagent_id: "s1".into(),
+                    started_at_ms: 12346,
+                },
+            },
+            Outbound::SubAgentLifecycle {
+                session_id: "p1".into(),
+                event: SubAgentLifecycleEvent::Completed {
+                    subagent_id: "s1".into(),
+                    result: Some("ok".into()),
+                    completed_at_ms: 12500,
+                },
+            },
+            Outbound::SubAgentLifecycle {
+                session_id: "p1".into(),
+                event: SubAgentLifecycleEvent::Failed {
+                    subagent_id: "s2".into(),
+                    error: "boom".into(),
+                    completed_at_ms: 12500,
+                },
+            },
+        ];
+        for msg in cases {
+            let json = serde_json::to_value(&msg).expect("serialize");
+            let parsed: Outbound = serde_json::from_value(json).expect("deserialize");
+            // Spot check a couple of fields per case via Debug
+            assert!(
+                format!("{:?}", parsed).contains("SubAgentLifecycle"),
+                "expected SubAgentLifecycle variant, got {:?}",
+                parsed
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_autonomous_turn_start_round_trip() {
+        let msg = Outbound::AutonomousTurnStart {
+            session_id: "sess-1".to_string(),
+            reason: Some("subagent_handoff".to_string()),
+            synthetic_user_message: Some("[Task Complete] greeting\n\n你好".to_string()),
+        };
+        let json = serde_json::to_value(&msg).expect("serialize");
+        let parsed: Outbound = serde_json::from_value(json).expect("deserialize");
+        match parsed {
+            Outbound::AutonomousTurnStart {
+                session_id,
+                reason,
+                synthetic_user_message,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(reason.as_deref(), Some("subagent_handoff"));
+                assert_eq!(
+                    synthetic_user_message.as_deref(),
+                    Some("[Task Complete] greeting\n\n你好")
+                );
+            }
+            _ => panic!("expected AutonomousTurnStart variant"),
+        }
+    }
+
+    #[test]
+    fn inbound_close_session_round_trip() {
+        let msg: Inbound =
+            serde_json::from_value(serde_json::json!({"type":"close_session","session_id":"s-9"}))
+                .expect("parse");
+        match msg {
+            Inbound::CloseSession { session_id } => assert_eq!(session_id, "s-9"),
+            other => panic!("expected CloseSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_user_message_carries_task_id() {
+        let msg: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "user_message",
+            "session_id": "s-task",
+            "content": "hello",
+            "task_id": "task-1"
+        }))
+        .expect("parse");
+        match msg {
+            Inbound::UserMessage {
+                session_id,
+                content,
+                task_id,
+                attachments,
+            } => {
+                assert_eq!(session_id, "s-task");
+                assert_eq!(content, "hello");
+                assert_eq!(task_id.as_deref(), Some("task-1"));
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
         }
     }
 
@@ -335,6 +571,36 @@ mod tests {
                 assert_eq!(mode, "accept_edits");
             }
             _ => panic!("expected SetPermissionMode variant"),
+        }
+    }
+
+    #[test]
+    fn inbound_abort_reason_is_optional() {
+        let legacy: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "abort",
+            "session_id": "s-legacy"
+        }))
+        .expect("parse legacy abort");
+        match legacy {
+            Inbound::Abort { session_id, reason } => {
+                assert_eq!(session_id, "s-legacy");
+                assert!(reason.is_none());
+            }
+            _ => panic!("expected Abort variant"),
+        }
+
+        let with_reason: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "abort",
+            "session_id": "s-timeout",
+            "reason": "timed out"
+        }))
+        .expect("parse abort with reason");
+        match with_reason {
+            Inbound::Abort { session_id, reason } => {
+                assert_eq!(session_id, "s-timeout");
+                assert_eq!(reason.as_deref(), Some("timed out"));
+            }
+            _ => panic!("expected Abort variant"),
         }
     }
 

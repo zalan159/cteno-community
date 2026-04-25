@@ -57,6 +57,8 @@ fn init_main_db(path: &PathBuf) -> SqliteResult<()> {
             user_id TEXT,
             messages TEXT NOT NULL DEFAULT '[]',
             context_data TEXT,
+            agent_state TEXT,
+            agent_state_version INTEGER NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'active' CHECK(status IN ('active', 'expired', 'closed')),
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now')),
@@ -112,6 +114,23 @@ fn init_main_db(path: &PathBuf) -> SqliteResult<()> {
             "CREATE INDEX IF NOT EXISTS idx_agent_sessions_vendor ON agent_sessions(vendor)",
         )?;
         log::info!("[DB] Migrated agent_sessions: added vendor column");
+    }
+
+    // Migration: persist local agent state so permission prompts survive
+    // frontend reloads or missed Tauri events.
+    let has_agent_state_col: bool = conn
+        .prepare(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name='agent_state'",
+        )
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+        .unwrap_or(0)
+        > 0;
+    if !has_agent_state_col {
+        conn.execute_batch("ALTER TABLE agent_sessions ADD COLUMN agent_state TEXT")?;
+        conn.execute_batch(
+            "ALTER TABLE agent_sessions ADD COLUMN agent_state_version INTEGER NOT NULL DEFAULT 0",
+        )?;
+        log::info!("[DB] Migrated agent_sessions: added agent_state columns");
     }
 
     Ok(())

@@ -164,6 +164,28 @@ fn build_claude_task_native_event(
     })
 }
 
+fn build_claude_sidechain_native_event(
+    kind: &str,
+    parent_tool_use_id: String,
+    uuid: Option<String>,
+    tool_use_id: Option<String>,
+    name: Option<String>,
+    input: Option<Value>,
+    text: Option<String>,
+    is_error: Option<bool>,
+) -> Value {
+    json!({
+        "kind": kind,
+        "parent_tool_use_id": parent_tool_use_id,
+        "uuid": uuid,
+        "tool_use_id": tool_use_id,
+        "name": name,
+        "input": input,
+        "text": text,
+        "is_error": is_error,
+    })
+}
+
 /// Per-session subprocess handle held inside the executor's registry.
 ///
 /// `stdin` and `pending_permission_inputs` are behind their own `Arc<Mutex>`
@@ -932,6 +954,7 @@ impl AgentExecutor for ClaudeAgentExecutor {
             supports_injected_tools: false,
             supports_permission_closure: true,
             supports_interrupt: true,
+            autonomous_turn: false,
         }
     }
 
@@ -1032,6 +1055,7 @@ impl AgentExecutor for ClaudeAgentExecutor {
 
             let mut iterations: u32 = 0;
             let mut final_text: Option<String> = None;
+            let mut permission_pending = false;
 
             // `'turn` lets every early-exit path carry `stdout_reader` back to
             // the outer scope so we can restore it into the process struct.
@@ -1044,7 +1068,7 @@ impl AgentExecutor for ClaudeAgentExecutor {
                 tokio::pin!(read_fut);
 
                 tokio::select! {
-                    _ = &mut deadline => {
+                    _ = &mut deadline, if !permission_pending => {
                         let _ = tx
                             .send(Err(AgentExecutorError::Timeout {
                                 operation: "send_message".to_string(),
@@ -1064,6 +1088,14 @@ impl AgentExecutor for ClaudeAgentExecutor {
                                 break 'turn stdout_reader;
                             }
                             Ok(_) => {
+                                let is_permission_request =
+                                    is_can_use_tool_control_request(&line);
+                                if permission_pending && !is_permission_request {
+                                    permission_pending = false;
+                                    deadline
+                                        .as_mut()
+                                        .reset(tokio::time::Instant::now() + turn_timeout);
+                                }
                                 match route_control_response_inline(
                                     &line,
                                     None,
@@ -1094,6 +1126,9 @@ impl AgentExecutor for ClaudeAgentExecutor {
                                 )
                                 .await
                                 {
+                                    if is_permission_request {
+                                        permission_pending = true;
+                                    }
                                     if done {
                                         break 'turn stdout_reader;
                                     }
@@ -1667,7 +1702,12 @@ async fn dispatch_event(
             }
             false
         }
-        ClaudeJsonEvent::Assistant { message, .. } => {
+        ClaudeJsonEvent::Assistant {
+            message,
+            parent_tool_use_id,
+            uuid,
+            ..
+        } => {
             *iterations = iterations.saturating_add(1);
             // Text and Thinking are already streamed via StreamEvent
             // (content_block_delta) because we spawn Claude CLI with
@@ -1677,6 +1717,70 @@ async fn dispatch_event(
             // before the loop so multi-block frames still concatenate).
             let streaming_already_populated = final_text.is_some();
             for block in message.content {
+                if let Some(parent_tool_use_id) = parent_tool_use_id.clone() {
+                    let payload = match block {
+                        ClaudeContent::Text { text } => Some(build_claude_sidechain_native_event(
+                            "sidechain_text",
+                            parent_tool_use_id,
+                            uuid.clone(),
+                            None,
+                            None,
+                            None,
+                            Some(text),
+                            None,
+                        )),
+                        ClaudeContent::Thinking { thinking } => {
+                            Some(build_claude_sidechain_native_event(
+                                "sidechain_thinking",
+                                parent_tool_use_id,
+                                uuid.clone(),
+                                None,
+                                None,
+                                None,
+                                Some(thinking),
+                                None,
+                            ))
+                        }
+                        ClaudeContent::ToolUse { id, name, input } => {
+                            Some(build_claude_sidechain_native_event(
+                                "sidechain_tool_call",
+                                parent_tool_use_id,
+                                uuid.clone(),
+                                Some(id),
+                                Some(name),
+                                Some(input),
+                                None,
+                                None,
+                            ))
+                        }
+                        ClaudeContent::RedactedThinking => {
+                            Some(build_claude_sidechain_native_event(
+                                "sidechain_thinking",
+                                parent_tool_use_id,
+                                uuid.clone(),
+                                None,
+                                None,
+                                None,
+                                Some("[redacted thinking]".to_string()),
+                                None,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some(payload) = payload {
+                        if tx
+                            .send(Ok(ExecutorEvent::NativeEvent {
+                                provider: Cow::Borrowed(VENDOR_NAME),
+                                payload,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return true;
+                        }
+                    }
+                    continue;
+                }
                 let outgoing = match block {
                     ClaudeContent::Text { text } => {
                         if !streaming_already_populated {
@@ -1713,14 +1817,37 @@ async fn dispatch_event(
             }
             false
         }
-        ClaudeJsonEvent::User { message, .. } => {
+        ClaudeJsonEvent::User {
+            message,
+            parent_tool_use_id,
+            uuid,
+            ..
+        } => {
             // The CLI echoes tool results (inside content blocks) and plain
             // user text through `user` frames. Fan out `tool_result` blocks
             // as `ExecutorEvent::ToolResult` so the card transitions out of
             // the "running" state; forward anything else as a debug-only
             // native marker.
             match message.content {
-                crate::stream::ClaudeUserMessageContent::Text(_) => {
+                crate::stream::ClaudeUserMessageContent::Text(text) => {
+                    if let Some(parent_tool_use_id) = parent_tool_use_id {
+                        let _ = tx
+                            .send(Ok(ExecutorEvent::NativeEvent {
+                                provider: Cow::Borrowed(VENDOR_NAME),
+                                payload: build_claude_sidechain_native_event(
+                                    "sidechain_prompt",
+                                    parent_tool_use_id,
+                                    uuid,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(text),
+                                    None,
+                                ),
+                            }))
+                            .await;
+                        return false;
+                    }
                     let _ = tx
                         .send(Ok(ExecutorEvent::NativeEvent {
                             provider: Cow::Borrowed(VENDOR_NAME),
@@ -1737,6 +1864,28 @@ async fn dispatch_event(
                                 is_error,
                             } => {
                                 let text = flatten_claude_tool_result_content(&content);
+                                if let Some(parent_tool_use_id) = parent_tool_use_id.clone() {
+                                    if tx
+                                        .send(Ok(ExecutorEvent::NativeEvent {
+                                            provider: Cow::Borrowed(VENDOR_NAME),
+                                            payload: build_claude_sidechain_native_event(
+                                                "sidechain_tool_result",
+                                                parent_tool_use_id,
+                                                uuid.clone(),
+                                                Some(tool_use_id),
+                                                None,
+                                                None,
+                                                Some(text),
+                                                Some(is_error),
+                                            ),
+                                        }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return true;
+                                    }
+                                    continue;
+                                }
                                 let output = if is_error { Err(text) } else { Ok(text) };
                                 if tx
                                     .send(Ok(ExecutorEvent::ToolResult {
@@ -1883,7 +2032,13 @@ async fn dispatch_event(
             true
         }
         // Stream events from --include-partial-messages (token-level streaming)
-        ClaudeJsonEvent::StreamEvent { event } => {
+        ClaudeJsonEvent::StreamEvent {
+            event,
+            parent_tool_use_id,
+        } => {
+            if parent_tool_use_id.is_some() {
+                return false;
+            }
             if let Some(evt) = event.as_ref() {
                 let evt_type = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if evt_type == "content_block_delta" {
@@ -2049,6 +2204,22 @@ async fn handle_control_request_inline(
             Some(false)
         }
     }
+}
+
+fn is_can_use_tool_control_request(raw_line: &str) -> bool {
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('{') {
+        return false;
+    }
+    let Ok(raw) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    raw.get("type").and_then(|v| v.as_str()) == Some("control_request")
+        && raw
+            .get("request")
+            .and_then(|r| r.get("subtype"))
+            .and_then(|v| v.as_str())
+            == Some("can_use_tool")
 }
 
 async fn write_control_line(
@@ -2446,6 +2617,43 @@ mod tests {
         };
 
         assert_eq!(top_level_payload, system_payload);
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_preserves_claude_sidechain_parent_tool_id() {
+        let event = parse_stream_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"subagent says hi"}]},"parent_tool_use_id":"toolu_parent","uuid":"sidechain-1"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut iterations = 0;
+        let mut final_text = None;
+
+        let done = dispatch_event(event, &tx, &mut iterations, &mut final_text).await;
+        assert!(!done);
+        assert_eq!(iterations, 1);
+        assert!(final_text.is_none());
+
+        match rx.recv().await.unwrap().unwrap() {
+            ExecutorEvent::NativeEvent { provider, payload } => {
+                assert_eq!(provider, VENDOR_NAME);
+                assert_eq!(
+                    payload,
+                    json!({
+                        "kind": "sidechain_text",
+                        "parent_tool_use_id": "toolu_parent",
+                        "uuid": "sidechain-1",
+                        "tool_use_id": Value::Null,
+                        "name": Value::Null,
+                        "input": Value::Null,
+                        "text": "subagent says hi",
+                        "is_error": Value::Null,
+                    })
+                );
+            }
+            other => panic!("expected NativeEvent, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2982,5 +3190,28 @@ mod tests {
             !caps.supports_multi_session_per_process,
             "claude adapter must not advertise multi-session per process"
         );
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_autonomous_turn() {
+        let store = Arc::new(RecordingStore::default());
+        let executor = ClaudeAgentExecutor::new(PathBuf::from("/unused"), store);
+        assert!(!executor.capabilities().autonomous_turn);
+    }
+
+    #[tokio::test]
+    async fn set_autonomous_turn_handler_returns_unsupported() {
+        let store = Arc::new(RecordingStore::default());
+        let executor = ClaudeAgentExecutor::new(PathBuf::from("/unused"), store);
+        let err = executor
+            .set_autonomous_turn_handler(Some(Arc::new(|_session_id, _synthetic, _stream| {})))
+            .await
+            .unwrap_err();
+        match err {
+            AgentExecutorError::Unsupported { capability } => {
+                assert_eq!(capability, "set_autonomous_turn_handler");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
@@ -30,10 +30,10 @@ use multi_agent_runtime_core::executor::{
     SessionRecord, SessionRef, SessionStoreProvider, SpawnSessionSpec, TokenUsage, UserMessage,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::stream::{
@@ -977,38 +977,31 @@ impl CodexAgentExecutor {
             let mut plan_text_by_tool_use_id: HashMap<String, String> = HashMap::new();
             let mut command_output_by_tool_use_id: HashMap<String, CommandOutputBuffers> =
                 HashMap::new();
-            let turn_deadline = tokio::time::Instant::now() + turn_timeout;
+            let deadline = tokio::time::sleep(turn_timeout);
+            tokio::pin!(deadline);
+            let mut permission_pending = false;
 
             for event in initial_native_events {
                 yield event;
             }
 
             loop {
-                let remaining = turn_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    Err(AgentExecutorError::Timeout {
-                        operation: "send_message".to_string(),
-                        seconds: turn_timeout.as_secs(),
-                    })?;
-                    unreachable!();
-                }
-
-                let frame = match tokio::time::timeout(remaining, frame_lease.receiver_mut().recv()).await {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => {
-                        Err(AgentExecutorError::Protocol(
-                            "codex app-server thread channel closed mid-turn".to_string(),
-                        ))?;
-                        unreachable!();
-                    }
-                    Err(_) => {
+                let frame = tokio::select! {
+                    _ = &mut deadline, if !permission_pending => {
                         Err(AgentExecutorError::Timeout {
                             operation: "send_message".to_string(),
                             seconds: turn_timeout.as_secs(),
-                        })?;
-                        unreachable!();
+                        })
                     }
-                };
+                    frame = frame_lease.receiver_mut().recv() => {
+                        match frame {
+                            Some(frame) => Ok(frame),
+                            None => Err(AgentExecutorError::Protocol(
+                                "codex app-server thread channel closed mid-turn".to_string(),
+                            )),
+                        }
+                    }
+                }?;
 
                 match frame {
                     ThreadFrame::ConnectionClosed { reason } => {
@@ -1024,7 +1017,18 @@ impl CodexAgentExecutor {
                             &params,
                             &thread_state.pending_approvals,
                         ).await? {
+                            let is_permission_request =
+                                matches!(&event, ExecutorEvent::PermissionRequest { .. });
+                            if permission_pending && !is_permission_request {
+                                permission_pending = false;
+                                deadline
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + turn_timeout);
+                            }
                             yield event;
+                            if is_permission_request {
+                                permission_pending = true;
+                            }
                         }
                     }
                     ThreadFrame::Notification { method, params } => {
@@ -1040,8 +1044,24 @@ impl CodexAgentExecutor {
                             &mut plan_text_by_tool_use_id,
                             &mut command_output_by_tool_use_id,
                         ).await?;
+                        let has_permission_request = outcome
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, ExecutorEvent::PermissionRequest { .. }));
+                        if permission_pending
+                            && !has_permission_request
+                            && !outcome.events.is_empty()
+                        {
+                            permission_pending = false;
+                            deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + turn_timeout);
+                        }
                         for event in outcome.events {
                             yield event;
+                        }
+                        if has_permission_request {
+                            permission_pending = true;
                         }
                         if outcome.done {
                             break;
@@ -1298,6 +1318,7 @@ impl AgentExecutor for CodexAgentExecutor {
             supports_permission_closure: true,
             // Children can be killed to interrupt the turn.
             supports_interrupt: true,
+            autonomous_turn: false,
         }
     }
 
@@ -1436,7 +1457,7 @@ impl AgentExecutor for CodexAgentExecutor {
                     .await
             }
             SessionTransport::ExecFallback(_) => Err(AgentExecutorError::Unsupported {
-                capability: "respond_to_permission",
+                capability: "respond_to_permission".to_string(),
             }),
         }
     }
@@ -1712,7 +1733,7 @@ impl AgentExecutor for CodexAgentExecutor {
     ) -> Result<ConnectionHandle, AgentExecutorError> {
         if !self.app_server_available() {
             return Err(AgentExecutorError::Unsupported {
-                capability: "open_connection",
+                capability: "open_connection".to_string(),
             });
         }
 
@@ -2423,6 +2444,9 @@ async fn handle_app_server_notification(
                 outcome
                     .events
                     .push(ExecutorEvent::UsageUpdate(aggregate_usage.clone()));
+                if let Some(event) = codex_context_usage_native_event(token_usage) {
+                    outcome.events.push(event);
+                }
             }
         }
         "turn/completed" => {
@@ -2796,6 +2820,31 @@ fn update_usage_from_object(value: &Value, usage: &mut TokenUsage) {
     }
 }
 
+fn codex_context_usage_native_event(token_usage: &Value) -> Option<ExecutorEvent> {
+    let object = token_usage.as_object()?;
+    let context_window =
+        positive_json_u64(object, &["modelContextWindow", "model_context_window"])?;
+    let usage = object
+        .get("last")
+        .or_else(|| object.get("lastTokenUsage"))
+        .or_else(|| object.get("last_token_usage"))
+        .or_else(|| object.get("total"))
+        .or_else(|| object.get("totalTokenUsage"))
+        .or_else(|| object.get("total_token_usage"))?;
+    let usage_object = usage.as_object()?;
+    let total_tokens = positive_json_u64(usage_object, &["totalTokens", "total_tokens"])?;
+
+    Some(ExecutorEvent::NativeEvent {
+        provider: Cow::Borrowed(VENDOR),
+        payload: json!({
+            "kind": "context_usage",
+            "total_tokens": total_tokens,
+            "max_tokens": context_window,
+            "raw_max_tokens": context_window,
+        }),
+    })
+}
+
 fn usage_objects<'a>(object: &'a Map<String, Value>) -> Vec<&'a Map<String, Value>> {
     let mut candidates = vec![object];
     for key in ["total", "totalTokenUsage", "total_token_usage"] {
@@ -2810,6 +2859,17 @@ fn json_u64(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| object.get(*key))
         .and_then(Value::as_u64)
+}
+
+fn positive_json_u64(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        })
+        .filter(|value| *value > 0)
 }
 
 fn json_f64(object: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
@@ -2917,7 +2977,7 @@ fn translate_item(item: &CodexItem, current_model: &str) -> Option<ExecutorEvent
         }),
         CodexItem::TodoList { id, items } => Some(ExecutorEvent::ToolCallStart {
             tool_use_id: id.clone(),
-            name: "TodoWrite".to_string(),
+            name: "update_plan".to_string(),
             input: codex_todo_input(items),
             partial: true,
         }),
@@ -3387,9 +3447,14 @@ fn codex_reasoning_summary_part(value: &Value) -> Option<String> {
 }
 
 fn normalize_todo_status(status: Option<&str>) -> &'static str {
-    match status.unwrap_or("pending") {
-        "completed" => "completed",
-        "in_progress" | "inProgress" => "in_progress",
+    match status
+        .unwrap_or("pending")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "completed" | "complete" | "done" | "success" | "succeeded" => "completed",
+        "in_progress" | "in-progress" | "inprogress" | "running" | "active" => "in_progress",
         _ => "pending",
     }
 }
@@ -3631,6 +3696,7 @@ exit 1
                     &session,
                     UserMessage {
                         content: "first".to_string(),
+                        task_id: None,
                         attachments: Vec::new(),
                         parent_tool_use_id: None,
                         injected_tools: Vec::new(),
@@ -3658,6 +3724,7 @@ exit 1
                     &session,
                     UserMessage {
                         content: "second".to_string(),
+                        task_id: None,
                         attachments: Vec::new(),
                         parent_tool_use_id: None,
                         injected_tools: Vec::new(),
@@ -3879,6 +3946,7 @@ exit 1
                     &sess_a,
                     UserMessage {
                         content: "hello A".to_string(),
+                        task_id: None,
                         attachments: Vec::new(),
                         parent_tool_use_id: None,
                         injected_tools: Vec::new(),
@@ -3894,6 +3962,7 @@ exit 1
                     &sess_b,
                     UserMessage {
                         content: "hello B".to_string(),
+                        task_id: None,
                         attachments: Vec::new(),
                         parent_tool_use_id: None,
                         injected_tools: Vec::new(),
@@ -3972,6 +4041,7 @@ exit 1
                     &sess_b,
                     UserMessage {
                         content: "hello B".to_string(),
+                        task_id: None,
                         attachments: Vec::new(),
                         parent_tool_use_id: None,
                         injected_tools: Vec::new(),
@@ -3981,11 +4051,9 @@ exit 1
                 .unwrap(),
         )
         .await;
-        assert!(
-            events_b
-                .iter()
-                .any(|e| matches!(e, ExecutorEvent::TurnComplete { .. }))
-        );
+        assert!(events_b
+            .iter()
+            .any(|e| matches!(e, ExecutorEvent::TurnComplete { .. })));
 
         let _ = executor.close_connection(handle).await;
         let _ = fs::remove_dir_all(&root);
@@ -4112,6 +4180,29 @@ exit 1
         assert!(caps.supports_runtime_set_model);
         assert_eq!(caps.permission_mode_kind, PermissionModeKind::Dynamic);
         assert!(caps.supports_resume);
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_autonomous_turn() {
+        let executor =
+            CodexAgentExecutor::new(PathBuf::from("codex"), Arc::new(RecordingStore::default()));
+        assert!(!executor.capabilities().autonomous_turn);
+    }
+
+    #[tokio::test]
+    async fn set_autonomous_turn_handler_returns_unsupported() {
+        let executor =
+            CodexAgentExecutor::new(PathBuf::from("codex"), Arc::new(RecordingStore::default()));
+        let err = executor
+            .set_autonomous_turn_handler(Some(Arc::new(|_session_id, _synthetic, _stream| {})))
+            .await
+            .unwrap_err();
+        match err {
+            AgentExecutorError::Unsupported { capability } => {
+                assert_eq!(capability, "set_autonomous_turn_handler");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4585,6 +4676,7 @@ exit 1
                     &resumed,
                     UserMessage {
                         content: "resume check".to_string(),
+                        task_id: None,
                         attachments: Vec::new(),
                         parent_tool_use_id: None,
                         injected_tools: Vec::new(),
@@ -5068,7 +5160,7 @@ exit 1
                         text: Some("Add frontend tool translation".to_string()),
                         step: None,
                         description: None,
-                        status: Some("inProgress".to_string()),
+                        status: Some("running".to_string()),
                     },
                 ],
             },
@@ -5146,7 +5238,7 @@ exit 1
     }
 
     #[test]
-    fn todo_list_starts_as_todowrite_tool() {
+    fn todo_list_starts_as_update_plan_tool() {
         let event = translate_item(
             &CodexItem::TodoList {
                 id: "todo-1".to_string(),
@@ -5167,7 +5259,7 @@ exit 1
 
         match event {
             ExecutorEvent::ToolCallStart { name, input, .. } => {
-                assert_eq!(name, "TodoWrite");
+                assert_eq!(name, "update_plan");
                 assert_eq!(
                     input,
                     serde_json::json!({
@@ -5310,6 +5402,44 @@ exit 1
                             "riskLevel": "medium",
                             "autoApproved": true
                         }
+                    })
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_usage_notification_maps_last_usage_to_context_usage_native_event() {
+        let event = codex_context_usage_native_event(&json!({
+            "total": {
+                "totalTokens": 180_000,
+                "inputTokens": 150_000,
+                "cachedInputTokens": 20_000,
+                "outputTokens": 8_000,
+                "reasoningOutputTokens": 2_000
+            },
+            "last": {
+                "totalTokens": 158_000,
+                "inputTokens": 130_000,
+                "cachedInputTokens": 18_000,
+                "outputTokens": 7_000,
+                "reasoningOutputTokens": 3_000
+            },
+            "modelContextWindow": 258_400
+        }))
+        .expect("context usage event");
+
+        match event {
+            ExecutorEvent::NativeEvent { provider, payload } => {
+                assert_eq!(provider.as_ref(), VENDOR);
+                assert_eq!(
+                    payload,
+                    json!({
+                        "kind": "context_usage",
+                        "total_tokens": 158_000_u64,
+                        "max_tokens": 258_400_u64,
+                        "raw_max_tokens": 258_400_u64,
                     })
                 );
             }

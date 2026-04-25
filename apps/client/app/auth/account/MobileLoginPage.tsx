@@ -30,6 +30,7 @@ import { openExternalUrl } from '@/utils/openExternalUrl';
 
 type LoginStep = 'email' | 'password' | 'social' | 'register';
 type PendingAction = 'check-email' | 'login' | 'register' | 'google' | 'apple' | null;
+type LoginMode = 'cloud' | 'local-token';
 
 type EmailCheckResponse = {
     exists?: boolean;
@@ -303,11 +304,14 @@ interface MobileLoginPageProps {
     title?: string;
     subtitle?: string;
     buttonTitle?: string;
+    loginMode?: LoginMode;
 }
 
 export function MobileLoginPage({
     title = 'Login',
     subtitle = 'Enter your email to continue, or use Apple or Google below.',
+    buttonTitle = 'Login',
+    loginMode = 'cloud',
 }: MobileLoginPageProps) {
     const styles = stylesheet;
     const { theme } = useUnistyles();
@@ -321,6 +325,14 @@ export function MobileLoginPage({
     const [pendingAction, setPendingAction] = React.useState<PendingAction>(null);
 
     const busy = pendingAction !== null;
+
+    const completeLogin = React.useCallback(async (payload: AuthSuccessPayload) => {
+        if (loginMode === 'local-token') {
+            await auth.loginForLocalToken(payload);
+        } else {
+            await auth.login(payload);
+        }
+    }, [auth, loginMode]);
 
     const showNativeAlert = React.useCallback((titleText: string, message: string) => {
         if (Platform.OS === 'ios' || Platform.OS === 'android') {
@@ -425,7 +437,7 @@ export function MobileLoginPage({
                 throw new Error(rawPayload?.error || `Login failed with status ${response.status}.`);
             }
 
-            await auth.login(payload);
+            await completeLogin(payload);
         } catch (caughtError) {
             const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
             console.error('Email login failed:', caughtError);
@@ -434,7 +446,7 @@ export function MobileLoginPage({
         } finally {
             setPendingAction(null);
         }
-    }, [auth, email, password, showNativeAlert]);
+    }, [completeLogin, email, password, showNativeAlert]);
 
     const handleRegister = React.useCallback(async () => {
         if (Platform.OS === 'ios' && !termsAccepted) {
@@ -469,7 +481,7 @@ export function MobileLoginPage({
             const message = 'Verification email sent. Please check your inbox.';
             setNotice(message);
             showNativeAlert('Check your email', message);
-            await auth.login(payload);
+            await completeLogin(payload);
         } catch (caughtError) {
             const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
             console.error('Registration failed:', caughtError);
@@ -478,7 +490,7 @@ export function MobileLoginPage({
         } finally {
             setPendingAction(null);
         }
-    }, [auth, email, password, showNativeAlert, termsAccepted]);
+    }, [completeLogin, email, password, showNativeAlert, termsAccepted]);
 
     const handleGoogleLogin = React.useCallback(async () => {
         setPendingAction('google');
@@ -486,8 +498,8 @@ export function MobileLoginPage({
         setNotice(null);
 
         try {
-            const payload = await loginWithBrowserOAuth('google');
-            await auth.login(payload);
+            const payload = await loginWithBrowserOAuth();
+            await completeLogin(payload);
         } catch (caughtError) {
             const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
             console.error('Google OAuth login failed:', caughtError);
@@ -496,7 +508,7 @@ export function MobileLoginPage({
         } finally {
             setPendingAction(null);
         }
-    }, [auth, showNativeAlert]);
+    }, [completeLogin, showNativeAlert]);
 
     const handleAppleLogin = React.useCallback(async () => {
         if (Platform.OS !== 'ios' || busy) {
@@ -513,7 +525,7 @@ export function MobileLoginPage({
                 return;
             }
 
-            await auth.login(payload);
+            await completeLogin(payload);
         } catch (caughtError) {
             const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
             console.error('Apple login failed:', caughtError);
@@ -522,7 +534,7 @@ export function MobileLoginPage({
         } finally {
             setPendingAction(null);
         }
-    }, [auth, busy, showNativeAlert]);
+    }, [busy, completeLogin, showNativeAlert]);
 
     const emailLocked = step !== 'email';
     const socialPrompt = Platform.OS === 'ios'
@@ -703,7 +715,7 @@ export function MobileLoginPage({
 
                             {step === 'password' ? (
                                 <RoundButton
-                                    title="Login"
+                                    title={buttonTitle}
                                     size="large"
                                     loading={pendingAction === 'login'}
                                     disabled={busy || password.length < 8}

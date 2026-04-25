@@ -66,6 +66,8 @@ mod community {
             Arc<dyn Fn() -> RuntimeFuture<Result<Value, String>> + Send + Sync>,
         pub export_profiles: Arc<dyn Fn() -> RuntimeFuture<Result<Value, String>> + Send + Sync>,
         pub save_profile: Arc<dyn Fn(Value) -> RuntimeFuture<Result<Value, String>> + Send + Sync>,
+        pub save_coding_plan_profiles:
+            Arc<dyn Fn(Value) -> RuntimeFuture<Result<Value, String>> + Send + Sync>,
         pub delete_profile:
             Arc<dyn Fn(String) -> RuntimeFuture<Result<Value, String>> + Send + Sync>,
         pub switch_session_model: Arc<
@@ -362,7 +364,19 @@ mod community {
             .register(&methods.save_profile, move |params| {
                 let save = save.clone();
                 async move {
-                    save(params)
+                    let profile_val = params.get("profile").cloned().unwrap_or(params);
+                    save(profile_val)
+                        .await
+                        .or_else(|e| Ok(json!({ "success": false, "error": e })))
+                }
+            })
+            .await;
+        let save_coding_plan = hooks.save_coding_plan_profiles.clone();
+        registry
+            .register(&methods.save_coding_plan_profiles, move |params| {
+                let save_coding_plan = save_coding_plan.clone();
+                async move {
+                    save_coding_plan(params)
                         .await
                         .or_else(|e| Ok(json!({ "success": false, "error": e })))
                 }
@@ -482,6 +496,7 @@ mod community {
         pub list_profiles: String,
         pub export_profiles: String,
         pub save_profile: String,
+        pub save_coding_plan_profiles: String,
         pub delete_profile: String,
         pub switch_profile: String,
         pub refresh_proxy_profiles: String,
@@ -571,6 +586,7 @@ mod community {
                 list_profiles: m("list-profiles"),
                 export_profiles: m("export-profiles"),
                 save_profile: m("save-profile"),
+                save_coding_plan_profiles: m("save-coding-plan-profiles"),
                 delete_profile: m("delete-profile"),
                 switch_profile: m("switch-session-model"),
                 refresh_proxy_profiles: m("refresh-proxy-profiles"),
@@ -657,6 +673,7 @@ mod community {
                 self.spawn.clone(),
                 self.reconnect.clone(),
                 self.list_profiles.clone(),
+                self.save_coding_plan_profiles.clone(),
                 self.get_session.clone(),
                 self.get_session_messages.clone(),
             ]

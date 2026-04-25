@@ -1172,6 +1172,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Frames hypotheses".to_string(),
                         prompt: "Hypothesize".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,
@@ -1190,6 +1191,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Runs experiments".to_string(),
                         prompt: "Experiment".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,
@@ -1208,6 +1210,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Evaluates experiment outcomes".to_string(),
                         prompt: "Evaluate".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,

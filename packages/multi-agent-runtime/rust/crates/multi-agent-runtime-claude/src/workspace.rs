@@ -1310,6 +1310,7 @@ impl ClaudeWorkspace {
                         ClaudeJsonEvent::Assistant {
                             message,
                             session_id,
+                            ..
                         } => {
                             for content in message.content {
                                 match content {

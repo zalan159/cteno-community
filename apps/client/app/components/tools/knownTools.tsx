@@ -93,15 +93,14 @@ const taskLikeTool = {
     icon: ICON_TASK,
     isMutable: true,
     minimal: (opts: { metadata: Metadata | null, tool: ToolCall, messages?: Message[] }) => {
-        // Check if there would be any filtered tasks
         const messages = opts.messages || [];
-        for (let m of messages) {
-            if (m.kind === 'tool-call' &&
-                (m.tool.state === 'running' || m.tool.state === 'completed' || m.tool.state === 'error')) {
-                return false; // Has active sub-tasks, show expanded
-            }
+        if (messages.length > 0) {
+            return false;
         }
-        return true; // No active sub-tasks, render as minimal
+        if (typeof opts.tool.input?.summary === 'string' && opts.tool.input.summary.trim().length > 0) {
+            return false;
+        }
+        return true;
     },
     input: z.object({
         prompt: z.string().describe('The task for the agent to perform'),
@@ -166,7 +165,26 @@ export const knownTools = {
             return t('tools.names.searchFiles');
         },
         icon: ICON_SEARCH,
-        minimal: true,
+        input: z.object({
+            pattern: z.string().describe('The glob pattern to match files against'),
+            path: z.string().optional().describe('The directory to search in')
+        }).partial().passthrough(),
+        extractDescription: (opts: { metadata: Metadata | null, tool: ToolCall }) => {
+            if (typeof opts.tool.input.pattern === 'string') {
+                return t('tools.desc.searchPattern', { pattern: opts.tool.input.pattern });
+            }
+            return t('tools.names.search');
+        },
+        extractTip: () => randomTip(TIPS.search),
+    },
+    'glob': {
+        title: (opts: { metadata: Metadata | null, tool: ToolCall }) => {
+            if (typeof opts.tool.input.pattern === 'string') {
+                return opts.tool.input.pattern;
+            }
+            return t('tools.names.searchFiles');
+        },
+        icon: ICON_SEARCH,
         input: z.object({
             pattern: z.string().describe('The glob pattern to match files against'),
             path: z.string().optional().describe('The directory to search in')
@@ -187,7 +205,39 @@ export const knownTools = {
             return 'Search Content';
         },
         icon: ICON_READ,
-        minimal: true,
+        input: z.object({
+            pattern: z.string().describe('The regular expression pattern to search for'),
+            path: z.string().optional().describe('File or directory to search in'),
+            output_mode: z.enum(['content', 'files_with_matches', 'count']).optional(),
+            '-n': z.boolean().optional().describe('Show line numbers'),
+            '-i': z.boolean().optional().describe('Case insensitive search'),
+            '-A': z.number().optional().describe('Lines to show after match'),
+            '-B': z.number().optional().describe('Lines to show before match'),
+            '-C': z.number().optional().describe('Lines to show before and after match'),
+            glob: z.string().optional().describe('Glob pattern to filter files'),
+            type: z.string().optional().describe('File type to search'),
+            head_limit: z.number().optional().describe('Limit output to first N lines/entries'),
+            multiline: z.boolean().optional().describe('Enable multiline mode')
+        }).partial().passthrough(),
+        extractDescription: (opts: { metadata: Metadata | null, tool: ToolCall }) => {
+            if (typeof opts.tool.input.pattern === 'string') {
+                const pattern = opts.tool.input.pattern.length > 20
+                    ? opts.tool.input.pattern.substring(0, 20) + '...'
+                    : opts.tool.input.pattern;
+                return `Search(pattern: ${pattern})`;
+            }
+            return 'Search';
+        },
+        extractTip: () => randomTip(TIPS.search),
+    },
+    'grep': {
+        title: (opts: { metadata: Metadata | null, tool: ToolCall }) => {
+            if (typeof opts.tool.input.pattern === 'string') {
+                return `grep(pattern: ${opts.tool.input.pattern})`;
+            }
+            return 'Search Content';
+        },
+        icon: ICON_READ,
         input: z.object({
             pattern: z.string().describe('The regular expression pattern to search for'),
             path: z.string().optional().describe('File or directory to search in'),

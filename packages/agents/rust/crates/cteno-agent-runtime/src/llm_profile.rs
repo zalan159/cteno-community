@@ -164,6 +164,9 @@ impl ProfileStore {
                 "isProxy": is_proxy,
                 "supportsVision": p.supports_vision,
                 "supportsComputerUse": p.supports_computer_use,
+                "thinking": p.thinking,
+                "supportsFunctionCalling": p.supports_function_calling,
+                "supportsImageOutput": p.supports_image_output,
                 "apiFormat": match p.api_format {
                     ApiFormat::Anthropic => "anthropic",
                     ApiFormat::OpenAI => "openai",
@@ -654,7 +657,8 @@ pub async fn fetch_proxy_profiles_from_server(
         }
     };
 
-    // Find the compress model ID (isCompressModel=true), fallback to "deepseek-chat"
+    // Find the compress model ID (isCompressModel=true), fallback to the
+    // current DeepSeek proxy flash model.
     let compress_model_id = models
         .iter()
         .find(|m| {
@@ -663,7 +667,7 @@ pub async fn fetch_proxy_profiles_from_server(
                 .unwrap_or(false)
         })
         .and_then(|m| m.get("id").and_then(|v| v.as_str()))
-        .unwrap_or("deepseek-chat")
+        .unwrap_or("deepseek-v4-flash")
         .to_string();
 
     let profiles: Vec<LlmProfile> = models

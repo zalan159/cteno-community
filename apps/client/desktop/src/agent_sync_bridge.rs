@@ -3,129 +3,33 @@
 //!
 //! Before any vendor session is spawned we reconcile each vendor's native
 //! config layout so all four (Claude / Codex / Gemini / Cteno) agree on:
-//! - the built-in `cteno-memory` MCP server (same stdio bin, same project dir)
 //! - `AGENTS.md` as the single-source system prompt
+//! - Cteno memory CLI invocation instructions
 //! - the set of canonical skills (global + per-project)
 //!
 //! The reconcile is idempotent. Failures are logged but do NOT block spawn —
-//! memory-MCP being unavailable is a graceful degradation, not a hard error.
+//! vendor-native config drift is a graceful degradation, not a hard error.
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use cteno_host_agent_sync::{
-    ClaudeSyncer, CodexSyncer, CtenoSyncer, GeminiSyncer, McpSpec, PersonaSpec, SkillSpec,
-    VendorSyncer, memory_mcp_spec, reconcile_all,
+    reconcile_all, ClaudeSyncer, CodexSyncer, CtenoSyncer, GeminiSyncer, McpSpec,
+    McpTransport as SyncMcpTransport, PersonaSpec, SkillSpec, VendorSyncer,
 };
-use serde_yaml::Value as YamlValue;
 use tokio::sync::OnceCell;
 
-const MEMORY_MCP_BIN_NAME: &str = "cteno-memory-mcp";
 const SKILLS_ROOT_DIR: &str = "skills";
 const SKILL_MD_UPPER: &str = "SKILL.md";
 const SKILL_MD_LOWER: &str = "skill.md";
 const PROMPT_SYNC_MARKER: &str = "<!-- cteno:merged-project-agent-md -->";
-
-/// Locate the shipped `cteno-memory-mcp` binary.
-///
-/// Resolution order:
-/// 1. `$CTENO_MEMORY_MCP_BIN` env override (dev/test).
-/// 2. Sibling of the current executable (prod — bin ships next to daemon).
-/// 3. `$PATH` lookup (fallback for bundler/installer layouts).
-///
-/// Returns `None` when nothing on the machine can run the server. In that
-/// case the reconcile skips the memory MCP entry rather than writing a
-/// broken `command = "cteno-memory-mcp"` into each vendor config.
-pub(crate) fn locate_memory_mcp_bin() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("CTENO_MEMORY_MCP_BIN") {
-        let p = PathBuf::from(explicit);
-        if p.exists() {
-            return Some(p);
-        }
-        log::warn!("CTENO_MEMORY_MCP_BIN points at {p:?} which does not exist");
-    }
-
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            let candidate = dir.join(MEMORY_MCP_BIN_NAME);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            // Tauri `externalBin` bundles sidecars under `{name}-{target-triple}`
-            // inside the app `Contents/MacOS/`, so the daemon's sibling lookup
-            // must accept that layout too.
-            let triple_candidate = dir.join(format!(
-                "{MEMORY_MCP_BIN_NAME}-{}",
-                env!("TARGET_TRIPLE_FALLBACK")
-            ));
-            if triple_candidate.exists() {
-                return Some(triple_candidate);
-            }
-            #[cfg(windows)]
-            {
-                let win_candidate = dir.join(format!("{MEMORY_MCP_BIN_NAME}.exe"));
-                if win_candidate.exists() {
-                    return Some(win_candidate);
-                }
-                let win_triple = dir.join(format!(
-                    "{MEMORY_MCP_BIN_NAME}-{}.exe",
-                    env!("TARGET_TRIPLE_FALLBACK")
-                ));
-                if win_triple.exists() {
-                    return Some(win_triple);
-                }
-            }
-        }
-    }
-
-    for candidate in dev_memory_mcp_candidates() {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    which_on_path(MEMORY_MCP_BIN_NAME)
-}
-
-fn dev_memory_mcp_candidates() -> Vec<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = if cfg!(windows) {
-        format!("{MEMORY_MCP_BIN_NAME}.exe")
-    } else {
-        MEMORY_MCP_BIN_NAME.to_string()
-    };
-    vec![
-        manifest_dir
-            .join("../../../packages/host/rust/target/debug")
-            .join(&bin),
-        manifest_dir
-            .join("../../../packages/host/rust/target/release")
-            .join(&bin),
-    ]
-}
-
-fn which_on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(bin);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let win = dir.join(format!("{bin}.exe"));
-            if win.exists() {
-                return Some(win);
-            }
-        }
-    }
-    None
-}
+const MEMORY_CLI_PROMPT_START: &str = "<!-- cteno:memory-cli-bridge:start -->";
+const MEMORY_CLI_PROMPT_END: &str = "<!-- cteno:memory-cli-bridge:end -->";
 
 #[derive(Clone, Debug)]
 struct DiscoveredSkill {
@@ -345,9 +249,70 @@ fn normalize_prompt_content(content: &str) -> String {
     content.trim().replace("\r\n", "\n")
 }
 
+fn strip_cteno_memory_cli_block(content: &str) -> String {
+    let Some(start) = content.find(MEMORY_CLI_PROMPT_START) else {
+        return content.trim().to_string();
+    };
+    let Some(end_rel) = content[start..].find(MEMORY_CLI_PROMPT_END) else {
+        return content.trim().to_string();
+    };
+    let end = start + end_rel + MEMORY_CLI_PROMPT_END.len();
+    let mut out = String::new();
+    out.push_str(content[..start].trim_end());
+    out.push_str(content[end..].trim_start());
+    out.trim().to_string()
+}
+
+fn render_cteno_memory_cli_block() -> &'static str {
+    r#"<!-- cteno:memory-cli-bridge:start -->
+## Cteno Memory CLI
+
+Use `ctenoctl memory` for persistent Cteno memory.
+
+Default scope is project + global. Pass `--project-dir "$PWD"` from the current project root so project memory maps to `.cteno/memory/`. Pass `--scope global` when you only want global memory.
+
+Command schema:
+
+```json
+{
+  "list": {
+    "command": "ctenoctl memory list --project-dir <path> [--scope auto|private|global]",
+    "output": { "success": "boolean", "data": ["[private] file.md", "[global] file.md"] }
+  },
+  "recall": {
+    "command": "ctenoctl memory recall --query <string> --project-dir <path> [--limit 10] [--type <string>]",
+    "args": { "query": "required string", "project_dir": "optional path", "limit": "optional integer", "type": "optional frontmatter type" },
+    "output": { "success": "boolean", "data": [{ "file_path": "string", "content": "markdown chunk", "score": "number" }] }
+  },
+  "read": {
+    "command": "ctenoctl memory read <file_path> --project-dir <path> [--scope auto|private|global]",
+    "args": { "file_path": "required workspace-relative path" },
+    "output": { "success": "boolean", "data": "markdown or null" }
+  },
+  "save": {
+    "command": "ctenoctl memory save --file-path <file_path> --content <markdown> --project-dir <path> [--scope private|global]",
+    "args": { "file_path": "required workspace-relative path", "content": "required markdown" },
+    "output": { "success": "boolean" }
+  }
+}
+```
+
+Run `ctenoctl memory schema` for the machine-readable schema.
+<!-- cteno:memory-cli-bridge:end -->"#
+}
+
+fn ensure_cteno_memory_cli_block(content: &str) -> String {
+    let base = strip_cteno_memory_cli_block(&normalize_prompt_content(content));
+    if base.is_empty() {
+        format!("{}\n", render_cteno_memory_cli_block())
+    } else {
+        format!("{}\n\n{}\n", base, render_cteno_memory_cli_block())
+    }
+}
+
 fn read_project_prompt_candidate(path: PathBuf, label: &'static str) -> Option<(String, String)> {
     let content = fs::read_to_string(&path).ok()?;
-    let normalized = normalize_prompt_content(&content);
+    let normalized = strip_cteno_memory_cli_block(&normalize_prompt_content(&content));
     if normalized.is_empty() {
         return None;
     }
@@ -392,15 +357,14 @@ fn ensure_authoritative_prompt_seed(workdir: &Path) -> PathBuf {
         candidates.push((label, content));
     }
 
-    if candidates.is_empty() {
-        return agents;
-    }
-
-    let next_content = if candidates.len() == 1 {
+    let base_content = if candidates.is_empty() {
+        "# Project Agent Instructions\n\nCteno keeps this file as the shared per-project instruction source for Codex, Claude, Gemini, and Cteno.\n".to_string()
+    } else if candidates.len() == 1 {
         candidates[0].1.clone()
     } else {
         render_merged_project_prompt(&candidates)
     };
+    let next_content = ensure_cteno_memory_cli_block(&base_content);
 
     let current = fs::read_to_string(&agents)
         .ok()
@@ -447,116 +411,6 @@ async fn syncers() -> &'static Syncers {
             }
         })
         .await
-}
-
-/// Ensure the Cteno-native MCP config (`{data_dir}/mcp_servers.yaml`, read by
-/// `cteno_agent_runtime::mcp::MCPRegistry`) carries a single canonical
-/// `cteno-memory` entry pointing at the discovered binary. Called just before
-/// `MCPRegistry::load_from_config` so the Cteno agent and the MCP-modal UI see
-/// it as a first-class server alongside anything the user added manually.
-///
-/// Policy:
-/// - Other servers in the yaml are left untouched.
-/// - Entry id is the stable literal `"cteno-memory"` so the upsert never
-///   duplicates across boots.
-/// - If the memory bin can't be located, the function is a no-op (and we log
-///   a warning) — Cteno keeps running without the memory server.
-pub fn ensure_cteno_memory_in_mcp_yaml(yaml_path: &Path) {
-    let Some(bin) = locate_memory_mcp_bin() else {
-        log::warn!(
-            "agent_sync: skipping cteno-memory MCP registration in {yaml_path:?} — bin not found"
-        );
-        return;
-    };
-
-    let existing = std::fs::read_to_string(yaml_path).unwrap_or_default();
-    // Parse permissively: any malformed content is treated as "empty servers list"
-    // and we rebuild. Persisted config stays valid YAML after the write.
-    let mut doc: YamlValue = if existing.trim().is_empty() {
-        YamlValue::Mapping(serde_yaml::Mapping::new())
-    } else {
-        serde_yaml::from_str(&existing).unwrap_or(YamlValue::Mapping(serde_yaml::Mapping::new()))
-    };
-    if !doc.is_mapping() {
-        doc = YamlValue::Mapping(serde_yaml::Mapping::new());
-    }
-
-    let root = doc.as_mapping_mut().expect("ensured mapping");
-    let servers_key = YamlValue::String("servers".into());
-    let servers_entry = root
-        .entry(servers_key.clone())
-        .or_insert(YamlValue::Sequence(Vec::new()));
-    if !servers_entry.is_sequence() {
-        *servers_entry = YamlValue::Sequence(Vec::new());
-    }
-    let servers = servers_entry.as_sequence_mut().expect("ensured sequence");
-
-    // Build the canonical cteno-memory entry. Note: no `--project-dir` — the
-    // Cteno agent's MCPRegistry spawns exactly one subprocess at boot, so a
-    // fixed per-project scope would be wrong. Per-session project scope is
-    // the vendor-specific path (each Claude/Codex/Gemini session spawns its
-    // own subprocess with the right workdir via reconcile_at_boot).
-    let mut transport = serde_yaml::Mapping::new();
-    transport.insert(
-        YamlValue::String("type".into()),
-        YamlValue::String("stdio".into()),
-    );
-    transport.insert(
-        YamlValue::String("command".into()),
-        YamlValue::String(bin.display().to_string()),
-    );
-    transport.insert(
-        YamlValue::String("args".into()),
-        YamlValue::Sequence(Vec::new()),
-    );
-    transport.insert(
-        YamlValue::String("env".into()),
-        YamlValue::Mapping(serde_yaml::Mapping::new()),
-    );
-
-    let mut entry = serde_yaml::Mapping::new();
-    entry.insert(
-        YamlValue::String("id".into()),
-        YamlValue::String("cteno-memory".into()),
-    );
-    entry.insert(
-        YamlValue::String("name".into()),
-        YamlValue::String("cteno-memory".into()),
-    );
-    entry.insert(YamlValue::String("enabled".into()), YamlValue::Bool(true));
-    entry.insert(
-        YamlValue::String("transport".into()),
-        YamlValue::Mapping(transport),
-    );
-    let entry_val = YamlValue::Mapping(entry);
-
-    // Upsert by id.
-    let position = servers.iter().position(|item| {
-        item.get("id")
-            .and_then(YamlValue::as_str)
-            .map(|s| s == "cteno-memory")
-            .unwrap_or(false)
-    });
-    match position {
-        Some(idx) => servers[idx] = entry_val,
-        None => servers.push(entry_val),
-    }
-
-    if let Some(parent) = yaml_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let rendered = match serde_yaml::to_string(&doc) {
-        Ok(s) => s,
-        Err(err) => {
-            log::warn!("agent_sync: failed to serialise mcp_servers.yaml: {err}");
-            return;
-        }
-    };
-    if let Err(err) = std::fs::write(yaml_path, rendered) {
-        log::warn!("agent_sync: failed to write {yaml_path:?}: {err}");
-        return;
-    }
-    log::info!("agent_sync: ensured cteno-memory MCP entry in {yaml_path:?}");
 }
 
 /// Enumerate distinct workdirs from the `personas` + `persona_workspaces`
@@ -632,7 +486,12 @@ fn collect_workdirs_from_db(db_path: &Path) -> Result<Vec<PathBuf>, String> {
 /// ignore the workdir argument.
 pub async fn reconcile_at_boot(workdirs: &[PathBuf]) {
     reconcile_global_skills().await;
+    let mcp = current_mcp_specs_from_registry().await;
 
+    reconcile_workdirs(workdirs, &mcp).await;
+}
+
+async fn reconcile_workdirs(workdirs: &[PathBuf], mcp: &[McpSpec]) {
     let mut seen = std::collections::HashSet::new();
     let unique: Vec<&PathBuf> = workdirs
         .iter()
@@ -648,7 +507,7 @@ pub async fn reconcile_at_boot(workdirs: &[PathBuf]) {
         log::info!(
             "agent_sync: no project workdirs to reconcile at boot; writing user-scope configs only"
         );
-        reconcile_single(&std::env::temp_dir()).await;
+        reconcile_single(&std::env::temp_dir(), mcp).await;
         return;
     }
 
@@ -657,7 +516,7 @@ pub async fn reconcile_at_boot(workdirs: &[PathBuf]) {
         unique.len()
     );
     for wd in unique {
-        reconcile_single(wd).await;
+        reconcile_single(wd, mcp).await;
     }
 }
 
@@ -678,7 +537,68 @@ pub async fn reconcile_project_now(workdir: &Path) {
     if !workdir.is_absolute() || !workdir.exists() {
         return;
     }
-    reconcile_single(workdir).await;
+    let mcp = current_mcp_specs_from_registry().await;
+    reconcile_single(workdir, &mcp).await;
+}
+
+/// Reconcile MCP changes immediately after the user edits MCP servers in the
+/// management UI/CLI. This keeps Claude/Codex/Gemini/Cteno vendor config files
+/// in step without waiting for the next daemon restart.
+pub async fn reconcile_mcp_now_from_db(db_path: &Path) {
+    if let Some(home) = dirs::home_dir() {
+        cleanup_legacy_user_scope_memory_mcp(&home);
+    }
+
+    let mcp = current_mcp_specs_from_registry().await;
+    let workdirs = match collect_workdirs_from_db(db_path) {
+        Ok(list) => list,
+        Err(err) => {
+            log::warn!(
+                "agent_sync: failed to enumerate persona workdirs after MCP mutation from {db_path:?}: {err}; \
+                 falling back to user-scope-only reconcile"
+            );
+            Vec::new()
+        }
+    };
+
+    reconcile_workdirs(&workdirs, &mcp).await;
+}
+
+async fn current_mcp_specs_from_registry() -> Vec<McpSpec> {
+    let Ok(registry) = crate::local_services::mcp_registry() else {
+        log::debug!("agent_sync: MCP registry unavailable; projecting empty MCP spec list");
+        return Vec::new();
+    };
+    let reg = registry.read().await;
+    mcp_specs_from_configs(&reg.server_configs())
+}
+
+fn mcp_specs_from_configs(configs: &[crate::mcp::MCPServerConfig]) -> Vec<McpSpec> {
+    configs
+        .iter()
+        .filter(|config| config.enabled && config.id != "cteno-memory")
+        .map(|config| match &config.transport {
+            crate::mcp::MCPTransport::Stdio { command, args, env } => McpSpec {
+                name: config.id.clone(),
+                command: command.clone(),
+                args: args.clone(),
+                env: env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                transport: SyncMcpTransport::Stdio,
+                host_managed: true,
+            },
+            crate::mcp::MCPTransport::HttpSse { url, .. } => McpSpec {
+                name: config.id.clone(),
+                command: String::new(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                transport: SyncMcpTransport::StreamableHttp { url: url.clone() },
+                host_managed: true,
+            },
+        })
+        .collect()
 }
 
 async fn reconcile_global_skills() {
@@ -686,6 +606,7 @@ async fn reconcile_global_skills() {
         log::warn!("agent_sync: failed to resolve home directory; skip global skill reconcile");
         return;
     };
+    cleanup_legacy_user_scope_memory_mcp(&home);
     let skills = collect_global_skills(&home);
     let s = syncers().await;
     for v in [
@@ -703,20 +624,45 @@ async fn reconcile_global_skills() {
     }
 }
 
-async fn reconcile_single(workdir: &Path) {
+fn cleanup_legacy_user_scope_memory_mcp(home: &Path) {
+    let gemini_settings = home.join(".gemini").join("settings.json");
+    let Ok(raw) = fs::read_to_string(&gemini_settings) else {
+        return;
+    };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let removed = root
+        .get_mut("mcpServers")
+        .and_then(|servers| servers.as_object_mut())
+        .and_then(|servers| servers.remove("cteno-memory"))
+        .is_some();
+    if !removed {
+        return;
+    }
+    match serde_json::to_string_pretty(&root) {
+        Ok(rendered) => {
+            if let Err(err) = fs::write(&gemini_settings, rendered) {
+                log::warn!(
+                    "agent_sync: failed to remove legacy cteno-memory from {gemini_settings:?}: {err}"
+                );
+            } else {
+                log::info!("agent_sync: removed legacy cteno-memory MCP from {gemini_settings:?}");
+            }
+        }
+        Err(err) => {
+            log::warn!(
+                "agent_sync: failed to serialize cleaned Gemini settings {gemini_settings:?}: {err}"
+            );
+        }
+    }
+}
+
+async fn reconcile_single(workdir: &Path, mcp: &[McpSpec]) {
     let authoritative_prompt = ensure_authoritative_prompt_seed(workdir);
     // If AGENTS.md is missing but CLAUDE.md/GEMINI.md exists, we seed AGENTS.md
     // from that content first to avoid prompt content loss during symlink
     // convergence.
-
-    let mut mcp: Vec<McpSpec> = Vec::new();
-    match locate_memory_mcp_bin() {
-        Some(bin) => mcp.push(memory_mcp_spec(&bin, workdir, None)),
-        None => log::warn!(
-            "agent_sync: cteno-memory-mcp binary not found (set CTENO_MEMORY_MCP_BIN \
-             to override); memory MCP will be absent from vendor configs"
-        ),
-    }
 
     // Personas still reserved for a follow-up pass.
     let personas: Vec<PersonaSpec> = Vec::new();
@@ -734,7 +680,7 @@ async fn reconcile_single(workdir: &Path) {
     match reconcile_all(
         workdir,
         &authoritative_prompt,
-        &mcp,
+        mcp,
         &personas,
         &skills,
         vendors,
@@ -763,14 +709,14 @@ mod tests {
     use tempfile::TempDir;
 
     // Env vars are process-global; `tokio::test` can interleave cases in
-    // parallel. Both test flows below mutate `CTENO_MEMORY_MCP_BIN` / `HOME`
-    // / `PATH`, so we serialize them behind a single mutex.
+    // parallel. Test flows below mutate `HOME` / `PATH`, so we serialize them
+    // behind a single mutex.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Reconcile must work end-to-end against a synthetic workdir with a
-    /// stubbed memory-mcp binary: Claude / Gemini / Codex configs appear
-    /// with the `cteno-memory` entry, and `AGENTS.md` symlinks (CLAUDE.md /
-    /// GEMINI.md / .cteno/PROMPT.md) are created.
+    /// Reconcile must work end-to-end against a synthetic workdir: vendor MCP
+    /// config files are present without the old built-in `cteno-memory` entry,
+    /// and `AGENTS.md` symlinks (CLAUDE.md / GEMINI.md / .cteno/PROMPT.md) are
+    /// created with the Cteno memory CLI instructions.
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_at_boot_writes_every_vendor_layout() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -778,16 +724,6 @@ mod tests {
         let project = tmp.path();
         std::fs::write(project.join("AGENTS.md"), "system prompt body").unwrap();
 
-        // Stub a memory-mcp bin so reconcile emits the MCP entry.
-        let fake_bin = tmp.path().join("fake-cteno-memory-mcp");
-        std::fs::write(&fake_bin, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake_bin, perms).unwrap();
-        }
         // Isolate the Codex user-scoped config away from the real ~/.codex.
         let fake_codex_home = tmp.path().join("codex-home");
         std::fs::create_dir_all(&fake_codex_home).unwrap();
@@ -796,7 +732,6 @@ mod tests {
         // runs single-threaded and sets env before any reader observes it.
         // SAFETY: no other thread observes these env vars concurrently.
         unsafe {
-            std::env::set_var("CTENO_MEMORY_MCP_BIN", &fake_bin);
             std::env::set_var("HOME", &fake_codex_home);
         }
 
@@ -806,40 +741,36 @@ mod tests {
         let claude_mcp: Value =
             serde_json::from_str(&std::fs::read_to_string(project.join(".mcp.json")).unwrap())
                 .unwrap();
-        assert!(claude_mcp["mcpServers"]["cteno-memory"].is_object());
+        assert!(!claude_mcp["mcpServers"]["cteno-memory"].is_object());
 
         // Gemini settings.json
         let gemini: Value = serde_json::from_str(
             &std::fs::read_to_string(project.join(".gemini/settings.json")).unwrap(),
         )
         .unwrap();
-        assert!(gemini["mcpServers"]["cteno-memory"].is_object());
+        assert!(!gemini["mcpServers"]["cteno-memory"].is_object());
 
         // Symlinked prompt — follow the symlinks to verify they reach
         // the authoritative AGENTS.md content.
+        let agents = std::fs::read_to_string(project.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("system prompt body"), "{agents}");
+        assert!(agents.contains(MEMORY_CLI_PROMPT_START), "{agents}");
+        assert!(agents.contains("ctenoctl memory recall"), "{agents}");
         assert_eq!(
-            std::fs::read_to_string(project.join("CLAUDE.md"))
-                .unwrap()
-                .trim(),
-            "system prompt body"
+            std::fs::read_to_string(project.join("CLAUDE.md")).unwrap(),
+            agents
         );
         assert_eq!(
-            std::fs::read_to_string(project.join("GEMINI.md"))
-                .unwrap()
-                .trim(),
-            "system prompt body"
+            std::fs::read_to_string(project.join("GEMINI.md")).unwrap(),
+            agents
         );
         assert_eq!(
-            std::fs::read_to_string(project.join(".cteno/PROMPT.md"))
-                .unwrap()
-                .trim(),
-            "system prompt body"
+            std::fs::read_to_string(project.join(".cteno/PROMPT.md")).unwrap(),
+            agents
         );
     }
 
-    /// Absent memory bin must still produce vendor layouts — just without
-    /// the cteno-memory MCP entry. Reconcile should never crash on missing
-    /// bin.
+    /// Reconcile must not reintroduce the legacy cteno-memory MCP entry.
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_at_boot_tolerates_missing_memory_bin() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -847,10 +778,6 @@ mod tests {
         let project = tmp.path();
         std::fs::write(project.join("AGENTS.md"), "prompt").unwrap();
 
-        // SAFETY: see sibling test.
-        unsafe {
-            std::env::remove_var("CTENO_MEMORY_MCP_BIN");
-        }
         // Point HOME at a temp dir so the codex syncer writes there, not
         // against the real ~/.codex — otherwise this test would poison
         // user state. We can't easily stub `current_exe()`, so this also
@@ -879,8 +806,73 @@ mod tests {
             .expect("mcpServers object");
         assert!(
             !servers.contains_key("cteno-memory"),
-            "no bin → no cteno-memory entry, got {servers:?}"
+            "no built-in cteno-memory entry, got {servers:?}"
         );
+    }
+
+    #[test]
+    fn mcp_specs_from_configs_projects_enabled_non_legacy_servers() {
+        let specs = mcp_specs_from_configs(&[
+            crate::mcp::MCPServerConfig {
+                id: "filesystem".into(),
+                name: "Filesystem".into(),
+                enabled: true,
+                transport: crate::mcp::MCPTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec![
+                        "-y".into(),
+                        "@modelcontextprotocol/server-filesystem".into(),
+                    ],
+                    env: HashMap::from([("ROOT".into(), "/tmp".into())]),
+                },
+            },
+            crate::mcp::MCPServerConfig {
+                id: "disabled".into(),
+                name: "Disabled".into(),
+                enabled: false,
+                transport: crate::mcp::MCPTransport::Stdio {
+                    command: "disabled".into(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+            },
+            crate::mcp::MCPServerConfig {
+                id: "cteno-memory".into(),
+                name: "Cteno Memory".into(),
+                enabled: true,
+                transport: crate::mcp::MCPTransport::Stdio {
+                    command: "cteno-memory-mcp".into(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+            },
+            crate::mcp::MCPServerConfig {
+                id: "remote".into(),
+                name: "Remote".into(),
+                enabled: true,
+                transport: crate::mcp::MCPTransport::HttpSse {
+                    url: "https://example.com/mcp".into(),
+                    headers: HashMap::new(),
+                },
+            },
+        ]);
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "filesystem");
+        assert_eq!(specs[0].command, "npx");
+        assert_eq!(
+            specs[0].args,
+            vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string()
+            ]
+        );
+        assert_eq!(specs[0].env.get("ROOT").map(String::as_str), Some("/tmp"));
+        assert_eq!(specs[1].name, "remote");
+        assert!(matches!(
+            specs[1].transport,
+            SyncMcpTransport::StreamableHttp { ref url } if url == "https://example.com/mcp"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -921,7 +913,6 @@ mod tests {
         // SAFETY: serialized by ENV_LOCK.
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::remove_var("CTENO_MEMORY_MCP_BIN");
             std::env::set_var("PATH", "/usr/bin:/bin");
         }
 
@@ -961,23 +952,17 @@ mod tests {
         // SAFETY: serialized by ENV_LOCK.
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::remove_var("CTENO_MEMORY_MCP_BIN");
             std::env::set_var("PATH", "/usr/bin:/bin");
         }
 
         reconcile_at_boot(std::slice::from_ref(&project)).await;
 
+        let agents = std::fs::read_to_string(project.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("legacy prompt from claude"), "{agents}");
+        assert!(agents.contains(MEMORY_CLI_PROMPT_START), "{agents}");
         assert_eq!(
-            std::fs::read_to_string(project.join("AGENTS.md"))
-                .unwrap()
-                .trim(),
-            "legacy prompt from claude"
-        );
-        assert_eq!(
-            std::fs::read_to_string(project.join("GEMINI.md"))
-                .unwrap()
-                .trim(),
-            "legacy prompt from claude"
+            std::fs::read_to_string(project.join("GEMINI.md")).unwrap(),
+            agents
         );
     }
 
@@ -997,7 +982,6 @@ mod tests {
         // SAFETY: serialized by ENV_LOCK.
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::remove_var("CTENO_MEMORY_MCP_BIN");
             std::env::set_var("PATH", "/usr/bin:/bin");
         }
 
@@ -1011,6 +995,7 @@ mod tests {
         assert!(merged.contains("claude project rules"), "{merged}");
         assert!(merged.contains("## From GEMINI.md"), "{merged}");
         assert!(merged.contains("gemini project rules"), "{merged}");
+        assert!(merged.contains(MEMORY_CLI_PROMPT_START), "{merged}");
         assert_eq!(
             std::fs::read_to_string(project.join("CLAUDE.md")).unwrap(),
             merged

@@ -1,4 +1,5 @@
 import { backoff } from '@/utils/time';
+import { getOptionalCloudSyncEnabled } from '@/config/runtime';
 import { authedFetch, NotAuthenticatedError } from './authedFetch';
 import { getServerUrl, isServerAvailable } from './serverConfig';
 
@@ -60,6 +61,9 @@ export interface KvMutateErrorResponse {
 export type KvMutateResponse = KvMutateSuccessResponse | KvMutateErrorResponse;
 
 function canUseServer(): boolean {
+    if (getOptionalCloudSyncEnabled() === false) {
+        return false;
+    }
     return isServerAvailable();
 }
 
@@ -194,7 +198,13 @@ export async function kvMutate(mutations: KvMutation[]): Promise<KvMutateRespons
     }
 
     if (!canUseServer()) {
-        throw new Error('Server unavailable');
+        return {
+            success: true,
+            results: mutations.map((mutation) => ({
+                key: mutation.key,
+                version: Math.max(0, mutation.version + 1),
+            })),
+        };
     }
 
     if (mutations.length > 100) {

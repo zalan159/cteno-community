@@ -38,6 +38,7 @@ interface MultiTextInputProps {
     onKeyPress?: OnKeyPressCallback;
     onSelectionChange?: (selection: { start: number; end: number }) => void;
     onStateChange?: (state: TextInputState) => void;
+    editable?: boolean;
 }
 
 export const MultiTextInput = React.forwardRef<MultiTextInputHandle, MultiTextInputProps>((props, ref) => {
@@ -200,6 +201,7 @@ export const MultiTextInput = React.forwardRef<MultiTextInputHandle, MultiTextIn
                 onKeyPress={handleKeyPress}
                 onSelectionChange={handleSelectionChange}
                 multiline={true}
+                editable={props.editable ?? true}
                 autoCapitalize="sentences"
                 autoCorrect={true}
                 keyboardType="default"

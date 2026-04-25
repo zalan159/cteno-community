@@ -14,7 +14,7 @@
 
 pub use cteno_agent_runtime::tool_executors::{
     a2ui_render, browser_action, browser_adapter, browser_cdp, browser_manage, browser_navigate,
-    browser_network, computer_use, edit, fetch, file_tracker, get_session_output, glob, grep,
+    browser_network, computer_use, edit, fetch, file_tracker, glob, grep,
     image_generation, memory, oss_upload, path_resolver, query_subagent, read, run_manager,
     sandbox, screenshot, shell, skill, start_subagent, stop_subagent, tool_search, update_plan,
     upload_artifact, wait, websearch, write,
@@ -23,7 +23,7 @@ pub use cteno_agent_runtime::tool_executors::{
 pub use cteno_agent_runtime::tool_executors::{
     A2uiRenderExecutor, BrowserActionExecutor, BrowserAdapterExecutor, BrowserCdpExecutor,
     BrowserManageExecutor, BrowserNavigateExecutor, BrowserNetworkExecutor, ComputerUseExecutor,
-    CoordScale, EditExecutor, FetchExecutor, GetSessionOutputExecutor, GlobExecutor, GrepExecutor,
+    CoordScale, EditExecutor, FetchExecutor, GlobExecutor, GrepExecutor,
     ImageGenerationExecutor, MemoryExecutor, QuerySubAgentExecutor, ReadExecutor,
     RunManagerExecutor, SandboxCheckResult, SandboxContext, SandboxPolicy, ScreenshotExecutor,
     ShellExecutor, SkillExecutor, StartSubAgentExecutor, StopSubAgentExecutor, ToolSearchExecutor,

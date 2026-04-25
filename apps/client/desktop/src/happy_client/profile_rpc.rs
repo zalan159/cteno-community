@@ -112,6 +112,60 @@ pub(crate) fn build_profile_rpc_hooks(
                 }) as RuntimeFuture<Result<Value, String>>
             }
         }),
+        save_coding_plan_profiles: Arc::new({
+            let app_data_dir = app_data_dir.clone();
+            let profile_store = profile_store.clone();
+            move |payload: Value| {
+                let app_data_dir = app_data_dir.clone();
+                let profile_store = profile_store.clone();
+                Box::pin(async move {
+                    let profiles_val = payload
+                        .get("profiles")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new()));
+                    let profiles: Vec<LlmProfile> = match serde_json::from_value(profiles_val) {
+                        Ok(profiles) => profiles,
+                        Err(e) => {
+                            return Ok(json!({
+                                "success": false,
+                                "error": format!("Invalid Coding Plan profiles: {}", e),
+                            }));
+                        }
+                    };
+
+                    if profiles.is_empty() {
+                        return Ok(json!({
+                            "success": false,
+                            "error": "No Coding Plan profiles provided",
+                        }));
+                    }
+
+                    let default_profile_id = payload
+                        .get("defaultProfileId")
+                        .and_then(Value::as_str)
+                        .filter(|id| profiles.iter().any(|profile| profile.id == *id))
+                        .unwrap_or(&profiles[0].id)
+                        .to_string();
+                    let profile_count = profiles.len();
+
+                    let mut store = profile_store.write().await;
+                    for profile in profiles {
+                        store.save_profile(profile);
+                    }
+                    store.default_profile_id = default_profile_id.clone();
+                    if let Err(e) = llm_profile::save_profiles(&app_data_dir, &store) {
+                        log::error!("Failed to save Coding Plan profiles: {}", e);
+                        return Ok(json!({ "success": false, "error": e }));
+                    }
+
+                    Ok(json!({
+                        "success": true,
+                        "count": profile_count,
+                        "defaultProfileId": default_profile_id,
+                    }))
+                }) as RuntimeFuture<Result<Value, String>>
+            }
+        }),
         delete_profile: Arc::new({
             let app_data_dir = app_data_dir.clone();
             let profile_store = profile_store.clone();

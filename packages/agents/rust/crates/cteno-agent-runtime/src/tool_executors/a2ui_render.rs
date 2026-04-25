@@ -102,18 +102,13 @@ impl ToolExecutor for A2uiRenderExecutor {
             }
         }
 
-        // Push real-time event to frontend via machine socket.
-        // Routed through MachineSocketProvider hook (installed in commercial
-        // builds; community stub is a no-op).
-        if let Some(sock) = hooks::machine_socket() {
+        // Emit a transport-agnostic host event; the desktop shell fans it
+        // out to the Tauri `local-host-event` channel (always) and, in
+        // commercial builds, to the machine socket for cross-device relay.
+        if let Some(emitter) = hooks::host_event_emitter() {
             let aid = agent_id.clone();
             tokio::spawn(async move {
-                let payload = json!({
-                    "type": "hypothesis-push",
-                    "agentId": aid,
-                    "event": "a2ui_updated",
-                });
-                let _ = sock.push_to_frontend("hypothesis-push", payload).await;
+                emitter.emit_a2ui_updated(&aid).await;
             });
         }
 

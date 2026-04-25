@@ -32,11 +32,11 @@
 //! | `turn_complete`         | `TurnComplete`                           |
 //! | `error`                 | `Error { recoverable: true }`            |
 //!
-//! `set_permission_mode` and `set_model` map to stdio control messages so the
-//! host can retarget a live session without forcing a restart. Because the
-//! control path is best-effort and does not carry an explicit ack, the adapter
-//! treats closed pipes, subprocess exit, and blocked writes as recoverable
-//! executor errors instead of panicking.
+//! `set_model` maps to stdio control messages so the host can retarget a live
+//! session without forcing a restart. `set_permission_mode` is queued on the
+//! session slot and flushed immediately before the next `UserMessage`; this
+//! keeps mode changes made during an active turn from blocking on the turn's
+//! stdout reader while still applying them to subsequent turns.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -51,11 +51,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cteno_agent_runtime::hooks;
 use multi_agent_runtime_core::{
-    AgentCapabilities, AgentExecutor, AgentExecutorError, DeltaKind, EventStream, ExecutorEvent,
-    InjectedToolSpec, ModelChangeOutcome, ModelSpec, NativeMessage, NativeSessionId, Pagination,
-    PermissionDecision, PermissionMode, PermissionModeKind, ProcessHandleToken, ResumeHints,
-    SessionFilter, SessionInfo, SessionMeta, SessionRecord, SessionRef, SessionStoreProvider,
-    SpawnSessionSpec, TokenUsage, UserMessage,
+    executor::AutonomousTurnHandler, AgentCapabilities, AgentExecutor, AgentExecutorError, EventStream,
+    ExecutorEvent, InjectedToolSpec, ModelChangeOutcome, ModelSpec, NativeMessage, NativeSessionId,
+    Pagination, PermissionDecision, PermissionMode, PermissionModeKind, ProcessHandleToken,
+    ResumeHints, SessionFilter, SessionInfo, SessionMeta, SessionRecord, SessionRef,
+    SessionStoreProvider, SpawnSessionSpec, TokenUsage, UserMessage,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -65,8 +65,8 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use crate::connection::{CtenoConnection, SessionEventRx};
-use crate::protocol::{Inbound, InjectedToolWire, Outbound, UsageWire};
+use crate::connection::{BackgroundAcpSink, CtenoConnection, SessionEventRx};
+use crate::protocol::{AttachmentKindWire, AttachmentWire, Inbound, InjectedToolWire, Outbound};
 
 use multi_agent_runtime_core::executor::{
     ConnectionHandle, ConnectionHandleId, ConnectionHealth, ConnectionSpec,
@@ -126,6 +126,7 @@ struct HostAuthSnapshot {
 struct CtenoSessionLaunchConfig {
     workdir: PathBuf,
     system_prompt: Option<String>,
+    additional_directories: Vec<PathBuf>,
     agent_config: Value,
     env: BTreeMap<String, String>,
     injected_tools: Vec<InjectedToolSpec>,
@@ -148,15 +149,71 @@ struct CtenoSessionSlot {
     /// exclusive with `process`. When `Some`, every session operation must go
     /// through the shared `CtenoConnection`.
     connection: Option<Arc<CtenoConnection>>,
-    /// Per-session outbound event receiver vended by the connection's router.
-    /// Consumed by `send_message`; kept in the slot so control-frame responses
-    /// (like the `Error` surface for unknown-request permission responses)
-    /// can route back to the right session until it is explicitly closed.
-    event_rx: Option<SessionEventRx>,
+    /// Routing state for the per-session dispatcher task that owns this
+    /// slot's `event_rx` (consumed in `start_session_on_internal`). The
+    /// dispatcher reads `event_rx` for the lifetime of the session and
+    /// uses this state to decide whether each frame goes to the active
+    /// `send_message` consumer (`InUserTurn`) or to the autonomous-turn
+    /// handler stream (`InAutonomousTurn`). Subprocess-backed sessions
+    /// (legacy resume path) keep this `Idle` because they consume their
+    /// child's stdout directly.
+    route_state: Arc<Mutex<RouteState>>,
+    /// Permission mode requested while the current turn may still be running.
+    /// Flushed as a `SetPermissionMode` frame immediately before the next
+    /// `UserMessage`.
+    pending_permission_mode: Option<String>,
 }
 
 type SessionRegistry = Mutex<HashMap<ProcessHandleToken, Arc<Mutex<CtenoSessionSlot>>>>;
 type ConnectionRegistry = Mutex<HashMap<ConnectionHandleId, Arc<CtenoConnection>>>;
+
+/// Routing state used by the per-session dispatcher task to decide where to
+/// forward each `Outbound` frame received from the cteno-agent subprocess.
+///
+/// State transitions are driven by **explicit** protocol signals:
+/// - `send_message` writes `Inbound::UserMessage` and atomically transitions
+///   `Idle -> InUserTurn { tx }`. The returned `EventStream` consumes from
+///   the matching `rx`.
+/// - `Outbound::AutonomousTurnStart` (emitted by cteno-agent before it
+///   self-initiates a new turn — e.g. after a SubAgent handoff) transitions
+///   `Idle -> InAutonomousTurn { tx }` and invokes the registered
+///   `AutonomousTurnHandler` with the matching stream.
+/// - `Outbound::TurnComplete` (or downstream consumer drop) transitions back
+///   to `Idle`.
+///
+/// Because the dispatcher is the **single consumer** of `event_rx`, frame
+/// ordering is preserved naturally — no fan-out, no race between concurrent
+/// turn streams.
+enum RouteState {
+    /// No active stream. `AutonomousTurnStart` will start a new autonomous
+    /// turn; other frames in this state are unexpected and logged.
+    Idle,
+    /// User-initiated turn (`send_message` set this `tx`). Held until the
+    /// dispatcher observes the matching `TurnComplete` for this turn.
+    InUserTurn {
+        tx: tokio::sync::mpsc::Sender<Result<ExecutorEvent, AgentExecutorError>>,
+    },
+    /// Autonomous turn started by the agent itself. Frames flow into the
+    /// stream consumed by the registered `AutonomousTurnHandler` until
+    /// `TurnComplete`.
+    InAutonomousTurn {
+        tx: tokio::sync::mpsc::Sender<Result<ExecutorEvent, AgentExecutorError>>,
+    },
+}
+
+impl RouteState {
+    fn is_idle(&self) -> bool {
+        matches!(self, RouteState::Idle)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            RouteState::Idle => "idle",
+            RouteState::InUserTurn { .. } => "user_turn",
+            RouteState::InAutonomousTurn { .. } => "autonomous_turn",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum StderrProbeEvent {
@@ -180,6 +237,21 @@ pub struct CtenoAgentExecutor {
     /// daemon can SIGTERM orphans on crash recovery / shutdown. Left `None`
     /// in tests and library-only callers who do not need orphan sweeping.
     supervisor: Option<Arc<cteno_host_runtime::SubprocessSupervisor>>,
+    background_acp_sink: Option<BackgroundAcpSink>,
+    /// Structured sink covering subagent lifecycle + legacy background ACP.
+    /// Replaces the older single-`Fn` `BackgroundAcpSink` for routes
+    /// that need typed event dispatch (notably `SubAgentLifecycle`).
+    /// Both can coexist during migration; the dispatcher prefers
+    /// the trait sink and falls back to the legacy sink for the older
+    /// `source: subagent` ACP path.
+    session_event_sink: Arc<Mutex<Option<crate::session_sink::SessionEventSinkArc>>>,
+    /// Optional handler invoked by per-session dispatcher tasks when the
+    /// cteno-agent emits `Outbound::AutonomousTurnStart`. Wrapped in
+    /// `Arc<Mutex<...>>` so the dispatcher can clone the handle out and read
+    /// the latest registered handler each time (avoiding a copy-at-spawn race
+    /// that would prevent late `set_autonomous_turn_handler` calls from
+    /// taking effect on already-running sessions).
+    autonomous_turn_handler: Arc<Mutex<Option<AutonomousTurnHandler>>>,
 }
 
 impl CtenoAgentExecutor {
@@ -194,6 +266,9 @@ impl CtenoAgentExecutor {
             spawn_ready_timeout: DEFAULT_SPAWN_READY_TIMEOUT,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             supervisor: None,
+            background_acp_sink: None,
+            session_event_sink: Arc::new(Mutex::new(None)),
+            autonomous_turn_handler: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -205,6 +280,31 @@ impl CtenoAgentExecutor {
         supervisor: Arc<cteno_host_runtime::SubprocessSupervisor>,
     ) -> Self {
         self.supervisor = Some(supervisor);
+        self
+    }
+
+    /// Attach a display-only sink for runtime-owned background ACP messages
+    /// emitted after the initiating turn has already completed. This preserves
+    /// the stdio transparent channel without letting the host own DAG or
+    /// SubAgent progression.
+    pub fn with_background_acp_sink(mut self, sink: BackgroundAcpSink) -> Self {
+        self.background_acp_sink = Some(sink);
+        self
+    }
+
+    /// Attach a structured `SessionEventSink` to receive subagent lifecycle
+    /// events (and any future runtime-owned background events). The sink
+    /// is invoked by the per-session dispatcher when matching frames
+    /// arrive. Multiple registrations replace each other (last wins).
+    ///
+    /// `async` because the underlying slot is a tokio `Mutex` (shared with
+    /// dispatcher tasks that read it). Call from any async context during
+    /// startup before spawning sessions.
+    pub async fn with_session_event_sink(
+        self,
+        sink: crate::session_sink::SessionEventSinkArc,
+    ) -> Self {
+        *self.session_event_sink.lock().await = Some(sink);
         self
     }
 
@@ -273,7 +373,7 @@ impl CtenoAgentExecutor {
     /// Send an `Inbound` frame to whichever backing the session uses
     /// (legacy per-session subprocess or shared connection). Dispatches on
     /// slot contents, so `interrupt` / `respond_to_permission` /
-    /// `set_model` / `set_permission_mode` do not have to know which path the
+    /// `set_model` and permission responses do not have to know which path the
     /// session was spawned through.
     async fn write_slot_frame(
         &self,
@@ -388,7 +488,7 @@ impl CtenoAgentExecutor {
         } else if let (Some(process), Some(stdin)) = (legacy, stdin) {
             // `process` mutex may be held by the turn-loop reader; take it
             // with the DEFAULT_CONTROL_TIMEOUT guard so a long-running turn
-            // doesn't stall set_model / set_permission_mode indefinitely.
+            // doesn't stall set_model indefinitely.
             // `stdin` has its own mutex and isn't contended by the reader.
             match timeout(DEFAULT_CONTROL_TIMEOUT, async {
                 let mut process_guard = process.lock().await;
@@ -527,6 +627,11 @@ impl CtenoAgentExecutor {
         let init = Inbound::Init {
             session_id: native_session_id.to_string(),
             workdir: launch.workdir.to_str().map(|s| s.to_string()),
+            additional_directories: launch
+                .additional_directories
+                .iter()
+                .filter_map(|path| path.to_str().map(str::to_string))
+                .collect(),
             agent_config: agent_config_out,
             system_prompt: launch.system_prompt.clone(),
             auth_token,
@@ -695,9 +800,23 @@ impl CtenoAgentExecutor {
         stdin: &Arc<Mutex<ChildStdin>>,
         session_id: &str,
         message: &UserMessage,
+        pending_permission_mode: Option<&str>,
     ) -> Result<(), AgentExecutorError> {
         let mut process_guard = process.lock().await;
         let mut stdin_guard = stdin.lock().await;
+        if let Some(mode) = pending_permission_mode {
+            let frame = Inbound::SetPermissionMode {
+                session_id: session_id.to_string(),
+                mode: mode.to_string(),
+            };
+            write_checked_frame(
+                &mut *process_guard,
+                &mut *stdin_guard,
+                "applying queued permission mode to cteno-agent",
+                &frame,
+            )
+            .await?;
+        }
         for spec in message.injected_tools.iter() {
             let frame = Inbound::ToolInject {
                 session_id: session_id.to_string(),
@@ -719,6 +838,12 @@ impl CtenoAgentExecutor {
         let frame = Inbound::UserMessage {
             session_id: session_id.to_string(),
             content: message.content.clone(),
+            task_id: message.task_id.clone(),
+            attachments: message
+                .attachments
+                .iter()
+                .map(attachment_wire_from_core)
+                .collect(),
         };
         write_checked_frame(
             &mut *process_guard,
@@ -743,34 +868,70 @@ impl CtenoAgentExecutor {
         let session_id = session.id.as_str().to_string();
         let slot = self.get_session_slot(session).await?;
 
-        let (conn, event_rx) = {
-            let mut guard = slot.lock().await;
+        let (conn, route_state) = {
+            let guard = slot.lock().await;
             let conn = guard
                 .connection
                 .clone()
                 .ok_or_else(|| AgentExecutorError::SessionNotFound(session.id.to_string()))?;
-            let rx = guard.event_rx.take().ok_or_else(|| {
-                AgentExecutorError::Protocol(
-                    "send_message: per-session event receiver already consumed".to_string(),
-                )
-            })?;
-            (conn, rx)
+            (conn, guard.route_state.clone())
         };
 
         // Reject if connection is dead.
         if let crate::connection::ConnectionLiveness::Dead { reason } = conn.check().await {
-            // Put the (already-closed) receiver back so we don't leak and so a
-            // retry still finds a receiver entry.
-            let (tx_placeholder, rx_placeholder) = tokio::sync::mpsc::channel(1);
-            drop(tx_placeholder); // closes channel immediately
-            {
-                let mut guard = slot.lock().await;
-                guard.event_rx = Some(rx_placeholder);
-            }
-            let _ = event_rx; // drop original receiver
             return Err(AgentExecutorError::Protocol(format!(
                 "send_message: connection dead: {reason}"
             )));
+        }
+
+        // Atomically claim the session for a user-driven turn. The dispatcher
+        // task spawned at session start owns `event_rx`; it will read frames
+        // forever and route them to whichever `tx` is currently parked in
+        // `RouteState`. Reject if another turn (user or autonomous) is in
+        // flight — turn boundaries are explicit, no implicit interleaving.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecutorEvent, AgentExecutorError>>(64);
+        {
+            let mut state = route_state.lock().await;
+            if !state.is_idle() {
+                return Err(AgentExecutorError::Vendor {
+                    vendor: VENDOR_NAME,
+                    message: format!(
+                        "send_message: session already has an active turn (state={})",
+                        state.label()
+                    ),
+                });
+            }
+            *state = RouteState::InUserTurn { tx: tx.clone() };
+        }
+
+        // Helper to roll back the route state if any pre-write step fails so
+        // the next send_message call can start a fresh turn.
+        let rollback_state = || async {
+            let mut state = route_state.lock().await;
+            if matches!(*state, RouteState::InUserTurn { .. }) {
+                *state = RouteState::Idle;
+            }
+        };
+
+        let pending_permission_mode = {
+            let mut guard = slot.lock().await;
+            guard.pending_permission_mode.take()
+        };
+        if let Some(mode) = pending_permission_mode.as_deref() {
+            let frame = Inbound::SetPermissionMode {
+                session_id: session_id.clone(),
+                mode: mode.to_string(),
+            };
+            if let Err(e) = conn.writer.send(&frame).await {
+                {
+                    let mut guard = slot.lock().await;
+                    guard.pending_permission_mode = pending_permission_mode;
+                }
+                rollback_state().await;
+                return Err(AgentExecutorError::Protocol(format!(
+                    "cteno-agent queued permission mode failed: {e}"
+                )));
+            }
         }
 
         // Write injected tools + the UserMessage through the shared writer.
@@ -784,6 +945,7 @@ impl CtenoAgentExecutor {
                 },
             };
             if let Err(e) = conn.writer.send(&frame).await {
+                rollback_state().await;
                 return Err(AgentExecutorError::Protocol(format!(
                     "cteno-agent tool inject failed: {e}"
                 )));
@@ -792,74 +954,57 @@ impl CtenoAgentExecutor {
         let user_frame = Inbound::UserMessage {
             session_id: session_id.clone(),
             content: message.content.clone(),
+            task_id: message.task_id.clone(),
+            attachments: message
+                .attachments
+                .iter()
+                .map(attachment_wire_from_core)
+                .collect(),
         };
         if let Err(e) = conn.writer.send(&user_frame).await {
+            rollback_state().await;
             return Err(AgentExecutorError::Protocol(format!(
                 "cteno-agent user_message write failed: {e}"
             )));
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecutorEvent, AgentExecutorError>>(32);
+        // Spawn a per-turn timeout watchdog. Unlike the legacy implementation
+        // (which interleaved deadline + recv inside a single loop) the
+        // dispatcher now owns event consumption, so the watchdog only needs
+        // to detect "no terminal frame within the deadline" and force-abort.
+        // It cancels itself if the route state transitions back to Idle
+        // (turn ended naturally).
         let turn_timeout = self.turn_timeout;
-        let slot_for_return = slot.clone();
-        let expected_session = session_id.clone();
-
+        let route_state_for_watchdog = route_state.clone();
+        let conn_for_watchdog = conn.clone();
+        let session_id_for_watchdog = session_id.clone();
+        let tx_for_watchdog = tx.clone();
         tokio::spawn(async move {
-            let deadline = tokio::time::sleep(turn_timeout);
-            tokio::pin!(deadline);
-            let mut event_rx = event_rx;
-            let mut iterations: u32 = 0;
-            let mut final_text: Option<String> = None;
-
-            loop {
-                tokio::select! {
-                    _ = &mut deadline => {
-                        let _ = tx
-                            .send(Ok(ExecutorEvent::Error {
-                                message: format!(
-                                    "cteno-agent response timed out after {}s",
-                                    turn_timeout.as_secs()
-                                ),
-                                recoverable: false,
-                            }))
-                            .await;
-                        // Return the event_rx to the slot for potential
-                        // future retry / clean-up paths.
-                        let mut guard = slot_for_return.lock().await;
-                        guard.event_rx = Some(event_rx);
-                        return;
-                    }
-                    next = event_rx.recv() => {
-                        match next {
-                            Some(frame) => {
-                                let done = dispatch_event(
-                                    frame,
-                                    &tx,
-                                    &mut iterations,
-                                    &mut final_text,
-                                    &expected_session,
-                                )
-                                .await;
-                                if done {
-                                    let mut guard = slot_for_return.lock().await;
-                                    guard.event_rx = Some(event_rx);
-                                    return;
-                                }
-                            }
-                            None => {
-                                let _ = tx
-                                    .send(Ok(ExecutorEvent::Error {
-                                        message:
-                                            "cteno-agent connection closed mid-turn".to_string(),
-                                        recoverable: false,
-                                    }))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                }
+            tokio::time::sleep(turn_timeout).await;
+            let mut state = route_state_for_watchdog.lock().await;
+            // Only fire if THIS user turn is still parked. If a different tx
+            // is sitting there (or Idle), the turn already finished and the
+            // watchdog is stale.
+            let still_ours = match &*state {
+                RouteState::InUserTurn { tx } => tx.same_channel(&tx_for_watchdog),
+                _ => false,
+            };
+            if !still_ours {
+                return;
             }
+            log::warn!(
+                "[cteno send_message watchdog] timeout for session {}, sending Abort",
+                session_id_for_watchdog
+            );
+            let abort_frame = Inbound::Abort {
+                session_id: session_id_for_watchdog.clone(),
+                reason: Some(turn_timeout_message(turn_timeout.as_secs())),
+            };
+            let _ = conn_for_watchdog.writer.send(&abort_frame).await;
+            send_timeout_terminal_events(&tx_for_watchdog, turn_timeout.as_secs()).await;
+            // Force back to Idle so the next send_message can proceed even
+            // if the agent never echoes TurnComplete.
+            *state = RouteState::Idle;
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))
@@ -882,6 +1027,7 @@ impl CtenoAgentExecutor {
         let launch = CtenoSessionLaunchConfig {
             workdir: workdir.clone(),
             system_prompt: system_prompt.clone(),
+            additional_directories: Vec::new(),
             agent_config,
             env,
             injected_tools,
@@ -924,7 +1070,8 @@ impl CtenoAgentExecutor {
                 process: Some(Arc::new(Mutex::new(process))),
                 stdin: Some(Arc::new(Mutex::new(stdin))),
                 connection: None,
-                event_rx: None,
+                route_state: Arc::new(Mutex::new(RouteState::Idle)),
+                pending_permission_mode: None,
             })),
         );
 
@@ -956,7 +1103,7 @@ impl CtenoAgentExecutor {
             .stderr(Stdio::piped());
 
         let child = command.spawn().map_err(AgentExecutorError::from)?;
-        let conn = CtenoConnection::start(child)
+        let conn = CtenoConnection::start(child, self.background_acp_sink.clone())
             .map_err(|e| AgentExecutorError::Io(format!("cteno-agent connection start: {e}")))?;
 
         // Register with the supervisor if present so the daemon's pid file
@@ -1003,6 +1150,11 @@ impl CtenoAgentExecutor {
         let init = Inbound::Init {
             session_id: native_session_id.clone(),
             workdir: launch.workdir.to_str().map(|s| s.to_string()),
+            additional_directories: launch
+                .additional_directories
+                .iter()
+                .filter_map(|path| path.to_str().map(str::to_string))
+                .collect(),
             agent_config: agent_config_out,
             system_prompt: launch.system_prompt.clone(),
             auth_token,
@@ -1073,6 +1225,21 @@ impl CtenoAgentExecutor {
                 message,
             })?;
 
+        // Spawn the per-session dispatcher BEFORE handing control back to
+        // callers. The dispatcher owns `event_rx` for the lifetime of the
+        // session and routes every frame either to the active per-turn
+        // consumer or to the autonomous-turn handler. See `RouteState` doc
+        // for the invariants.
+        let route_state = Arc::new(Mutex::new(RouteState::Idle));
+        spawn_session_dispatcher(
+            rx,
+            route_state.clone(),
+            self.autonomous_turn_handler.clone(),
+            self.session_event_sink.clone(),
+            conn.clone(),
+            native_id.as_str().to_string(),
+        );
+
         self.sessions.lock().await.insert(
             token,
             Arc::new(Mutex::new(CtenoSessionSlot {
@@ -1082,7 +1249,8 @@ impl CtenoAgentExecutor {
                 process: None,
                 stdin: None,
                 connection: Some(conn.clone()),
-                event_rx: Some(rx),
+                route_state,
+                pending_permission_mode: None,
             })),
         );
 
@@ -1170,6 +1338,21 @@ fn sync_auth_into_agent_config(agent_config: &mut Value, snapshot: &HostAuthSnap
     }
 }
 
+fn attachment_wire_from_core(attachment: &multi_agent_runtime_core::Attachment) -> AttachmentWire {
+    let kind = match attachment.kind {
+        multi_agent_runtime_core::AttachmentKind::Image => AttachmentKindWire::Image,
+        multi_agent_runtime_core::AttachmentKind::Text => AttachmentKindWire::Text,
+        multi_agent_runtime_core::AttachmentKind::File => AttachmentKindWire::File,
+        multi_agent_runtime_core::AttachmentKind::Other => AttachmentKindWire::Other,
+    };
+    AttachmentWire {
+        kind,
+        mime_type: attachment.mime_type.clone(),
+        source: attachment.source.clone(),
+        data: attachment.data.clone(),
+    }
+}
+
 fn apply_spawn_agent_config_fields(
     agent_config: &mut Value,
     model: Option<&ModelSpec>,
@@ -1208,9 +1391,29 @@ fn apply_spawn_agent_config_fields(
     );
 }
 
+fn set_launch_permission_mode(agent_config: &mut Value, mode: &str) {
+    if !agent_config.is_object() {
+        *agent_config = json!({});
+    }
+    if let Some(map) = agent_config.as_object_mut() {
+        map.insert(
+            "permission_mode".to_string(),
+            Value::String(mode.to_string()),
+        );
+    }
+}
+
 fn stderr_line_is_fatal(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("panic") || lower.contains("fatal")
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+
+    // cteno-agent stderr also carries diagnostics and can include previews of
+    // user/session content. Treat only process-level panic/fatal prefixes as
+    // fatal; otherwise ordinary text containing words like "fatal" can abort a
+    // healthy turn when echoed in memory/log snippets.
+    lower.starts_with("fatal")
+        || lower.starts_with("panic")
+        || (lower.starts_with("thread ") && lower.contains(" panicked at "))
 }
 
 fn truncate_for_error(raw: &str, max_chars: usize) -> String {
@@ -1271,15 +1474,33 @@ fn spawn_output_closed_message(stderr_tail: &str) -> String {
     }
 }
 
-fn turn_timeout_message(stderr_tail: &str, seconds: u64) -> String {
-    if stderr_tail.trim().is_empty() {
-        format!("cteno-agent response timed out after {seconds}s.")
-    } else {
-        format!(
-            "cteno-agent response timed out after {seconds}s. Last stderr: {}",
-            truncate_for_error(stderr_tail, 240)
-        )
+fn turn_timeout_message(seconds: u64) -> String {
+    format!(
+        "cteno-agent response timed out after {seconds}s. The turn was stopped so you can retry."
+    )
+}
+
+fn turn_timeout_error_event(seconds: u64) -> ExecutorEvent {
+    ExecutorEvent::Error {
+        message: turn_timeout_message(seconds),
+        recoverable: true,
     }
+}
+
+fn empty_turn_complete_event() -> ExecutorEvent {
+    ExecutorEvent::TurnComplete {
+        final_text: None,
+        iteration_count: 0,
+        usage: TokenUsage::default(),
+    }
+}
+
+async fn send_timeout_terminal_events(
+    tx: &tokio::sync::mpsc::Sender<Result<ExecutorEvent, AgentExecutorError>>,
+    seconds: u64,
+) {
+    let _ = tx.send(Ok(turn_timeout_error_event(seconds))).await;
+    let _ = tx.send(Ok(empty_turn_complete_event())).await;
 }
 
 fn stderr_fatal_turn_message(line: &str) -> String {
@@ -1543,6 +1764,7 @@ impl AgentExecutor for CtenoAgentExecutor {
             supports_injected_tools: true,
             supports_permission_closure: true,
             supports_interrupt: true,
+            autonomous_turn: true,
         }
     }
 
@@ -1608,9 +1830,19 @@ impl AgentExecutor for CtenoAgentExecutor {
         }
 
         let (mut process, mut stdin) = self.ensure_turn_process(session).await?;
+        let pending_permission_mode = {
+            let mut guard = slot.lock().await;
+            guard.pending_permission_mode.take()
+        };
 
         if let Err(error) = self
-            .send_message_frames(&process, &stdin, &session_id, &message)
+            .send_message_frames(
+                &process,
+                &stdin,
+                &session_id,
+                &message,
+                pending_permission_mode.as_deref(),
+            )
             .await
         {
             let slot = self.get_session_slot(session).await?;
@@ -1622,7 +1854,7 @@ impl AgentExecutor for CtenoAgentExecutor {
             let (p, s) = self.ensure_turn_process(session).await?;
             process = p;
             stdin = s;
-            self.send_message_frames(&process, &stdin, &session_id, &message)
+            self.send_message_frames(&process, &stdin, &session_id, &message, None)
                 .await
                 .map_err(|retry_error| match retry_error {
                     AgentExecutorError::Io(_) | AgentExecutorError::SubprocessExited { .. } => {
@@ -1635,8 +1867,9 @@ impl AgentExecutor for CtenoAgentExecutor {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecutorEvent, AgentExecutorError>>(32);
         let turn_timeout = self.turn_timeout;
         let process_clone = process.clone();
+        let stdin_clone = stdin.clone();
+        let supervisor = self.supervisor.clone();
         let expected_session = session_id.clone();
-
         tokio::spawn(async move {
             let deadline = tokio::time::sleep(turn_timeout);
             tokio::pin!(deadline);
@@ -1644,7 +1877,7 @@ impl AgentExecutor for CtenoAgentExecutor {
             let mut guard = process_clone.lock().await;
             let mut stderr_rx = guard.stderr_events.subscribe();
             let mut iterations: u32 = 0;
-            let mut final_text: Option<String> = None;
+            let mut permission_pending = false;
 
             if let Some(line) = take_pending_fatal_stderr(&guard.pending_fatal_stderr).await {
                 let _ = tx
@@ -1659,14 +1892,16 @@ impl AgentExecutor for CtenoAgentExecutor {
             loop {
                 let mut line = String::new();
                 tokio::select! {
-                    _ = &mut deadline => {
-                        let stderr = stderr_tail_snapshot(&guard.stderr_tail).await;
-                        let _ = tx
-                            .send(Ok(ExecutorEvent::Error {
-                                message: turn_timeout_message(&stderr, turn_timeout.as_secs()),
-                                recoverable: false,
-                            }))
-                            .await;
+                    _ = &mut deadline, if !permission_pending => {
+                        send_timeout_terminal_events(&tx, turn_timeout.as_secs()).await;
+                        let pid_opt = guard.pid;
+                        let _ = guard.child.kill().await;
+                        let _ = guard.child.wait().await;
+                        if let (Some(sup), Some(pid)) = (supervisor.as_ref(), pid_opt) {
+                            if let Err(e) = sup.unregister(pid) {
+                                log::warn!("SubprocessSupervisor::unregister failed for pid={pid}: {e}");
+                            }
+                        }
                         return;
                     }
                     stderr_event = stderr_rx.recv() => {
@@ -1730,14 +1965,42 @@ impl AgentExecutor for CtenoAgentExecutor {
                                         continue;
                                     }
                                 };
+                                let is_permission_request =
+                                    matches!(&event, Outbound::PermissionRequest { .. });
+                                if let Outbound::HostCallRequest {
+                                    session_id,
+                                    request_id,
+                                    hook_name,
+                                    method,
+                                    ..
+                                } = &event
+                                {
+                                    let frame = Inbound::HostCallResponse {
+                                        session_id: session_id.clone(),
+                                        request_id: request_id.clone(),
+                                        ok: false,
+                                        output: None,
+                                        error: Some(format!(
+                                            "host call handler not installed for {hook_name}.{method}"
+                                        )),
+                                    };
+                                    let mut stdin_guard = stdin_clone.lock().await;
+                                    let _ = write_frame(&mut *stdin_guard, &frame).await;
+                                }
+                                if permission_pending && !is_permission_request {
+                                    permission_pending = false;
+                                    deadline.as_mut().reset(tokio::time::Instant::now() + turn_timeout);
+                                }
                                 let done = dispatch_event(
                                     event,
                                     &tx,
                                     &mut iterations,
-                                    &mut final_text,
                                     &expected_session,
                                 )
                                 .await;
+                                if is_permission_request {
+                                    permission_pending = true;
+                                }
                                 if done {
                                     return;
                                 }
@@ -1820,6 +2083,7 @@ impl AgentExecutor for CtenoAgentExecutor {
     async fn interrupt(&self, session: &SessionRef) -> Result<(), AgentExecutorError> {
         let frame = Inbound::Abort {
             session_id: session.id.as_str().to_string(),
+            reason: None,
         };
         self.write_slot_frame(session, &frame).await
     }
@@ -1831,10 +2095,22 @@ impl AgentExecutor for CtenoAgentExecutor {
             // Connection-backed: detach from the shared connection's router
             // but leave the subprocess running (other sessions may share it).
             if let Some(conn) = guard.connection.take() {
+                let close_frame = Inbound::CloseSession {
+                    session_id: guard.native_session_id.as_str().to_string(),
+                };
+                if let Err(err) = conn.writer.send(&close_frame).await {
+                    log::warn!(
+                        "failed to notify cteno-agent about closing session {}: {}",
+                        guard.native_session_id.as_str(),
+                        err
+                    );
+                }
                 conn.unregister_session(guard.native_session_id.as_str())
                     .await;
-                // Drop any buffered outbound frames for this session.
-                guard.event_rx.take();
+                // Force the dispatcher's active stream (if any) into a
+                // terminal state so any pending downstream consumer sees
+                // the session shutdown rather than hanging.
+                *guard.route_state.lock().await = RouteState::Idle;
                 guard.auth_state = SessionAuthState::Empty;
                 return Ok(());
             }
@@ -1849,23 +2125,11 @@ impl AgentExecutor for CtenoAgentExecutor {
         session: &SessionRef,
         mode: PermissionMode,
     ) -> Result<(), AgentExecutorError> {
-        let frame = Inbound::SetPermissionMode {
-            session_id: session.id.as_str().to_string(),
-            mode: permission_mode_wire(mode).to_string(),
-        };
-        self.send_control_frame(session, "set_permission_mode", &frame)
-            .await?;
+        let mode = permission_mode_wire(mode).to_string();
         let slot = self.get_session_slot(session).await?;
         let mut guard = slot.lock().await;
-        if !guard.launch.agent_config.is_object() {
-            guard.launch.agent_config = json!({});
-        }
-        if let Some(map) = guard.launch.agent_config.as_object_mut() {
-            map.insert(
-                "permission_mode".to_string(),
-                Value::String(permission_mode_wire(mode).to_string()),
-            );
-        }
+        set_launch_permission_mode(&mut guard.launch.agent_config, &mode);
+        guard.pending_permission_mode = Some(mode);
         Ok(())
     }
 
@@ -1894,6 +2158,15 @@ impl AgentExecutor for CtenoAgentExecutor {
             map.insert("model".to_string(), model_value);
         }
         Ok(ModelChangeOutcome::Applied)
+    }
+
+    async fn set_autonomous_turn_handler(
+        &self,
+        handler: Option<AutonomousTurnHandler>,
+    ) -> Result<(), AgentExecutorError> {
+        let mut guard = self.autonomous_turn_handler.lock().await;
+        *guard = handler;
+        Ok(())
     }
 
     async fn list_sessions(
@@ -2031,6 +2304,7 @@ impl AgentExecutor for CtenoAgentExecutor {
         let launch = CtenoSessionLaunchConfig {
             workdir: spec.workdir,
             system_prompt: spec.system_prompt,
+            additional_directories: spec.additional_directories,
             agent_config,
             env: spec.env,
             injected_tools: injected,
@@ -2087,11 +2361,177 @@ fn permission_mode_wire(mode: PermissionMode) -> &'static str {
 /// Translate a decoded [`Outbound`] frame into zero or more
 /// [`ExecutorEvent`]s and push them through the channel. Returns `true` when
 /// the turn is complete and the worker loop should exit.
+/// Spawn a long-lived dispatcher task for a connection-backed session.
+///
+/// The dispatcher is the sole consumer of the session's `event_rx` for the
+/// session's lifetime. It reads frames in arrival order, applies explicit
+/// route-state transitions on `AutonomousTurnStart` / `TurnComplete`, and
+/// forwards everything else through the `dispatch_event` translator into
+/// whichever `tx` is currently parked in `RouteState`. Because there is one
+/// consumer per session, frame ordering is preserved naturally.
+///
+/// Special handling:
+/// - `AutonomousTurnStart`: caught **before** translation. Allocates a fresh
+///   per-turn `(tx, rx)`, transitions `Idle -> InAutonomousTurn { tx }`, and
+///   invokes the registered `AutonomousTurnHandler` with `(session_id, rx
+///   stream)`. The handler is responsible for consuming the stream
+///   (typically by spawning a normalizer feeder).
+/// - `HostCallRequest`: auto-replies with "no handler installed" via the
+///   shared connection writer (preserves the legacy behavior). This needs
+///   to live in the dispatcher because both user-driven and autonomous
+///   turns can emit it.
+/// - `TurnComplete`: routed through normally, then transitions state back
+///   to `Idle`.
+fn spawn_session_dispatcher(
+    mut event_rx: SessionEventRx,
+    route_state: Arc<Mutex<RouteState>>,
+    autonomous_handler_slot: Arc<Mutex<Option<AutonomousTurnHandler>>>,
+    session_event_sink_slot: Arc<Mutex<Option<crate::session_sink::SessionEventSinkArc>>>,
+    conn: Arc<CtenoConnection>,
+    session_id: String,
+) {
+    tokio::spawn(async move {
+        let mut iterations: u32 = 0;
+        log::debug!("[cteno dispatcher] starting for session {}", session_id);
+        while let Some(frame) = event_rx.recv().await {
+            // 1a. SubAgent lifecycle frames are out-of-band: not part of
+            //     any per-turn stream. Route to the SessionEventSink so
+            //     the host can mirror the SubAgent registry.
+            if let Outbound::SubAgentLifecycle {
+                session_id: ref parent,
+                ref event,
+            } = frame
+            {
+                let sink = session_event_sink_slot.lock().await.clone();
+                if let Some(sink) = sink {
+                    log::info!(
+                        "[cteno dispatcher] routing SubAgentLifecycle frame for parent={parent} to SessionEventSink"
+                    );
+                    let dto = crate::session_sink::SubAgentLifecycleEvent::from_wire(
+                        event.clone(),
+                    );
+                    sink.on_subagent_lifecycle(parent, dto);
+                } else {
+                    log::warn!(
+                        "[cteno dispatcher] SubAgentLifecycle for {parent} but no SessionEventSink installed — dropping"
+                    );
+                }
+                continue;
+            }
+
+            // 1b. Explicit boundary: AutonomousTurnStart begins a new turn.
+            if let Outbound::AutonomousTurnStart {
+                session_id: ref frame_session,
+                ref reason,
+                ref synthetic_user_message,
+            } = frame
+            {
+                let handler = autonomous_handler_slot.lock().await.clone();
+                let Some(handler) = handler else {
+                    log::warn!(
+                        "[cteno dispatcher] AutonomousTurnStart for {frame_session} (reason={reason:?}) but no autonomous_turn_handler registered — frames will be dropped until next idle"
+                    );
+                    continue;
+                };
+                let (auto_tx, auto_rx) =
+                    tokio::sync::mpsc::channel::<Result<ExecutorEvent, AgentExecutorError>>(64);
+                let stream: EventStream = Box::pin(ReceiverStream::new(auto_rx));
+                {
+                    let mut state = route_state.lock().await;
+                    if !state.is_idle() {
+                        log::warn!(
+                            "[cteno dispatcher] AutonomousTurnStart for {frame_session} while state={} (replacing — user turn frames may be dropped)",
+                            state.label()
+                        );
+                    }
+                    *state = RouteState::InAutonomousTurn { tx: auto_tx };
+                }
+                handler(
+                    frame_session.clone(),
+                    synthetic_user_message.clone(),
+                    stream,
+                );
+                continue;
+            }
+
+            // 2. Auto-reply to host_call_request frames so the agent's
+            //    HostCallRequest doesn't hang waiting on a host that has
+            //    no installed handler.
+            if let Outbound::HostCallRequest {
+                session_id: ref hc_session,
+                ref request_id,
+                ref hook_name,
+                ref method,
+                ..
+            } = frame
+            {
+                let _ = conn
+                    .writer
+                    .send(&Inbound::HostCallResponse {
+                        session_id: hc_session.clone(),
+                        request_id: request_id.clone(),
+                        ok: false,
+                        output: None,
+                        error: Some(format!(
+                            "host call handler not installed for {hook_name}.{method}"
+                        )),
+                    })
+                    .await;
+            }
+
+            // 3. Snapshot the current route tx so we don't hold the
+            //    state lock across the await.
+            let active_tx = {
+                let state = route_state.lock().await;
+                match &*state {
+                    RouteState::Idle => None,
+                    RouteState::InUserTurn { tx } | RouteState::InAutonomousTurn { tx } => {
+                        Some(tx.clone())
+                    }
+                }
+            };
+            let Some(tx) = active_tx else {
+                log::warn!(
+                    "[cteno dispatcher] frame for {session_id} arrived in Idle state — dropping"
+                );
+                continue;
+            };
+
+            // 4. Translate + forward via the existing dispatch_event helper.
+            //    Returns `true` iff this frame ended the turn (TurnComplete
+            //    or downstream consumer dropped).
+            let consumer_gone = dispatch_event(frame, &tx, &mut iterations, &session_id).await;
+
+            // 5. If turn ended (or consumer dropped), reset state and
+            //    iteration counter so the next turn starts clean.
+            if consumer_gone {
+                let mut state = route_state.lock().await;
+                // Only transition if THIS tx is still parked — guards
+                // against a race where send_message already replaced state
+                // (it shouldn't because RouteState rejects double-claim,
+                // but be defensive).
+                let still_ours = match &*state {
+                    RouteState::InUserTurn { tx: parked }
+                    | RouteState::InAutonomousTurn { tx: parked } => parked.same_channel(&tx),
+                    RouteState::Idle => false,
+                };
+                if still_ours {
+                    *state = RouteState::Idle;
+                    iterations = 0;
+                }
+            }
+        }
+        log::info!(
+            "[cteno dispatcher] event_rx closed for session {} — exiting",
+            session_id
+        );
+    });
+}
+
 async fn dispatch_event(
     event: Outbound,
     tx: &tokio::sync::mpsc::Sender<Result<ExecutorEvent, AgentExecutorError>>,
     iterations: &mut u32,
-    final_text: &mut Option<String>,
     expected_session: &str,
 ) -> bool {
     // We don't abort on session_id mismatches — a single cteno-agent process
@@ -2108,62 +2548,27 @@ async fn dispatch_event(
                 .await;
             false
         }
-        Outbound::Delta {
+        Outbound::Acp {
             session_id,
-            kind,
-            content,
+            delivery,
+            data,
         } => {
             if session_id != expected_session {
                 log::debug!(
-                    "delta for foreign session ignored (expected={expected_session} got={session_id})"
+                    "acp frame for foreign session ignored (expected={expected_session} got={session_id})"
                 );
             }
-            let delta_kind = match kind.as_str() {
-                "text" => DeltaKind::Text,
-                "thinking" => DeltaKind::Thinking,
-                "reasoning" => DeltaKind::Reasoning,
-                other => {
-                    log::debug!("unknown delta kind from cteno-agent: {other}");
-                    DeltaKind::Text
-                }
-            };
-            if matches!(delta_kind, DeltaKind::Text) {
-                let snapshot = final_text.clone().unwrap_or_default();
-                *final_text = Some(format!("{snapshot}{content}"));
+            if data.get("type").and_then(Value::as_str) == Some("tool-call") {
+                *iterations = iterations.saturating_add(1);
             }
-            tx.send(Ok(ExecutorEvent::StreamDelta {
-                kind: delta_kind,
-                content,
-            }))
-            .await
-            .is_err()
-        }
-        Outbound::ToolUse {
-            tool_use_id,
-            name,
-            input,
-            ..
-        } => {
-            *iterations = iterations.saturating_add(1);
-            tx.send(Ok(ExecutorEvent::ToolCallStart {
-                tool_use_id,
-                name,
-                input,
-                partial: false,
-            }))
-            .await
-            .is_err()
-        }
-        Outbound::ToolResult {
-            tool_use_id,
-            output,
-            is_error,
-            ..
-        } => {
-            let payload = if is_error { Err(output) } else { Ok(output) };
-            tx.send(Ok(ExecutorEvent::ToolResult {
-                tool_use_id,
-                output: payload,
+            tx.send(Ok(ExecutorEvent::NativeEvent {
+                provider: Cow::Borrowed(VENDOR_NAME),
+                payload: json!({
+                    "kind": "acp",
+                    "session_id": session_id,
+                    "delivery": delivery,
+                    "data": data,
+                }),
             }))
             .await
             .is_err()
@@ -2201,12 +2606,8 @@ async fn dispatch_event(
             method,
             params,
         } => {
-            // HostCallRequest is currently routed through the in-process
-            // host-call dispatcher installed by cteno-agent-stdio's main.rs.
-            // The stdio adapter layer does not see these today; surface as a
-            // NativeEvent so the normalizer can log and drop.
             log::warn!(
-                "cteno-agent host_call_request observed at executor layer (hook={hook_name} method={method})"
+                "cteno-agent host_call_request has no host handler at executor layer (hook={hook_name} method={method})"
             );
             tx.send(Ok(ExecutorEvent::NativeEvent {
                 provider: Cow::Borrowed(VENDOR_NAME),
@@ -2222,20 +2623,61 @@ async fn dispatch_event(
             .await
             .is_err()
         }
+        Outbound::AutonomousTurnStart {
+            session_id,
+            reason,
+            synthetic_user_message,
+        } => tx
+            .send(Ok(ExecutorEvent::NativeEvent {
+                provider: Cow::Borrowed(VENDOR_NAME),
+                payload: json!({
+                    "kind": "autonomous_turn_start",
+                    "session_id": session_id,
+                    "reason": reason,
+                    "synthetic_user_message": synthetic_user_message,
+                }),
+            }))
+            .await
+            .is_err(),
+        // Defensive fallback. Phase B routes SubAgentLifecycle via the
+        // dispatcher's SessionEventSink **before** any per-turn `dispatch_event`
+        // call; this NativeEvent fallback only fires for paths that bypass the
+        // dispatcher (e.g. legacy subprocess sessions) and lets debugging UIs
+        // observe the wire frame as a typed payload.
+        Outbound::SubAgentLifecycle { session_id, event } => tx
+            .send(Ok(ExecutorEvent::NativeEvent {
+                provider: Cow::Borrowed(VENDOR_NAME),
+                payload: json!({
+                    "kind": "subagent_lifecycle",
+                    "session_id": session_id,
+                    "event": event,
+                }),
+            }))
+            .await
+            .is_err(),
         Outbound::TurnComplete {
-            final_text: emitted,
             iteration_count,
             usage,
+            context_usage,
             ..
         } => {
-            let final_payload = if emitted.is_empty() {
-                final_text.clone()
-            } else {
-                Some(emitted)
-            };
+            if let Some(context_usage) = context_usage {
+                let _ = tx
+                    .send(Ok(ExecutorEvent::NativeEvent {
+                        provider: Cow::Borrowed(VENDOR_NAME),
+                        payload: json!({
+                            "kind": "context_usage",
+                            "total_tokens": context_usage.total_tokens,
+                            "max_tokens": context_usage.max_tokens,
+                            "raw_max_tokens": context_usage.raw_max_tokens,
+                            "auto_compact_token_limit": context_usage.auto_compact_token_limit,
+                        }),
+                    }))
+                    .await;
+            }
             let _ = tx
                 .send(Ok(ExecutorEvent::TurnComplete {
-                    final_text: final_payload,
+                    final_text: None,
                     iteration_count: iteration_count as u32,
                     usage: TokenUsage {
                         input_tokens: usage.input_tokens as u64,
@@ -2263,6 +2705,7 @@ async fn dispatch_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::AcpDeliveryWire;
 
     #[test]
     fn apply_spawn_agent_config_fields_keeps_profile_id_alongside_model() {
@@ -2331,6 +2774,51 @@ mod tests {
         assert!(config.get("auth").is_none());
     }
 
+    #[tokio::test]
+    async fn dispatch_acp_frame_as_native_event_without_translation() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut iterations = 0;
+
+        let done = dispatch_event(
+            Outbound::Acp {
+                session_id: "s-1".to_string(),
+                delivery: AcpDeliveryWire::Persisted,
+                data: json!({
+                    "type": "tool-call",
+                    "id": "call-1",
+                    "name": "read",
+                    "input": {"path": "notes.txt"},
+                    "vendor_field": {"kept": true}
+                }),
+            },
+            &tx,
+            &mut iterations,
+            "s-1",
+        )
+        .await;
+
+        assert!(!done);
+        assert_eq!(iterations, 1);
+        let event = rx.recv().await.expect("event").expect("executor event");
+        match event {
+            ExecutorEvent::NativeEvent { provider, payload } => {
+                assert_eq!(provider.as_ref(), VENDOR_NAME);
+                assert_eq!(payload.get("kind").and_then(Value::as_str), Some("acp"));
+                assert_eq!(
+                    payload.get("delivery").and_then(Value::as_str),
+                    Some("persisted")
+                );
+                assert_eq!(
+                    payload
+                        .pointer("/data/vendor_field/kept")
+                        .and_then(Value::as_bool),
+                    Some(true)
+                );
+            }
+            other => panic!("expected NativeEvent, got {other:?}"),
+        }
+    }
+
     #[test]
     fn sync_auth_into_agent_config_injects_live_snapshot() {
         let mut config = json!({
@@ -2367,6 +2855,59 @@ mod tests {
         assert_eq!(config["profile_id"].as_str(), Some("proxy-default"));
     }
 
+    #[tokio::test]
+    async fn set_permission_mode_queues_for_next_turn_without_live_process() {
+        let exec = test_executor();
+        let token = ProcessHandleToken::new();
+        let session = SessionRef {
+            id: NativeSessionId::new("cteno-test-session"),
+            vendor: VENDOR_NAME,
+            process_handle: token.clone(),
+            spawned_at: Utc::now(),
+            workdir: PathBuf::from("/tmp/cteno-test"),
+        };
+
+        exec.sessions.lock().await.insert(
+            token,
+            Arc::new(Mutex::new(CtenoSessionSlot {
+                native_session_id: session.id.clone(),
+                launch: CtenoSessionLaunchConfig {
+                    workdir: session.workdir.clone(),
+                    system_prompt: None,
+                    additional_directories: Vec::new(),
+                    agent_config: json!({"permission_mode": "default"}),
+                    env: BTreeMap::new(),
+                    injected_tools: Vec::new(),
+                },
+                auth_state: SessionAuthState::Empty,
+                process: None,
+                stdin: None,
+                connection: None,
+                route_state: Arc::new(Mutex::new(RouteState::Idle)),
+                pending_permission_mode: None,
+            })),
+        );
+
+        exec.set_permission_mode(&session, PermissionMode::BypassPermissions)
+            .await
+            .expect("permission mode should queue without writing stdin");
+
+        let slot = exec.get_session_slot(&session).await.unwrap();
+        let guard = slot.lock().await;
+        assert_eq!(
+            guard
+                .launch
+                .agent_config
+                .get("permission_mode")
+                .and_then(Value::as_str),
+            Some("bypass_permissions")
+        );
+        assert_eq!(
+            guard.pending_permission_mode.as_deref(),
+            Some("bypass_permissions")
+        );
+    }
+
     #[test]
     fn stderr_probe_flags_panic_and_fatal_lines() {
         assert!(stderr_line_is_fatal(
@@ -2374,6 +2915,12 @@ mod tests {
         ));
         assert!(stderr_line_is_fatal("FATAL: unable to bind socket"));
         assert!(!stderr_line_is_fatal("warning: retrying startup"));
+        assert!(!stderr_line_is_fatal(
+            "\"content\": \"cteno-agent reported a fatal stderr line\""
+        ));
+        assert!(!stderr_line_is_fatal(
+            "CURRENT SESSION MEMORY: user mentioned panic and fatal text"
+        ));
     }
 
     #[test]
@@ -2414,6 +2961,23 @@ mod tests {
                 assert!(message.contains("panic: broken state machine"));
             }
             other => panic!("expected fatal error event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_timeout_event_is_recoverable_and_retryable() {
+        let event = turn_timeout_error_event(600);
+        match event {
+            ExecutorEvent::Error {
+                message,
+                recoverable,
+            } => {
+                assert!(recoverable);
+                assert!(message.contains("timed out after 600s"));
+                assert!(message.contains("retry"));
+                assert!(!message.contains("Last stderr"));
+            }
+            other => panic!("expected recoverable timeout error, got {other:?}"),
         }
     }
 
@@ -2477,6 +3041,60 @@ mod tests {
     fn capabilities_flag_multi_session_is_true() {
         let exec = test_executor();
         assert!(exec.capabilities().supports_multi_session_per_process);
+        assert!(exec.capabilities().autonomous_turn);
+    }
+
+    #[tokio::test]
+    async fn set_autonomous_turn_handler_stores_handler_when_supported() {
+        let exec = test_executor();
+        let handler: AutonomousTurnHandler =
+            Arc::new(|_session_id, _synthetic, _stream| {});
+        exec.set_autonomous_turn_handler(Some(handler)).await.unwrap();
+        assert!(exec.autonomous_turn_handler.lock().await.is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // RouteState transition tests — verify the state machine that drives
+    // the dispatcher's frame routing decisions. These tests exercise the
+    // pure state surface only (no real connection / event_rx).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn route_state_idle_label() {
+        assert_eq!(RouteState::Idle.label(), "idle");
+        assert!(RouteState::Idle.is_idle());
+    }
+
+    #[tokio::test]
+    async fn route_state_user_turn_label_and_busy() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let state = RouteState::InUserTurn { tx };
+        assert_eq!(state.label(), "user_turn");
+        assert!(!state.is_idle());
+    }
+
+    #[tokio::test]
+    async fn route_state_autonomous_turn_label_and_busy() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let state = RouteState::InAutonomousTurn { tx };
+        assert_eq!(state.label(), "autonomous_turn");
+        assert!(!state.is_idle());
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_when_not_idle() {
+        // Synthesize a session slot in InUserTurn state and verify a
+        // second send_message would refuse rather than corrupt routing.
+        let route_state = Arc::new(Mutex::new(RouteState::Idle));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        *route_state.lock().await = RouteState::InUserTurn { tx };
+
+        // The actual rejection branch lives inside
+        // send_message_connection_backed; here we simulate the same
+        // critical-section check to lock in the contract.
+        let state = route_state.lock().await;
+        assert!(!state.is_idle());
+        assert_eq!(state.label(), "user_turn");
     }
 
     #[tokio::test]

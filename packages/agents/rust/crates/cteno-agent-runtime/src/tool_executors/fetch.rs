@@ -133,6 +133,7 @@ impl FetchExecutor {
                 compress_cfg.max_tokens,
                 None,  // No streaming for fetch compression
                 false, // No thinking for fetch compression
+                None,
             )
             .await
             .map_err(|e| format!("Compression LLM call failed: {}", e))?;

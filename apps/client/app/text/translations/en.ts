@@ -238,6 +238,18 @@ export const en = {
         enhancedSessionWizard: 'Enhanced Session Wizard',
         enhancedSessionWizardEnabled: 'Profile-first session launcher active',
         enhancedSessionWizardDisabled: 'Using standard session launcher',
+        desktopTools: 'Desktop Tools',
+        desktopToolsDescription: 'Make local Cteno command-line tools available to other desktop agent apps on this computer.',
+        ctenoctlExternalTools: 'ctenoctl for External Apps',
+        ctenoctlExternalToolsSubtitle: 'Install ctenoctl into your user PATH so Codex, Claude, and Gemini outside Cteno can call memory tools.',
+        ctenoctlInstalled: ({ path }: { path: string }) => `Installed at ${path}. Restart external apps after installing.`,
+        ctenoctlInstalledNeedsRestart: ({ path }: { path: string }) => `Installed at ${path}. Restart external apps to pick up PATH changes.`,
+        ctenoctlNeedsPath: ({ hint }: { hint: string }) => `Installed, but PATH needs attention: ${hint}`,
+        ctenoctlStatusFailed: ({ error }: { error: string }) => `Could not read install status: ${error}`,
+        ctenoctlUnsupported: 'ctenoctl PATH install is not supported on this platform.',
+        ctenoctlInstall: 'Install',
+        ctenoctlUpdate: 'Update',
+        ctenoctlInstallSuccess: 'ctenoctl was installed to your user PATH. Restart external apps before using it there.',
     },
 
     errors: {

@@ -12,6 +12,14 @@ fn happy_server_url() -> String {
     crate::resolved_happy_server_url()
 }
 
+// Kept in the repo for historical compatibility, but no longer auto-installed
+// into the user-visible skill directory.
+const BUILTIN_SKILLS_DISABLED_BY_DEFAULT: &[&str] = &["a2ui", "ctenoctl"];
+
+fn should_auto_sync_builtin_skill(name: &str) -> bool {
+    !BUILTIN_SKILLS_DISABLED_BY_DEFAULT.contains(&name)
+}
+
 // ============================================================================
 // Public Skill Loading (accessible from other modules)
 // ============================================================================
@@ -30,7 +38,10 @@ pub fn sync_builtin_skills(builtin_dir: &std::path::Path, unified_dir: &std::pat
                     .flatten()
                     .filter(|e| {
                         let name = e.file_name().to_string_lossy().to_string();
-                        e.path().is_dir() && !name.starts_with('.') && name != "SKILL.md"
+                        e.path().is_dir()
+                            && !name.starts_with('.')
+                            && name != "SKILL.md"
+                            && should_auto_sync_builtin_skill(&name)
                     })
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .collect()
@@ -81,6 +92,10 @@ pub fn sync_builtin_skills(builtin_dir: &std::path::Path, unified_dir: &std::pat
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if !path.is_dir() || name.starts_with('.') || name == "SKILL.md" {
+            continue;
+        }
+        if !should_auto_sync_builtin_skill(&name) {
+            log::info!("Skipping disabled builtin skill '{}'", name);
             continue;
         }
         let dest = unified_dir.join(&name);
@@ -362,7 +377,10 @@ pub fn load_all_skills(
                     .flatten()
                     .filter(|e| {
                         let name = e.file_name().to_string_lossy().to_string();
-                        e.path().is_dir() && !name.starts_with('.') && name != "SKILL.md"
+                        e.path().is_dir()
+                            && !name.starts_with('.')
+                            && name != "SKILL.md"
+                            && should_auto_sync_builtin_skill(&name)
                     })
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .collect()
@@ -930,7 +948,9 @@ pub async fn initialize_services(
     match crate::executor_registry::ExecutorRegistry::build_with_supervisor(
         session_store,
         supervisor_arc.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(registry) => {
             let vendors = registry.available_vendors();
             log::info!(
@@ -1145,14 +1165,6 @@ pub async fn initialize_services(
             log::info!("Registered list_task_sessions executor");
         }
 
-        if let Some(config) = all_tools.iter().find(|t| t.id == "get_session_output") {
-            let executor = Arc::new(crate::tool_executors::GetSessionOutputExecutor::new(
-                db_path.clone(),
-            ));
-            tool_registry.register(config.clone(), executor);
-            log::info!("Registered get_session_output executor");
-        }
-
         if let Some(config) = all_tools.iter().find(|t| t.id == "send_to_session") {
             let executor = Arc::new(crate::tool_executors::SendToSessionExecutor::new());
             tool_registry.register(config.clone(), executor);
@@ -1299,11 +1311,6 @@ pub async fn initialize_services(
     let mcp_save_path = data_dir.join("mcp_servers.yaml");
     mcp_registry.set_config_path(mcp_save_path.clone());
 
-    // Ensure Cteno's built-in cross-vendor memory MCP is registered before
-    // `load_from_config` runs, so it shows up in the MCP modal and the agent's
-    // tool list the same way user-added servers do.
-    crate::agent_sync_bridge::ensure_cteno_memory_in_mcp_yaml(&mcp_save_path);
-
     if mcp_config_path.exists() {
         log::info!("Loading MCP servers from {:?}", mcp_config_path);
         match mcp_registry.load_from_config(&mcp_config_path).await {
@@ -1445,7 +1452,7 @@ pub async fn initialize_services(
         mcp_registry,
     );
 
-    // Cross-vendor config reconcile (memory-mcp entry, AGENTS.md symlink fan-out,
+    // Cross-vendor config reconcile (AGENTS.md symlink fan-out,
     // etc.) — runs once at boot so vendor CLI subprocesses see the updated
     // configs the first time they're spawned. See
     // `packages/host/rust/crates/cteno-host-agent-sync` and the accompanying
@@ -1568,5 +1575,60 @@ nested body
         let agents = load_agents_from_dir(tmp.path());
         assert_eq!(agents.len(), 1, "got: {agents:?}");
         assert_eq!(agents[0].id, "reviewer");
+    }
+
+    fn write_minimal_skill(root: &std::path::Path, id: &str) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                r#"---
+id: {id}
+name: "{id}"
+description: "{id} skill"
+version: "1.0.0"
+---
+
+{id} instructions.
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sync_builtin_skills_skips_deprecated_defaults_and_removes_old_managed_copies() {
+        let tmp = TempDir::new().unwrap();
+        let builtin = tmp.path().join("builtin");
+        let unified = tmp.path().join("unified");
+
+        for id in ["a2ui", "ctenoctl", "mcp"] {
+            write_minimal_skill(&builtin, id);
+        }
+
+        let old_a2ui = unified.join("a2ui");
+        std::fs::create_dir_all(&old_a2ui).unwrap();
+        std::fs::write(old_a2ui.join("SKILL.md"), "old builtin copy").unwrap();
+        std::fs::write(
+            old_a2ui.join(SOURCE_META_FILE),
+            r#"{"sourceType":"builtin","sourceKey":"a2ui","sourceDigest":"old"}"#,
+        )
+        .unwrap();
+
+        sync_builtin_skills(&builtin, &unified);
+
+        assert!(
+            !unified.join("a2ui").exists(),
+            "deprecated builtin a2ui should not remain auto-installed"
+        );
+        assert!(
+            !unified.join("ctenoctl").exists(),
+            "deprecated builtin ctenoctl should not be auto-installed"
+        );
+        assert!(
+            unified.join("mcp").join("SKILL.md").exists(),
+            "active builtin skills should still sync"
+        );
     }
 }

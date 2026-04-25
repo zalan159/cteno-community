@@ -1189,7 +1189,7 @@ describe('Zod Transform - WOLOG Content Normalization', () => {
                 expect(normalized.content).toHaveLength(1);
                 expect(normalized.content[0].type).toBe('text');
                 if (normalized.content[0].type === 'text') {
-                    expect(normalized.content[0].text).toBe('Executor error: Sandbox denied the command\nRecoverable: Yes');
+                    expect(normalized.content[0].text).toBe('Sandbox denied the command\n\n可以修复后重试。');
                 }
             }
         });

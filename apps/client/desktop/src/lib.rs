@@ -31,15 +31,16 @@ mod session_store_impl;
 // mod native_host; // Removed — Extension replaced by CDP
 mod orchestration;
 mod persona;
+mod quota_monitor;
 mod scheduler;
 mod session_message_codec;
 mod session_relay;
 mod session_sync_impl;
 mod skill_store;
+mod subagent_mirror;
 mod task_graph;
 mod tool_executors;
 mod tray;
-mod usage_monitor;
 mod webview_bridge;
 
 // Re-export migrated agent-runtime modules under the previous crate:: paths so

@@ -4,6 +4,7 @@ import type { Persona, PersonaTaskSummary } from '../sync/storageTypes';
 import type { VendorName } from '../sync/ops';
 import { loadCachedVendorDefaultModelId } from '../sync/modelCatalogCache';
 import { storage, useCachedPersonas } from '../sync/storage';
+import { sync } from '../sync/sync';
 import { frontendLog } from '@/utils/tauri';
 
 interface UsePersonasOptions {
@@ -105,6 +106,13 @@ export function usePersonas(options: UsePersonasOptions): UsePersonasReturn {
             });
             if (!result.success) {
                 throw new Error(result.error || 'Failed to create persona');
+            }
+            if (result.persona?.chatSessionId?.startsWith('pending-')) {
+                sync.registerPendingPersonaSession(result.persona, machineId, {
+                    pendingSessionId: result.pendingSessionId,
+                    attemptId: result.attemptId,
+                    vendor: result.persona.agent ?? params.agent,
+                });
             }
             await fetchPersonas();
             return result.persona || null;

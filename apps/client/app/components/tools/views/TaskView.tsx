@@ -1,12 +1,13 @@
 import * as React from 'react';
 import { ToolViewProps } from './_all';
-import { View, ActivityIndicator, StyleSheet, Platform } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 import { knownTools } from '../../tools/knownTools';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolCall } from '@/sync/typesMessage';
 import { useUnistyles } from 'react-native-unistyles';
 import { t } from '@/text';
 import { Text } from '@/components/StyledText';
+import { Message } from '@/sync/typesMessage';
 
 interface FilteredTool {
     tool: ToolCall;
@@ -16,36 +17,86 @@ interface FilteredTool {
 
 export const TaskView = React.memo<ToolViewProps>(({ tool, metadata, messages }) => {
     const { theme } = useUnistyles();
-    const filtered: FilteredTool[] = [];
+    const timeline: Array<
+        | { kind: 'text'; id: string; text: string; isThinking: boolean }
+        | { kind: 'tool'; id: string; item: FilteredTool }
+    > = [];
 
-    for (let m of messages) {
-        if (m.kind === 'tool-call') {
-            const tName = m.tool.name || 'unknown';
-            const knownTool = knownTools[tName as keyof typeof knownTools] as any;
+    function toolTitle(messageTool: ToolCall): string {
+        const tName = messageTool.name || 'unknown';
+        const knownTool = knownTools[tName as keyof typeof knownTools] as any;
 
-            // Extract title using extractDescription if available, otherwise use title
-            let title = tName;
-            if (knownTool) {
-                if ('extractDescription' in knownTool && typeof knownTool.extractDescription === 'function') {
-                    title = knownTool.extractDescription({ tool: m.tool, metadata });
-                } else if (knownTool.title) {
-                    // Handle optional title and function type
-                    if (typeof knownTool.title === 'function') {
-                        title = knownTool.title({ tool: m.tool, metadata });
-                    } else {
-                        title = knownTool.title;
-                    }
-                }
+        if (knownTool) {
+            if ('extractDescription' in knownTool && typeof knownTool.extractDescription === 'function') {
+                return knownTool.extractDescription({ tool: messageTool, metadata });
             }
-
-            if (m.tool.state === 'running' || m.tool.state === 'completed' || m.tool.state === 'error') {
-                filtered.push({
-                    tool: m.tool,
-                    title,
-                    state: m.tool.state
-                });
+            if (knownTool.title) {
+                if (typeof knownTool.title === 'function') {
+                    return knownTool.title({ tool: messageTool, metadata });
+                }
+                return knownTool.title;
             }
         }
+
+        return tName;
+    }
+
+    function appendMessage(message: Message) {
+        if (message.kind === 'agent-text') {
+            const text = message.text.trim();
+            if (text.length > 0) {
+                timeline.push({
+                    kind: 'text',
+                    id: message.id,
+                    text,
+                    isThinking: !!message.isThinking,
+                });
+            }
+            return;
+        }
+
+        if (message.kind === 'user-text') {
+            const text = message.text.trim();
+            if (text.length > 0) {
+                timeline.push({
+                    kind: 'text',
+                    id: message.id,
+                    text,
+                    isThinking: false,
+                });
+            }
+            return;
+        }
+
+        if (message.kind === 'tool-call') {
+            if (message.tool.state === 'running' || message.tool.state === 'completed' || message.tool.state === 'error') {
+                timeline.push({
+                    kind: 'tool',
+                    id: message.id,
+                    item: {
+                        tool: message.tool,
+                        title: toolTitle(message.tool),
+                        state: message.tool.state,
+                    },
+                });
+            }
+            for (const child of message.children) {
+                appendMessage(child);
+            }
+        }
+    }
+
+    for (let m of messages) {
+        appendMessage(m);
+    }
+
+    if (typeof tool.input?.summary === 'string' && tool.input.summary.trim().length > 0) {
+        timeline.push({
+            kind: 'text',
+            id: 'task-summary',
+            text: tool.input.summary.trim(),
+            isThinking: false,
+        });
     }
 
     const styles = StyleSheet.create({
@@ -92,32 +143,53 @@ export const TaskView = React.memo<ToolViewProps>(({ tool, metadata, messages })
             fontStyle: 'italic',
             opacity: 0.7,
         },
+        textItem: {
+            paddingVertical: 6,
+            paddingHorizontal: 4,
+        },
+        textBody: {
+            fontSize: 14,
+            lineHeight: 20,
+            color: theme.colors.text,
+        },
+        thinkingText: {
+            color: theme.colors.textSecondary,
+            fontStyle: 'italic',
+        },
     });
 
-    if (filtered.length === 0) {
+    if (timeline.length === 0) {
         return null;
     }
 
-    const visibleTools = filtered.slice(filtered.length - 3);
-    const remainingCount = filtered.length - 3;
+    const visibleItems = timeline.slice(Math.max(0, timeline.length - 8));
+    const remainingCount = timeline.length - visibleItems.length;
 
     return (
         <View style={styles.container}>
-            {visibleTools.map((item, index) => (
-                <View key={`${item.tool.name}-${index}`} style={styles.toolItem}>
-                    <Text style={styles.toolTitle}>{item.title}</Text>
-                    <View style={styles.statusContainer}>
-                        {item.state === 'running' && (
-                            <ActivityIndicator size={Platform.OS === 'ios' ? "small" : 14 as any} color={theme.colors.warning} />
-                        )}
-                        {item.state === 'completed' && (
-                            <Ionicons name="checkmark-circle" size={16} color={theme.colors.success} />
-                        )}
-                        {item.state === 'error' && (
-                            <Ionicons name="close-circle" size={16} color={theme.colors.textDestructive} />
-                        )}
+            {visibleItems.map((entry, index) => (
+                entry.kind === 'text' ? (
+                    <View key={`${entry.id}-${index}`} style={styles.textItem}>
+                        <Text
+                            style={[styles.textBody, entry.isThinking && styles.thinkingText]}
+                            numberOfLines={entry.isThinking ? 3 : 6}
+                        >
+                            {entry.text}
+                        </Text>
                     </View>
-                </View>
+                ) : (
+                    <View key={`${entry.id}-${index}`} style={styles.toolItem}>
+                        <Text style={styles.toolTitle}>{entry.item.title}</Text>
+                        <View style={styles.statusContainer}>
+                            {entry.item.state === 'completed' && (
+                                <Ionicons name="checkmark-circle" size={16} color={theme.colors.success} />
+                            )}
+                            {entry.item.state === 'error' && (
+                                <Ionicons name="close-circle" size={16} color={theme.colors.textDestructive} />
+                            )}
+                        </View>
+                    </View>
+                )
             ))}
             {remainingCount > 0 && (
                 <View style={styles.moreToolsItem}>

@@ -41,5 +41,4 @@ pub(crate) fn log_bootstrap_paths(host_paths: &crate::host::core::HostPaths) {
         agents_dir,
         agents_dir.exists()
     );
-
 }

@@ -33,9 +33,8 @@ pub struct McpSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub transport: McpTransport,
-    /// True when this entry is managed by the host (Cteno-provisioned MCP like
-    /// the built-in `cteno-memory` server). Reconcile overwrites host-managed
-    /// entries in-place; user-authored entries are left untouched.
+    /// True when this entry is managed by the host. Reconcile overwrites
+    /// host-managed entries in-place; user-authored entries are left untouched.
     #[serde(default = "default_true")]
     pub host_managed: bool,
 }

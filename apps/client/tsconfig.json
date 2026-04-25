@@ -7,6 +7,14 @@
       "@/*": [
         "./app/*"
       ],
+      "@cteno/client-ui": ["../../packages/client-ui/src/index.ts"],
+      "@cteno/client-ui/*": ["../../packages/client-ui/src/*"],
+      "@cteno/client-sync": ["../../packages/client-sync/src/index.ts"],
+      "@cteno/client-sync/*": ["../../packages/client-sync/src/*"],
+      "@cteno/client-agent-ui": ["../../packages/client-agent-ui/src/index.ts"],
+      "@cteno/client-agent-ui/*": ["../../packages/client-agent-ui/src/*"],
+      "@cteno/client-a2ui": ["../../packages/client-a2ui/src/index.ts"],
+      "@cteno/client-a2ui/*": ["../../packages/client-a2ui/src/*"],
       "hello-world": [ "../../hello-world" ]
     },
     "jsx": "react-jsx",

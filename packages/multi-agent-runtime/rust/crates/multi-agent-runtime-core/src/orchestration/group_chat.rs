@@ -365,6 +365,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Coordinates work".to_string(),
                         prompt: "Coordinate".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,
@@ -383,6 +384,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Writes code".to_string(),
                         prompt: "Implement".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,

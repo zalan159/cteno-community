@@ -17,6 +17,16 @@ use std::sync::Arc;
 /// Depth 0 = parent agent, depth 1 = sub-agent. Sub-agents cannot spawn further sub-agents.
 const MAX_DEPTH: u32 = 1;
 
+/// Builds a session-tagged `AcpMessageSender` for a subagent. The runtime calls
+/// this with the **subagent's own** session id (the one the SubAgentManager
+/// generated and that `agent_sessions.id` will match) so the subagent's ACP
+/// frames are routed under its own id — not the parent's. This is what lets
+/// the desktop project subagent transcripts into a separate `agent_sessions`
+/// row keyed by `subagent.id` (so `BaseSessionPage` via
+/// `useSession(subagent.id)` finds them) without bleeding subagent thinking /
+/// tool-call frames into the parent persona's transcript.
+pub type AcpSenderFactory = Arc<dyn Fn(String) -> AcpMessageSender + Send + Sync>;
+
 /// Context needed to execute a sub-agent, passed from the parent agent's handler.
 #[derive(Clone)]
 pub struct SubAgentContext {
@@ -31,8 +41,14 @@ pub struct SubAgentContext {
     pub use_proxy: bool,
     /// Parent session model from resolved profile (overrides agent default when present)
     pub profile_model: Option<String>,
-    /// ACP sender from parent agent — sub-agent's intermediate messages flow to the same user
-    pub acp_sender: Option<AcpMessageSender>,
+    /// Factory for building an AcpMessageSender bound to the subagent's own
+    /// session id. The runtime calls `(factory)(subagent_session_id)` and
+    /// passes the result down to `execute_autonomous_agent_with_session`. See
+    /// [`AcpSenderFactory`] for why this is a factory and not a pre-built
+    /// sender (which would be tagged with the parent's id and bleed the
+    /// subagent's stream into the persona transcript). `None` = silent
+    /// execution (no ACP routing).
+    pub acp_sender_factory: Option<AcpSenderFactory>,
     /// Permission checker from parent agent — sub-agent asks the same user for permission
     pub permission_checker: Option<PermissionChecker>,
     /// Parent's abort flag — aborting the parent also aborts sub-agents
@@ -40,6 +56,8 @@ pub struct SubAgentContext {
     pub thinking_flag: Option<Arc<AtomicU8>>,
     /// API format inherited from parent profile
     pub api_format: crate::llm_profile::ApiFormat,
+    /// Sandbox policy inherited from the parent session.
+    pub sandbox_policy: Option<crate::tool_executors::SandboxPolicy>,
 }
 
 /// Execute a sub-agent synchronously.
@@ -49,18 +67,27 @@ pub struct SubAgentContext {
 /// and returns the sub-agent's final response text.
 ///
 /// Uses `Box::pin` internally to handle async recursion (execute_sub_agent → ReAct loop → execute_tool → execute_sub_agent).
+///
+/// `session_id_override`: if provided, the subagent's transcript persists
+/// under this session id in `agent_sessions`. Used by `SubAgentManager` so
+/// the SubAgent record id and the agent_sessions row id match — clicking a
+/// SubAgent in the UI then navigates to `/session/{subagent.id}` and finds
+/// its conversation. When `None` (legacy callers, ad-hoc sub-agent calls),
+/// a synthetic `sub_{agent_id}_{uuid}` id is generated.
 pub fn execute_sub_agent<'a>(
     agent_config: &'a AgentConfig,
     prompt: &'a str,
     _context: Option<serde_json::Value>,
     exec_ctx: &'a SubAgentContext,
     depth: u32,
+    session_id_override: Option<String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
     Box::pin(execute_sub_agent_inner(
         agent_config,
         prompt,
         exec_ctx,
         depth,
+        session_id_override,
     ))
 }
 
@@ -69,6 +96,7 @@ async fn execute_sub_agent_inner(
     prompt: &str,
     exec_ctx: &SubAgentContext,
     depth: u32,
+    session_id_override: Option<String>,
 ) -> Result<String, String> {
     if depth >= MAX_DEPTH {
         return Err(format!(
@@ -103,8 +131,28 @@ async fn execute_sub_agent_inner(
         tools.len()
     );
 
-    // Generate a temporary session ID for the sub-agent
-    let sub_session_id = format!("sub_{}_{}", agent_config.id, uuid::Uuid::new_v4());
+    // Use the SubAgentManager-supplied id when provided so the
+    // agent_sessions row id matches the SubAgent record id (UI navigation
+    // depends on this); fall back to the legacy synthetic id for ad-hoc
+    // callers that don't go through SubAgentManager.
+    let sub_session_id = session_id_override
+        .unwrap_or_else(|| format!("sub_{}_{}", agent_config.id, uuid::Uuid::new_v4()));
+
+    // Build an ACP sender bound to *this* subagent's session id so its frames
+    // are routed under its own id (see [`AcpSenderFactory`] doc). Cloned so we
+    // can emit a final `message` + `task_complete` after the inner runtime
+    // returns — the inner loop only emits intermediate frames (thinking,
+    // tool-call, tool-result), it never emits the final assistant text or a
+    // task-complete marker. The parent runner does that after `execute_*`
+    // returns; the subagent path needs the same closing frames so its own
+    // `agent_sessions` row ends with the final answer + a clean
+    // `task_complete` (otherwise the BackgroundRunsModal detail page only
+    // shows intermediate `thinking` blocks and the user sees no result).
+    let sub_acp_sender = exec_ctx
+        .acp_sender_factory
+        .as_ref()
+        .map(|factory| factory(sub_session_id.clone()));
+    let sub_acp_sender_for_close = sub_acp_sender.clone();
 
     // System prompt from the AGENT.md markdown body.
     let base_system_prompt = agent_config.instructions.as_deref().unwrap_or(
@@ -129,10 +177,11 @@ async fn execute_sub_agent_inner(
             &tools,
             temperature,
             max_tokens,
+            None,
             Some(&sub_session_id),
             None, // user_id
             Some(runtime_context_messages),
-            exec_ctx.acp_sender.clone(),
+            sub_acp_sender,
             None, // skill_activation_handler
             exec_ctx.permission_checker.clone(),
             None, // compress_client — sub-agents have short conversations, no compression needed
@@ -150,10 +199,11 @@ async fn execute_sub_agent_inner(
             exec_ctx.api_format.clone(),
             false, // Sub-agents don't need vision support
             false, // No thinking for sub-agent path
+            None,  // No reasoning effort for sub-agent path
             true,  // Supports function calling for sub-agent path
             false, // No image output for sub-agent path
             None,  // No user images for sub-agent path
-            None,  // No sandbox policy (inherit default WorkspaceWrite)
+            exec_ctx.sandbox_policy.as_ref(),
         ),
     )
     .await;
@@ -166,6 +216,23 @@ async fn execute_sub_agent_inner(
                 agent_result.iteration_count,
                 agent_result.response.len()
             );
+            // Mirror the parent runner's closing frames so the subagent's
+            // own session transcript ends with the final assistant text and
+            // a `task_complete` marker. See `sub_acp_sender_for_close` doc.
+            if let Some(sender) = sub_acp_sender_for_close.as_ref() {
+                if !agent_result.response.is_empty() {
+                    sender(serde_json::json!({
+                        "type": "message",
+                        "message": agent_result.response.clone(),
+                    }))
+                    .await;
+                }
+                sender(serde_json::json!({
+                    "type": "task_complete",
+                    "id": uuid::Uuid::new_v4().to_string(),
+                }))
+                .await;
+            }
             Ok(agent_result.response)
         }
         Ok(Err(e)) => {

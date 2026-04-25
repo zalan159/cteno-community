@@ -122,11 +122,32 @@ impl SessionConnection {
         }
     }
 
+    fn model_id_for_profile_selection(vendor: &str, profile: &LlmProfile) -> String {
+        if vendor == "cteno" {
+            profile.id.clone()
+        } else {
+            profile.chat.model.clone()
+        }
+    }
+
     async fn is_vendor_native_model_id(vendor: &str, model_id: &str) -> bool {
         crate::commands::collect_vendor_models(vendor)
             .await
             .map(|models| models.into_iter().any(|model| model.id == model_id))
             .unwrap_or(false)
+    }
+
+    async fn default_vendor_model_id(vendor: &str) -> Option<String> {
+        crate::commands::collect_vendor_models(vendor)
+            .await
+            .ok()
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|model| model.is_default)
+                    .map(|model| model.id.clone())
+                    .or_else(|| models.first().map(|model| model.id.clone()))
+            })
     }
 
     async fn build_model_spec(
@@ -162,9 +183,10 @@ impl SessionConnection {
         let store = self.agent_config.profile_store.read().await;
 
         if let Some(profile) = store.get_profile_or_proxy(profile_id, &proxy_profiles) {
+            let model_id = Self::model_id_for_profile_selection(vendor, &profile);
             return Ok(ModelSpec {
                 provider: Self::provider_for_api_format(&profile.api_format).to_string(),
-                model_id: profile.chat.model.clone(),
+                model_id,
                 reasoning_effort: normalized_reasoning_effort,
                 temperature: Some(profile.chat.temperature),
             });
@@ -172,6 +194,22 @@ impl SessionConnection {
 
         let provider = Self::provider_for_vendor(vendor)
             .ok_or_else(|| format!("Unknown profile/model selection: {}", profile_id))?;
+
+        if let Some(model_id) = Self::default_vendor_model_id(vendor).await {
+            log::warn!(
+                "Session {} requested model/profile '{}' is not available for vendor={}; falling back to '{}'",
+                self.session_id,
+                profile_id,
+                vendor,
+                model_id
+            );
+            return Ok(ModelSpec {
+                provider: provider.to_string(),
+                model_id,
+                reasoning_effort: normalized_reasoning_effort,
+                temperature: None,
+            });
+        }
 
         Ok(ModelSpec {
             provider: provider.to_string(),
@@ -424,5 +462,50 @@ impl SessionConnection {
 impl Drop for SessionConnection {
     fn drop(&mut self) {
         self.heartbeat_running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_profile::LlmEndpoint;
+
+    fn test_profile() -> LlmProfile {
+        let chat = LlmEndpoint {
+            api_key: String::new(),
+            base_url: "https://dev.frontfidelity.cn".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            temperature: 0.2,
+            max_tokens: 32000,
+            context_window_tokens: Some(128000),
+        };
+
+        LlmProfile {
+            id: "proxy-deepseek-v4-pro".to_string(),
+            name: "DeepSeek V4 Pro".to_string(),
+            chat: chat.clone(),
+            compress: chat,
+            supports_vision: false,
+            supports_computer_use: false,
+            api_format: ApiFormat::Anthropic,
+            thinking: false,
+            is_free: false,
+            supports_function_calling: true,
+            supports_image_output: false,
+        }
+    }
+
+    #[test]
+    fn cteno_model_switch_uses_profile_id_as_selector() {
+        let profile = test_profile();
+
+        assert_eq!(
+            SessionConnection::model_id_for_profile_selection("cteno", &profile),
+            "proxy-deepseek-v4-pro"
+        );
+        assert_eq!(
+            SessionConnection::model_id_for_profile_selection("claude", &profile),
+            "deepseek-v4-pro"
+        );
     }
 }

@@ -84,7 +84,7 @@ cteno-host-runtime = { path = "../../../packages/host/rust/crates/cteno-host-run
 cteno-host-session-codec = { path = "../../../packages/host/rust/crates/cteno-host-session-codec" }
 cteno-host-session-registry = { path = "../../../packages/host/rust/crates/cteno-host-session-registry" }
 cteno-host-session-wire = { path = "../../../packages/host/rust/crates/cteno-host-session-wire" }
-cteno-host-usage-monitor = { path = "../../../packages/host/rust/crates/cteno-host-usage-monitor" }
+cteno-host-quota-monitor = { path = "../../../packages/host/rust/crates/cteno-host-quota-monitor" }
 cteno-host-agent-sync = { path = "../../../packages/host/rust/crates/cteno-host-agent-sync" }
 cteno-agent-runtime = { path = "../../../packages/agents/rust/crates/cteno-agent-runtime" }
 

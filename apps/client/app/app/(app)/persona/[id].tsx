@@ -7,16 +7,16 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Typography } from '@/constants/Typography';
 import { Text } from '@/components/StyledText';
-import { AgentInput } from '@/components/AgentInput';
+import { AgentInput, TodoInputPanel, latestTodosFromMessages } from '@/components/AgentInput';
 import { getSuggestions } from '@/components/autocomplete/suggestions';
 import { usePersonas } from '@/hooks/usePersonas';
 import { useAgentWorkspaces } from '@/hooks/useAgentWorkspaces';
-import { useAllMachines, useAllSessions, useCachedPersonas, useIsDataReady, useLocalSetting, useRealtimeStatus, useSession, useSessionMessages, useSessionTaskLifecycle, useSessionUsage, useSetting, storage } from '@/sync/storage';
+import { useAllMachines, useAllSessions, useCachedPersonas, useIsDataReady, useLocalSetting, useRealtimeStatus, useSession, useSessionMessages, useSessionTaskLifecycle, useSessionTodos, useSessionUsage, useSetting, storage } from '@/sync/storage';
 import { isMachineOnline } from '@/utils/machineUtils';
 import { formatPathRelativeToHome, getSessionAvatarId, getSessionName, useSessionStatus } from '@/utils/sessionUtils';
-import { sync, onHypothesisPush } from '@/sync/sync';
+import { sync } from '@/sync/sync';
 import { gitStatusSync } from '@/sync/gitStatusSync';
-import { sessionAbort, sessionApplyPermissionModeChange, sessionApplyRuntimeModelChange, sessionSetSandboxPolicy, sessionGetMCPServers, sessionSetMCPServers, machineListRuns, machineListScheduledTasks, machineGetPersonaTasks, machineListModels, machineUpdatePersona, machineReconnectSession, machineWorkspaceSendMessage, machineDeleteAgentWorkspace } from '@/sync/ops';
+import { sessionAbort, sessionApplyPermissionModeChange, sessionApplyRuntimeModelChange, sessionSetSandboxPolicy, sessionGetMCPServers, sessionSetMCPServers, machineListRuns, machineListScheduledTasks, machineGetPersonaTasks, machineListModels, machineUpdatePersona, machineWorkspaceSendMessage, machineDeleteAgentWorkspace, machineGetSession } from '@/sync/ops';
 import type { MCPServerItem, ModelOptionDisplay, RunRecord, ScheduledTask, VendorName } from '@/sync/ops';
 import { loadCachedVendorDefaultModelId } from '@/sync/modelCatalogCache';
 import { startSpeechToText, stopSpeechToText } from '@/realtime/RealtimeSession';
@@ -56,6 +56,7 @@ import { EmptyMessages } from '@/components/EmptyMessages';
 import { PersonaEmptyState } from '@/components/PersonaEmptyState';
 import { PersonaChatInput, PendingImage, PickedImage } from '@/components/PersonaChatInput';
 import { EffortSelector, type RuntimeEffort } from '@/components/EffortSelector';
+import { useAuth } from '@/auth/AuthContext';
 import { BackgroundRunsModal } from '@/components/BackgroundRunsModal';
 import { MemoryEditorModal } from '@/components/MemoryEditorModal';
 import { WorkspaceBrowserModal } from '@/components/WorkspaceBrowserModal';
@@ -2202,6 +2203,29 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     const headerHeight = useHeaderHeight();
     const [isDeletingWorkspace, setIsDeletingWorkspace] = useState(false);
     const personaAgent: VendorName = persona.agent ?? 'cteno';
+    // Subscribe to SubAgent lifecycle events for this persona's chat
+    // session. Without this on the persona route, the BackgroundRunsModal
+    // opened from `/persona/{id}` would always show an empty subagents
+    // list — the BaseSessionPage at `/session/{id}` had its own
+    // `useSubAgents` binding but the persona route was missing the
+    // equivalent. Wires the same data path: `useSubAgents` → `list-subagents`
+    // RPC → `SubAgentMirror` (populated by cteno-agent's lifecycle frames).
+    const {
+        subagents: personaSubagents,
+        stopSubAgent: handleStopPersonaSubAgent,
+    } = useSubAgents({
+        sessionId: persona.chatSessionId,
+        machineId: machineId || '',
+        activeOnly: false,
+    });
+    const displayablePersonaSubagents = React.useMemo(
+        () => getDisplayableSubAgents(personaSubagents),
+        [personaSubagents],
+    );
+    const [selectedPersonaSubAgent, setSelectedPersonaSubAgent] =
+        React.useState<typeof personaSubagents[0] | null>(null);
+    const [showPersonaSubAgentDetail, setShowPersonaSubAgentDetail] =
+        React.useState(false);
     const runtimeControls = useSessionRuntimeControls(persona.chatSessionId);
     const runtimeVendor = runtimeControls.vendor ?? personaAgent;
     const supportedPermissionModes = React.useMemo(
@@ -2212,9 +2236,6 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     const showModelPicker = !hideProfilePicker && runtimeControls.model.outcome !== 'unsupported';
     const modelChangeNeedsRestart = runtimeControls.model.outcome === 'restart_required';
 
-    // Handle pending session: when chatSessionId starts with "pending-", the
-    // server session is being created in the background. Listen for the
-    // persona_session_ready push event and refresh personas to get the real ID.
     const isPendingSession = persona.chatSessionId.startsWith('pending-');
 
     const handleDeleteWorkspace = useCallback(async () => {
@@ -2234,10 +2255,37 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
         }
     }, [isDeletingWorkspace, machineId, onWorkspaceRefresh, router, workspace]);
 
-    const effectiveSessionId = isPendingSession ? '' : persona.chatSessionId;
+    const effectiveSessionId = persona.chatSessionId;
     const session = useSession(effectiveSessionId);
     const { messages, isLoaded } = useSessionMessages(effectiveSessionId);
+    const sessionTodos = useSessionTodos(effectiveSessionId);
+    const dynamicTodos = React.useMemo(
+        () => sessionTodos ?? latestTodosFromMessages(messages),
+        [messages, sessionTodos],
+    );
+    const [isTodoCollapsed, setIsTodoCollapsed] = React.useState(false);
+    const todoToggle = React.useMemo(() => {
+        if (!dynamicTodos?.length) return null;
+        return {
+            completed: dynamicTodos.filter(todo => todo.status === 'completed').length,
+            total: dynamicTodos.length,
+            collapsed: isTodoCollapsed,
+            onPress: () => setIsTodoCollapsed(value => !value),
+        };
+    }, [dynamicTodos, isTodoCollapsed]);
     const runtimeEffort: RuntimeEffort = session?.runtimeEffort || 'default';
+    const pendingPermission = React.useMemo(() => {
+        const requests = session?.agentState?.requests;
+        if (!requests) return null;
+        const [id, request] = Object.entries(requests)[0] ?? [];
+        if (!id || !request) return null;
+        return {
+            id,
+            tool: request.tool,
+            arguments: request.arguments,
+            createdAt: request.createdAt,
+        };
+    }, [session?.agentState?.requests]);
     const [message, setMessage] = React.useState('');
     const [pendingImages, setPendingImages] = React.useState<PendingImage[]>([]);
     const [workspaceRouteStatus, setWorkspaceRouteStatus] = React.useState<string | null>(null);
@@ -2332,18 +2380,6 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     // Continuous browsing toggle
     const { createPersona, updatePersona, refresh: refreshPersonas } = usePersonas({ machineId });
 
-    // When session is pending, listen for push event + poll fast to get real session ID
-    React.useEffect(() => {
-        if (!isPendingSession) return;
-        const unsub = onHypothesisPush((pushId, event) => {
-            if (pushId === persona.id && event === 'persona_session_ready') {
-                refreshPersonas();
-            }
-        });
-        const timer = setInterval(refreshPersonas, 2000);
-        return () => { unsub(); clearInterval(timer); };
-    }, [isPendingSession, persona.id, refreshPersonas]);
-
     const [continuousBrowsing, setContinuousBrowsing] = React.useState(persona.continuousBrowsing);
     const doToggleContinuousBrowsing = React.useCallback(async (next: boolean) => {
         setContinuousBrowsing(next);
@@ -2397,13 +2433,16 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                         effortModalId = null;
                     }
                     try {
-                        await sessionApplyRuntimeModelChange(
-                            persona.chatSessionId,
-                            machineId,
-                            currentModelId,
-                            effort,
-                            runtimeControls.model,
-                        );
+                        storage.getState().updateSessionRuntimeEffort(persona.chatSessionId, effort);
+                        if (!isPendingSession) {
+                            await sessionApplyRuntimeModelChange(
+                                persona.chatSessionId,
+                                machineId,
+                                currentModelId,
+                                effort,
+                                runtimeControls.model,
+                            );
+                        }
                     } catch (error) {
                         console.error('Failed to switch reasoning effort:', error);
                     }
@@ -2416,11 +2455,10 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 },
             },
         });
-    }, [currentModelEffortLevels, currentModelId, machineId, persona.chatSessionId, runtimeControls.model, runtimeEffort]);
+    }, [currentModelEffortLevels, currentModelId, isPendingSession, machineId, persona.chatSessionId, runtimeControls.model, runtimeEffort]);
 
     const handleModelPress = React.useCallback(() => {
         const showPicker = (nextModels: ModelOptionDisplay[]) => {
-            if (nextModels.length === 0) return;
             frontendLog(`[PersonaModelPress.showPicker] ${JSON.stringify({
                 machineId: machineId ?? null,
                 runtimeVendor,
@@ -2442,13 +2480,14 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 props: {
                     models: nextModels,
                     currentModelId,
+                    machineId,
                     onSelect: async (modelId: string) => {
                         if (profileModalIdRef.current) {
                             Modal.hide(profileModalIdRef.current);
                             profileModalIdRef.current = null;
                         }
                         try {
-                            if (machineId && runtimeControls.model.outcome !== 'unsupported') {
+                            if (machineId && !isPendingSession && runtimeControls.model.outcome !== 'unsupported') {
                                 await sessionApplyRuntimeModelChange(
                                     persona.chatSessionId,
                                     machineId,
@@ -2508,7 +2547,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
             .catch(() => {
                 showPicker(models);
             });
-    }, [models, currentModelId, persona.chatSessionId, persona.id, machineId, updatePersona, refreshPersonas, onProfileChange, runtimeControls.model, modelChangeNeedsRestart, runtimeEffort, runtimeVendor]);
+    }, [models, currentModelId, persona.chatSessionId, persona.id, machineId, isPendingSession, updatePersona, refreshPersonas, onProfileChange, runtimeControls.model, modelChangeNeedsRestart, runtimeEffort, runtimeVendor]);
 
     const resolvedSessionPermissionMode = React.useMemo(() => {
         const sessionPermissionMode = session?.permissionMode || session?.metadata?.permissionMode;
@@ -2532,6 +2571,11 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
 
     const handlePermissionModeChange = React.useCallback(async (mode: PermissionMode) => {
         if (!showPermissionModeSelector) return;
+        storage.getState().updateSessionPermissionMode(persona.chatSessionId, mode);
+        if (isPendingSession) {
+            setPermissionMode(mode);
+            return;
+        }
         const result = await sessionApplyPermissionModeChange(
             persona.chatSessionId,
             mode,
@@ -2542,7 +2586,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
             return;
         }
         Modal.alert('Permission Mode', result.message);
-    }, [showPermissionModeSelector, persona.chatSessionId, runtimeControls.permissionMode]);
+    }, [showPermissionModeSelector, isPendingSession, persona.chatSessionId, runtimeControls.permissionMode]);
 
     // Sandbox policy — default to workspace_write
     const [sandboxPolicy, setSandboxPolicy] = React.useState<'workspace_write' | 'unrestricted'>(
@@ -2552,14 +2596,18 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     const handleSandboxPolicyChange = React.useCallback((policy: 'workspace_write' | 'unrestricted') => {
         setSandboxPolicy(policy);
         storage.getState().updateSessionSandboxPolicy(persona.chatSessionId, policy);
-        sessionSetSandboxPolicy(persona.chatSessionId, policy);
-    }, [persona.chatSessionId]);
+        if (!isPendingSession) {
+            sessionSetSandboxPolicy(persona.chatSessionId, policy);
+        }
+    }, [isPendingSession, persona.chatSessionId]);
 
     // Trigger session sync on mount + mark as read
     React.useLayoutEffect(() => {
-        sync.onSessionVisible(persona.chatSessionId);
+        if (!isPendingSession) {
+            sync.onSessionVisible(persona.chatSessionId);
+        }
         storage.getState().markPersonaRead(persona.chatSessionId);
-    }, [persona.chatSessionId]);
+    }, [isPendingSession, persona.chatSessionId]);
 
     // Keep marking as read while viewing (handles new messages arriving)
     React.useEffect(() => {
@@ -2592,7 +2640,11 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     const [activeMcpIds, setActiveMcpIds] = React.useState<string[]>([]);
 
     React.useEffect(() => {
-        if (!machineId) return;
+        if (!machineId || isPendingSession) {
+            setMcpServers([]);
+            setActiveMcpIds([]);
+            return;
+        }
         sessionGetMCPServers(persona.chatSessionId, machineId).then((result) => {
             setMcpServers(result.allServers);
             setActiveMcpIds(result.activeServerIds);
@@ -2600,7 +2652,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 sessionSetMCPServers(persona.chatSessionId, result.activeServerIds);
             }
         }).catch((err) => console.warn('Failed to load persona session MCP servers:', err));
-    }, [persona.chatSessionId, machineId]);
+    }, [persona.chatSessionId, machineId, isPendingSession]);
 
     const mcpModalIdRef = React.useRef<string | null>(null);
     const handleMcpClick = React.useCallback(() => {
@@ -2633,7 +2685,10 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     // Background runs (shell commands etc.) — poll every 5s
     const [runs, setRuns] = React.useState<RunRecord[]>([]);
     React.useEffect(() => {
-        if (!machineId) return;
+        if (!machineId || isPendingSession) {
+            setRuns([]);
+            return;
+        }
         let mounted = true;
         const loadRuns = async () => {
             try {
@@ -2644,7 +2699,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
         loadRuns();
         const interval = setInterval(loadRuns, 5000);
         return () => { mounted = false; clearInterval(interval); };
-    }, [machineId, persona.chatSessionId]);
+    }, [machineId, persona.chatSessionId, isPendingSession]);
 
     // Scheduled tasks — filter to this persona only
     const { tasks: allScheduledTasks, toggleTask: toggleScheduledTask, deleteTask: deleteScheduledTask, updateTask: updateScheduledTask } = useScheduledTasks({ machineId });
@@ -2700,7 +2755,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     }, []);
 
     const handleRunsClick = React.useCallback(async () => {
-        if (!machineId) return;
+        if (!machineId || isPendingSession) return;
 
         // Refresh runs before showing modal
         try {
@@ -2715,9 +2770,20 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 machineId,
                 sessionId: persona.chatSessionId,
                 runs,
+                subagents: displayablePersonaSubagents,
                 scheduledTasks,
                 taskSessions: taskSummaries,
                 agentTasks,
+                onStopSubAgent: handleStopPersonaSubAgent,
+                onViewSubAgentDetail: (subagent: typeof personaSubagents[0]) => {
+                    // The SubAgent record id matches the agent_sessions
+                    // row id (set via `session_id_override` in
+                    // `execute_sub_agent`), so navigating to
+                    // `/session/{id}` lands on BaseSessionPage which
+                    // loads its full transcript.
+                    closeRunsModal();
+                    router.push(`/session/${subagent.id}` as any);
+                },
                 onToggleScheduledTask: toggleScheduledTask,
                 onViewScheduledTaskDetail: (task: ScheduledTask) => {
                     closeRunsModal();
@@ -2732,7 +2798,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                     router.push(`/session/${task.sessionId}/message/${task.messageId}`);
                 },
                 onRefresh: async () => {
-                    if (!machineId) return;
+                    if (!machineId || isPendingSession) return;
                     try {
                         const latestRuns = await machineListRuns(machineId, persona.chatSessionId);
                         setRuns(latestRuns);
@@ -2741,7 +2807,7 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 onClose: closeRunsModal,
             },
         });
-    }, [agentTasks, machineId, persona.chatSessionId, persona.id, runs, scheduledTasks, taskSummaries, toggleScheduledTask, closeRunsModal, router]);
+    }, [agentTasks, machineId, isPendingSession, persona.chatSessionId, persona.id, runs, scheduledTasks, taskSummaries, toggleScheduledTask, closeRunsModal, router]);
 
     // Scheduled task detail
     const [selectedScheduledTask, setSelectedScheduledTask] = React.useState<ScheduledTask | null>(null);
@@ -3030,6 +3096,8 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     }, [effectiveWorkspace?.members, gatedTasksTemplateState, router]);
 
     const handleSend = useCallback(async () => {
+        if (pendingPermission) return;
+
         const hasText = message.trim().length > 0;
         const hasImages = pendingImages.length > 0;
         const hasSkills = selectedSkills.length > 0;
@@ -3101,27 +3169,9 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 text = userText || ' ';
             }
 
-            let targetSessionId = persona.chatSessionId;
-            const isPendingSession = persona.chatSessionId.startsWith('pending-');
-
-            // Only block on reconnect for pending sessions that need real session creation.
-            // For normal sessions, sync.sendMessage already performs reconnect internally,
-            // and doing it here delays optimistic message rendering.
-            if (machineId && isPendingSession) {
-                try {
-                    const result = await machineReconnectSession(machineId, persona.chatSessionId);
-                    if (result.status === 'session_replaced' && result.newSessionId) {
-                        targetSessionId = result.newSessionId;
-                        console.log(`[Persona] Session replaced: ${persona.chatSessionId} → ${targetSessionId}`);
-                        refreshPersonas();
-                    }
-                } catch (e) {
-                    console.warn('reconnect-session failed, sending anyway:', e);
-                }
-            }
-            sync.sendMessage(targetSessionId, text, displayText, images);
+            sync.sendMessage(persona.chatSessionId, text, displayText, images);
         }
-    }, [message, pendingImages, selectedSkills, effectiveWorkspace, persona.id, persona.chatSessionId, machineId, onWorkspaceRefresh, refreshPersonas]);
+    }, [message, pendingImages, selectedSkills, effectiveWorkspace, persona.id, persona.chatSessionId, machineId, onWorkspaceRefresh, pendingPermission]);
 
     const handleWorkspaceRolePress = React.useCallback((roleId: string) => {
         setWorkspaceRouteStatus(null);
@@ -3278,6 +3328,22 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
     // Input
     const input = (
         <View>
+            {!!dynamicTodos?.length && !isTodoCollapsed && (
+                <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
+                    <View
+                        style={{
+                            width: '100%',
+                            maxWidth: layout.maxWidth,
+                            alignSelf: 'center',
+                            borderRadius: Platform.select({ default: 16, android: 20 }),
+                            overflow: 'hidden',
+                            backgroundColor: theme.colors.input.background,
+                        }}
+                    >
+                        <TodoInputPanel todos={dynamicTodos} />
+                    </View>
+                </View>
+            )}
             <PersonaChatInput
                 placeholder={effectiveWorkspace ? '输入 @pm、@prd、@coder ... 然后描述任务' : t('persona.inputPlaceholder', { name: persona.name })}
                 value={message}
@@ -3311,8 +3377,12 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                 onModelPress={showModelPicker ? handleModelPress : undefined}
                 effortName={showModelPicker ? runtimeEffortLabel(runtimeEffort) : undefined}
                 onEffortPress={showModelPicker ? handleEffortPress : undefined}
-                usageVendor={runtimeVendor === 'claude' || runtimeVendor === 'codex' || runtimeVendor === 'gemini' ? runtimeVendor : null}
-                usageMachineId={machineId}
+                quotaVendor={runtimeVendor === 'claude' || runtimeVendor === 'codex' || runtimeVendor === 'gemini' ? runtimeVendor : null}
+                quotaMachineId={machineId}
+                sessionId={effectiveSessionId}
+                metadata={session?.metadata ?? null}
+                pendingPermission={pendingPermission}
+                todoToggle={todoToggle}
             />
             {/* Toolbar below input: permission mode + background runs */}
             <PersonaToolbar
@@ -3438,15 +3508,59 @@ function PersonaChatLoaded({ persona, machineId, onBack, renderHeader, onClear: 
                     await updateScheduledTask(id, updates);
                 }}
             />
+
+            <SubAgentDetailModal
+                subagent={selectedPersonaSubAgent}
+                visible={showPersonaSubAgentDetail}
+                onClose={() => {
+                    setShowPersonaSubAgentDetail(false);
+                    setSelectedPersonaSubAgent(null);
+                }}
+                onStop={async (id) => {
+                    try {
+                        await handleStopPersonaSubAgent(id);
+                        setShowPersonaSubAgentDetail(false);
+                        setSelectedPersonaSubAgent(null);
+                    } catch (err) {
+                        console.error('Failed to stop SubAgent:', err);
+                    }
+                }}
+            />
         </>
     );
 }
 
-export const SessionPersonaPage = React.memo(({ id }: { id: string }) => {
+export const BaseSessionPage = React.memo(({ id }: { id: string }) => {
     const sessionId = id;
     const router = useRouter();
     const session = useSession(sessionId);
     const isDataReady = useIsDataReady();
+    const allMachines = useAllMachines();
+    // Lazy session loader: when navigated to a session id that isn't in
+    // storage yet (typically a SubAgent's session — we don't sync those
+    // by default), fetch it via `machineGetSession` and apply it so
+    // BaseSessionLoaded can render its transcript instead of the
+    // "session deleted" fallback. Only fires once per missing-session
+    // mount; if the RPC also returns null, the fallback shows.
+    const lazyFetchAttemptedRef = React.useRef<string | null>(null);
+    React.useEffect(() => {
+        if (!isDataReady || session) return;
+        if (lazyFetchAttemptedRef.current === sessionId) return;
+        const candidateMachine =
+            allMachines.find((m) => isMachineOnline(m)) || allMachines[0];
+        if (!candidateMachine) return;
+        lazyFetchAttemptedRef.current = sessionId;
+        (async () => {
+            try {
+                const fetched = await machineGetSession(candidateMachine.id, sessionId);
+                if (fetched) {
+                    storage.getState().applySessions([fetched]);
+                }
+            } catch (e) {
+                console.warn(`[BaseSessionPage] lazy load for ${sessionId} failed:`, e);
+            }
+        })();
+    }, [isDataReady, session, sessionId, allMachines]);
     const { theme } = useUnistyles();
     const safeArea = useSafeAreaInsets();
     const isLandscape = useIsLandscape();
@@ -3555,7 +3669,7 @@ export const SessionPersonaPage = React.memo(({ id }: { id: string }) => {
                         </Text>
                     </View>
                 ) : (
-                    <SessionPersonaLoaded key={sessionId} sessionId={sessionId} session={session} />
+                    <BaseSessionLoaded key={sessionId} sessionId={sessionId} session={session} />
                 )}
             </View>
 
@@ -3579,7 +3693,7 @@ export const SessionPersonaPage = React.memo(({ id }: { id: string }) => {
     );
 });
 
-function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, session: Session }) {
+function BaseSessionLoaded({ sessionId, session }: { sessionId: string, session: Session }) {
     const { theme } = useUnistyles();
     const router = useRouter();
     const safeArea = useSafeAreaInsets();
@@ -3599,9 +3713,24 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
     const sandboxPolicy = session.sandboxPolicy || 'workspace_write';
     const sessionStatus = useSessionStatus(session);
     const sessionUsage = useSessionUsage(sessionId);
+    const sessionTodos = useSessionTodos(sessionId);
     const alwaysShowContextSize = useSetting('alwaysShowContextSize');
     const experiments = useSetting('experiments');
     const runtimeControls = useSessionRuntimeControls(sessionId);
+    const dynamicTodos = React.useMemo(
+        () => sessionTodos ?? latestTodosFromMessages(messages),
+        [messages, sessionTodos],
+    );
+    const [isTodoCollapsed, setIsTodoCollapsed] = React.useState(false);
+    const todoToggle = React.useMemo(() => {
+        if (!dynamicTodos?.length) return null;
+        return {
+            completed: dynamicTodos.filter(todo => todo.status === 'completed').length,
+            total: dynamicTodos.length,
+            collapsed: isTodoCollapsed,
+            onPress: () => setIsTodoCollapsed(value => !value),
+        };
+    }, [dynamicTodos, isTodoCollapsed]);
     const ownerMachineName = React.useMemo(() => {
         if (!machineId) {
             return 'Machine';
@@ -3636,6 +3765,16 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
     const [llmDefaultModelId, setLlmDefaultModelId] = React.useState<string>('default');
     const sessionModelId = session.metadata?.modelId || 'default';
     const runtimeEffort = session.runtimeEffort || 'default';
+    const currentRuntimeModel = React.useMemo(
+        () => llmModels.find((model) => model.id === sessionModelId) || null,
+        [llmModels, sessionModelId],
+    );
+    const currentRuntimeModelEffortLevels = React.useMemo(
+        () => currentRuntimeModel?.supportedReasoningEfforts?.length
+            ? currentRuntimeModel.supportedReasoningEfforts
+            : undefined,
+        [currentRuntimeModel],
+    );
 
     const reloadRuntimeModels = React.useCallback(() => {
         if (!machineId) return Promise.resolve();
@@ -3789,8 +3928,8 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
                 orchestrationFlow,
                 onStopSubAgent: handleStopSubAgent,
                 onViewSubAgentDetail: (subagent: typeof subagents[0]) => {
-                    setSelectedSubAgent(subagent);
-                    setShowSubAgentDetail(true);
+                    closeRunsModal();
+                    router.push(`/session/${subagent.id}` as any);
                 },
                 onViewScheduledTaskDetail: (task: ScheduledTask) => {
                     setSelectedScheduledTask(task);
@@ -3997,9 +4136,22 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
         </>
     ) : null;
 
+    const pendingPermission = React.useMemo(() => {
+        const requests = session.agentState?.requests;
+        if (!requests) return null;
+        const [id, request] = Object.entries(requests)[0] ?? [];
+        if (!id || !request) return null;
+        return {
+            id,
+            tool: request.tool,
+            arguments: request.arguments,
+            createdAt: request.createdAt,
+        };
+    }, [session.agentState?.requests]);
+
     const input = (
         <>
-            {!!session.promptSuggestions?.length && (
+            {!pendingPermission && !!session.promptSuggestions?.length && (
                 <View style={{ paddingHorizontal: 16, paddingTop: 8, paddingBottom: 4, flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
                     {session.promptSuggestions.map((suggestion, index) => (
                         <Pressable
@@ -4021,6 +4173,22 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
                     ))}
                 </View>
             )}
+            {!!dynamicTodos?.length && !isTodoCollapsed && (
+                <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
+                    <View
+                        style={{
+                            width: '100%',
+                            maxWidth: layout.maxWidth,
+                            alignSelf: 'center',
+                            borderRadius: Platform.select({ default: 16, android: 20 }),
+                            overflow: 'hidden',
+                            backgroundColor: theme.colors.input.background,
+                        }}
+                    >
+                        <TodoInputPanel todos={dynamicTodos} />
+                    </View>
+                </View>
+            )}
             <AgentInput
                 placeholder={t('session.inputPlaceholder')}
                 value={message}
@@ -4039,6 +4207,7 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
                     compressionInfo: sessionStatus.compressionInfo,
                 }}
                 onSend={() => {
+                    if (pendingPermission) return;
                     if (!message.trim()) return;
                     setMessage('');
                     clearDraft();
@@ -4065,11 +4234,18 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
                     cacheCreation: session.latestUsage.cacheCreation,
                     cacheRead: session.latestUsage.cacheRead,
                     contextSize: session.latestUsage.contextSize,
+                } : typeof session.contextTokens === 'number' ? {
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheCreation: 0,
+                    cacheRead: 0,
+                    contextSize: session.contextTokens,
                 } : undefined}
                 alwaysShowContextSize={alwaysShowContextSize}
                 llmProfiles={runtimeControls.model.outcome !== 'unsupported' ? llmModels : []}
                 selectedLlmProfileId={sessionModelId}
                 llmDefaultProfileId={llmDefaultModelId}
+                runtimeEffortLevels={currentRuntimeModelEffortLevels}
                 onLlmProfileChange={runtimeControls.model.outcome !== 'unsupported' ? updateRuntimeModel : undefined}
                 runtimeEffort={runtimeEffort}
                 onRuntimeEffortChange={runtimeControls.model.outcome !== 'unsupported'
@@ -4077,6 +4253,9 @@ function SessionPersonaLoaded({ sessionId, session }: { sessionId: string, sessi
                     : undefined}
                 activeMcpCount={mcpServers.length}
                 onMcpClick={handleMcpClick}
+                pendingPermission={pendingPermission}
+                todoToggle={todoToggle}
+                todos={session.todos}
             />
         </>
     );
@@ -4335,14 +4514,23 @@ function ContinuousBrowsingConfirmModal({ onConfirm, onClose }: {
 
 // -- Profile picker modal for switching models --
 
-function ProfilePickerModal({ models, currentModelId, onSelect, onClose, description }: {
+function ProfilePickerModal({ models, currentModelId, machineId, onSelect, onClose, description }: {
     models: ModelOptionDisplay[];
     currentModelId: string;
+    machineId?: string | null;
     onSelect: (modelId: string) => void;
     onClose: () => void;
     description?: string;
 }) {
     const { theme } = useUnistyles();
+    const router = useRouter();
+    const auth = useAuth();
+    const hasSignedInAccess = !!auth.credentials?.token?.trim();
+
+    const closeThenNavigate = React.useCallback((path: string) => {
+        onClose();
+        router.push(path as any);
+    }, [onClose, router]);
 
     React.useEffect(() => {
         frontendLog(`[ProfilePickerModal] ${JSON.stringify({
@@ -4408,14 +4596,100 @@ function ProfilePickerModal({ models, currentModelId, onSelect, onClose, descrip
                     </Text>
                 </View>
             ) : null}
-            <ScrollView style={{ maxHeight: 380 }}>
-                <LlmProfileList
-                    models={models}
-                    selectedModelId={currentModelId}
-                    onModelChange={onSelect}
-                    variant="modal"
-                />
-            </ScrollView>
+            {models.length > 0 ? (
+                <ScrollView style={{ maxHeight: 380 }}>
+                    <LlmProfileList
+                        models={models}
+                        selectedModelId={currentModelId}
+                        onModelChange={onSelect}
+                        variant="modal"
+                    />
+                </ScrollView>
+            ) : (
+                <View style={{ paddingHorizontal: 16, paddingVertical: 18 }}>
+                    <View style={{
+                        width: 36,
+                        height: 36,
+                        borderRadius: 18,
+                        backgroundColor: theme.colors.surfaceHigh,
+                        justifyContent: 'center',
+                        alignItems: 'center',
+                        marginBottom: 12,
+                    }}>
+                        <Ionicons name="key-outline" size={18} color={theme.colors.textSecondary} />
+                    </View>
+                    <Text style={{
+                        fontSize: 15,
+                        fontWeight: '600',
+                        color: theme.colors.text,
+                        marginBottom: 6,
+                        ...Typography.default('semiBold'),
+                    }}>
+                        当前机器还没有可用模型
+                    </Text>
+                    <Text style={{
+                        fontSize: 12,
+                        color: theme.colors.textSecondary,
+                        lineHeight: 18,
+                        marginBottom: 14,
+                        ...Typography.default(),
+                    }}>
+                        登录后会自动拉取内置代理模型；也可以在本机模型配置里填入自己的 API Key。
+                    </Text>
+                    {!hasSignedInAccess && (
+                        <Pressable
+                            onPress={() => closeThenNavigate('/login')}
+                            style={({ pressed }) => ({
+                                flexDirection: 'row',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                minHeight: 38,
+                                borderRadius: 8,
+                                backgroundColor: pressed ? theme.colors.surfacePressed : theme.colors.text,
+                                marginBottom: 8,
+                            })}
+                        >
+                            <Ionicons name="log-in-outline" size={16} color={theme.colors.surface} style={{ marginRight: 6 }} />
+                            <Text style={{
+                                fontSize: 13,
+                                fontWeight: '600',
+                                color: theme.colors.surface,
+                                ...Typography.default('semiBold'),
+                            }}>
+                                登录使用内置模型
+                            </Text>
+                        </Pressable>
+                    )}
+                    <Pressable
+                        onPress={() => {
+                            const path = machineId
+                                ? `/settings/profiles?machineId=${encodeURIComponent(machineId)}`
+                                : '/settings/profiles';
+                            closeThenNavigate(path);
+                        }}
+                        style={({ pressed }) => ({
+                            flexDirection: 'row',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            minHeight: 38,
+                            borderRadius: 8,
+                            borderWidth: 1,
+                            borderColor: theme.colors.divider,
+                            backgroundColor: pressed ? theme.colors.surfacePressed : 'transparent',
+                        })}
+                    >
+                        <Ionicons name="settings-outline" size={16} color={theme.colors.text} style={{ marginRight: 6 }} />
+                        <Text style={{
+                            fontSize: 13,
+                            fontWeight: '600',
+                            color: theme.colors.text,
+                            ...Typography.default('semiBold'),
+                        }}>
+                            配置本机模型 Key
+                        </Text>
+                    </Pressable>
+                </View>
+            )}
         </View>
     );
 }

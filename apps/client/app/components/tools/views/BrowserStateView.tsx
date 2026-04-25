@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, ActivityIndicator, Pressable } from 'react-native';
+import { View, Pressable } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolViewProps } from './_all';
@@ -45,7 +45,6 @@ export const BrowserStateView = React.memo<ToolViewProps>(({ tool }) => {
         return (
             <View style={styles.container}>
                 <View style={styles.row}>
-                    <ActivityIndicator size="small" />
                     <Text style={styles.runningText}>
                         {query ? `Searching for "${query}"...` : 'Getting page state...'}
                     </Text>

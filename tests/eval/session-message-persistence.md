@@ -69,3 +69,9 @@ rm -f /tmp/cteno-session-persistence/cteno.db
 - **expect**: 错误向上传播到 RPC 层；`executor.send_message` 不被触发（日志里看不到 vendor 子进程启动 / 相应 trace）
 - **anti-pattern**: persist 失败被 `let _ = ...` 静默；send_message 仍旧执行导致用户只看到 assistant 回复但本地历史丢了 user
 - **severity**: high
+
+### [pending] streaming 中 reload 历史不清当前临时文本
+- **message**: "本地 cteno session 第 2 轮开始后先收到 `text-delta: line1\nline2\n`，随后因为 tool-call 持久化触发 `reloadSessionMessages`，返回的最近页包含上一轮已完成的 ACP `message` / `task_complete`；继续收到 `text-delta: line3\n`"
+- **expect**: reload 后 footer streaming bubble 仍显示 `line1\nline2\n`，继续追加后显示 `line1\nline2\nline3\n`；最终落地 block 与 streaming 内容一致
+- **anti-pattern**: 重放上一轮 ACP `message` / `task_complete` 把当前 `streamingText` 清空，只剩 `line3`; 最终 block 正常但流式期间丢前几行
+- **severity**: high

@@ -49,6 +49,19 @@ async fn is_vendor_native_model_id(vendor: &str, model_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn default_vendor_model_id(vendor: &str) -> Option<String> {
+    crate::commands::collect_vendor_models(vendor)
+        .await
+        .ok()
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.id.clone())
+                .or_else(|| models.first().map(|model| model.id.clone()))
+        })
+}
+
 /// Resolve an `AgentExecutor` and spawn a new vendor session for this Happy
 /// session.
 async fn try_spawn_executor_session(
@@ -206,6 +219,21 @@ async fn resolve_spawn_model(
 
     let provider = provider?;
 
+    if let Some(model_id) = default_vendor_model_id(vendor).await {
+        log::warn!(
+            "[spawn] Requested model/profile '{}' is not available for vendor={}; falling back to '{}'",
+            profile_id,
+            vendor,
+            model_id
+        );
+        return Some(ModelSpec {
+            provider: provider.to_string(),
+            model_id,
+            reasoning_effort,
+            temperature: None,
+        });
+    }
+
     Some(ModelSpec {
         provider: provider.to_string(),
         model_id: profile_id.to_string(),
@@ -313,14 +341,17 @@ fn is_missing_claude_conversation_error(vendor: &str, error: &str) -> bool {
 }
 
 async fn try_resume_executor_session(
-    db_path: &Path,
+    config: &SpawnSessionConfig,
     happy_session_id: &str,
     agent_session: &AgentSession,
+    profile_id: &str,
+    system_prompt: Option<String>,
+    permission_mode: Option<PermissionMode>,
 ) -> Result<(Arc<dyn AgentExecutor>, SessionRef, PathBuf), String> {
     let native_session_id = restored_native_session_id(agent_session).ok_or_else(|| {
         format!("Missing persisted native_session_id for session {happy_session_id}")
     })?;
-    let session_store = crate::session_store_impl::build_session_store(db_path.to_path_buf());
+    let session_store = crate::session_store_impl::build_session_store(config.db_path.clone());
     let session_info = session_store
         .get_session_info(
             &agent_session.vendor,
@@ -352,15 +383,60 @@ async fn try_resume_executor_session(
         metadata,
     };
 
-    let session_ref = executor
-        .resume_session(NativeSessionId::new(native_session_id), hints)
-        .await
-        .map_err(|e| {
-            format!(
-                "executor.resume_session({}) failed for session {}: {}",
-                agent_session.vendor, happy_session_id, e
-            )
-        })?;
+    let session_ref = if agent_session.vendor == "cteno" {
+        let core_mode = permission_mode
+            .map(host_to_core_permission_mode)
+            .unwrap_or(CorePermissionMode::Default);
+        let spec = SpawnSessionSpec {
+            workdir: workdir.clone(),
+            system_prompt,
+            model: resolve_spawn_model(config, &agent_session.vendor, profile_id, None).await,
+            permission_mode: core_mode,
+            allowed_tools: None,
+            additional_directories: Vec::new(),
+            env: Default::default(),
+            agent_config: build_executor_agent_config(profile_id),
+            resume_hint: Some(hints),
+        };
+
+        log::info!(
+            "[Session {}] Resuming Cteno executor with profile_id='{}' via resume SpawnSessionSpec",
+            happy_session_id,
+            profile_id
+        );
+
+        match registry
+            .start_session_with_autoreopen("cteno", spec.clone())
+            .await
+        {
+            Ok(session_ref) => session_ref,
+            Err(err) => {
+                log::warn!(
+                    "[Session {}] start_session_with_autoreopen(cteno resume) failed: {} — falling back to spawn_session",
+                    happy_session_id,
+                    err
+                );
+                executor.spawn_session(spec).await.map_err(|e| {
+                    format!(
+                        "executor.spawn_session({}) resume failed for session {}: {}",
+                        agent_session.vendor,
+                        happy_session_id,
+                        user_visible_executor_error(&e)
+                    )
+                })?
+            }
+        }
+    } else {
+        executor
+            .resume_session(NativeSessionId::new(native_session_id), hints)
+            .await
+            .map_err(|e| {
+                format!(
+                    "executor.resume_session({}) failed for session {}: {}",
+                    agent_session.vendor, happy_session_id, e
+                )
+            })?
+    };
 
     log::info!(
         "[Session {}] Executor session resumed (vendor={}, native_id={})",
@@ -443,11 +519,25 @@ pub async fn spawn_session_internal(
         .session_connections
         .insert(session_id.clone(), conn)
         .await;
-    // Cloud sync is optional; local spawn succeeds even if the installed sync
-    // service is the default no-op or later fails internally.
-    session_sync_service()
-        .on_session_created(&session_id, Path::new(&directory), &session_ref.vendor)
+    // Cloud sync is optional best-effort work. Do not let a slow or
+    // unavailable server delay local session creation.
+    let sync_service = session_sync_service();
+    let sync_session_id = session_id.clone();
+    let sync_workdir = PathBuf::from(&directory);
+    let sync_vendor = session_ref.vendor.to_string();
+    tokio::spawn(async move {
+        let sync_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sync_service.on_session_created(&sync_session_id, &sync_workdir, &sync_vendor),
+        )
         .await;
+        if sync_result.is_err() {
+            log::warn!(
+                "Best-effort session sync create timed out for {} after 10s",
+                sync_session_id
+            );
+        }
+    });
 
     if let Some(msg) = initial_message {
         if let Some(conn) = config.session_connections.get(&session_id).await {
@@ -526,9 +616,12 @@ pub async fn resume_session_connection(
     let agent_config = prepare_spawn_agent_config(config, &profile_id, None).await;
     let permission_mode = restored_permission_mode(&agent_session);
     let (executor, session_ref, workdir) = match try_resume_executor_session(
-        &config.db_path,
+        config,
         session_id,
         &agent_session,
+        &profile_id,
+        Some(agent_config.system_prompt.clone()),
+        permission_mode,
     )
     .await
     {
@@ -689,10 +782,20 @@ mod tests {
             );
             std::env::set_var("CTENO_AGENT_PATH", &agent_binary);
 
-            let registry = crate::executor_registry::ExecutorRegistry::build(
-                crate::session_store_impl::build_session_store(shared_test_db_path()),
-            )
-            .expect("build executor registry");
+            // ExecutorRegistry::build is now async (registers cteno
+            // autonomous-turn handler). This test fixture runs inside
+            // `Once::call_once` (sync) — spin up a temporary
+            // single-threaded Tokio runtime to drive the future without
+            // re-entering whatever runtime might host the test caller.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("transient runtime for executor registry build");
+            let registry = rt
+                .block_on(crate::executor_registry::ExecutorRegistry::build(
+                    crate::session_store_impl::build_session_store(shared_test_db_path()),
+                ))
+                .expect("build executor registry");
             crate::local_services::install_executor_registry(Arc::new(registry));
         });
     }

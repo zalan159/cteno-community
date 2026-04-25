@@ -66,7 +66,7 @@ const TOOL_CALLS_THRESHOLD: u32 = 3;
 
 /// Tiered extraction models (proxy mode). Tried in order; first success wins.
 /// (model_id, context_window_tokens)
-pub const EXTRACTION_TIERS: &[(&str, usize)] = &[("deepseek-chat", 128_000)];
+pub const EXTRACTION_TIERS: &[(&str, usize)] = &[("deepseek-v4-flash", 1_000_000)];
 
 /// Tracks whether an extraction should fire. Lives on the stack in the ReAct
 /// loop and is initialised from the persisted `ExtractionMeta`.
@@ -204,6 +204,7 @@ Output ONLY a JSON object with these exact fields:
             2000,
             None,  // no streaming
             false, // no thinking
+            None,
         )
         .await
         .map_err(|e| format!("Extraction LLM call failed (model={}): {}", model, e))?;

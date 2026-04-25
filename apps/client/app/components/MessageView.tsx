@@ -306,6 +306,10 @@ function ToolCallBlock(props: {
   if (!props.message.tool) {
     return null;
   }
+  const normalizedToolName = props.message.tool.name.trim().toLowerCase();
+  if (normalizedToolName === 'update_plan' || normalizedToolName === 'update plan' || normalizedToolName === 'todowrite') {
+    return null;
+  }
   return (
     <View style={styles.toolContainer}>
       <ToolView

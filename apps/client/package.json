@@ -12,7 +12,7 @@
     "test": "vitest",
     "prebuild": "rm -rf android ios && expo prebuild",
     "typecheck": "tsc --noEmit",
-    "test:config": "vitest run app/config/runtime.test.ts app/config/serverDefaults.test.ts app/auth/local_mode/localMode.test.ts",
+    "test:config": "vitest run app/config/runtime.test.ts app/config/serverDefaults.test.ts app/config/capabilities.test.ts app/auth/local_mode/localMode.test.ts",
     "smoke": "npx expo config --json && yarn typecheck && yarn test:config && cargo check --manifest-path desktop/Cargo.toml",
     "postinstall": "patch-package && npx setup-skia-web public",
     "generate-theme": "tsx app/theme.gen.ts",

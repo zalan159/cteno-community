@@ -47,6 +47,12 @@ See:
 - **anti-pattern**: close_session A 把整个 subprocess 杀了导致 B 的回合立刻 error；B 的消息收到 "session not found" 但实际上 B 没被 close；connection check 返回 Dead。
 - **severity**: high
 
+### [pending] Cteno turn timeout 显示可重试错误并释放同一 session
+- **message**: "把 Cteno adapter 的 turn_timeout 临时设成 1 秒，用会触发长时间等待的 Cteno 回合复现 timeout；看到错误后，立刻在同一个 session 发送第二条短消息 'echo retry-ok'。"
+- **expect**: 第一轮在前端瞬态提示区出现 `cteno-agent response timed out after 1s`，并带有可重试提示；刷新/重载消息列表后这条 timeout 不作为聊天记录出现；同一轮随后写入 task_complete，界面停止 thinking；第二轮不会收到 `a turn is already in progress for this session`，并能正常完成。
+- **anti-pattern**: 超时只出现在 daemon stderr 或 Last stderr 泄漏一整段 tool schema；timeout 被持久化成 agent 聊天气泡；界面一直转圈没有 task_complete；第二轮被 busy 错误拒绝；同一个 timeout 产生两条重复错误气泡。
+- **severity**: high
+
 ### [pending] 未知 session_id 的 outbound 帧不会 panic 或打断其他 session
 - **message**: "向一个 Cteno connection 上注入一条伪造的 outbound 帧，session_id 指向一个从未 register 过的 UUID。连着跑几个合法 session 的请求，观察 demuxer 是否稳定。"
 - **expect**: 伪造帧被 silently drop（stderr 只打 warn），合法 session 的 delta / toolcall 流不受干扰；没有 panic / 没有 connection 级别的 Error 事件漏出去。

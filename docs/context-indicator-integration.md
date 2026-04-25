@@ -46,11 +46,16 @@
 
 - Codex:
   - app-server `thread/tokenUsage/updated`
-  - 以及 turn 完成时的 usage
+  - adapter 必须把 `tokenUsage.last.totalTokens + tokenUsage.modelContextWindow` 转成 `NativeEvent(kind=context_usage)`
+  - 以及 turn 完成时的 usage；`UsageUpdate/token_count` 只适合作为 fallback，不包含真实 context window
 - Claude:
   - SDK `get_context_usage()`
-- Gemini / Cteno:
-  - 各自 executor 的 usage / UsageUpdate
+- Gemini:
+  - ACP `session/prompt` response 的 `_meta.quota.token_count`
+  - adapter 同步生成 `NativeEvent(kind=context_usage)`；若响应将来直接带 context window，优先使用响应值，否则按 Gemini CLI 官方 `tokenLimit(model)` 规则从 `_meta.quota.model_usage[].model` 得出窗口
+- Cteno:
+  - stdio 在 `TurnComplete` 前发 `ContextUsage`，adapter 转成 `NativeEvent(kind=context_usage)`
+  - `total_tokens` 是最后一次 LLM 请求的上下文占用，`max_tokens` 是 profile/model 的实际 context window
 
 ### 2. Normalizer 持久化成 ACP usage 消息
 
@@ -148,12 +153,12 @@ Claude 这条线不能再幻想从旧 host `compressionThreshold` 推出来。
 Codex 曾经出现过：
 
 - app-server 已发 `thread/tokenUsage/updated`
-- normalizer 日志里也看到了 usage
+- normalizer 日志里也看到了 `UsageUpdate`
 - 但最终 UI 还是没有 `context: xx/yy`
 
 根因不是 Codex 没数据，而是：
 
-- usage 没被正确持久化成 session side-effect
+- `thread/tokenUsage/updated` 只转成了 `token_count`，没有同步转成携带 `modelContextWindow` 的 `context_usage`
 - 或本地回放把 `token_count` 当成“无需处理”的普通消息跳过了
 
 ## 现在的判断标准
@@ -164,7 +169,7 @@ Codex 曾经出现过：
 2. normalizer 有没有持久化成 `token_count` 或 `context_usage`
 3. 前端 `sync.ts` 有没有把这类 ACP 消息应用到 session
 4. `storage.ts` 有没有保住 `session.contextTokens`
-5. `sessionUtils.ts` 有没有被旧 `compressionThreshold` 干扰
+5. `sessionUtils.ts` 有没有拿到 `session.contextWindowTokens`；没有真实窗口时不要用 vendor 猜值硬显示
 
 不要先去看 heartbeat。
 

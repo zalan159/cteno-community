@@ -17,6 +17,8 @@ use serde_json::Value;
 
 use crate::schemas::{McpSpec, McpTransport};
 
+pub(crate) const LEGACY_CTENO_MEMORY_MCP_NAME: &str = "cteno-memory";
+
 /// Shared helper — render an `McpSpec` as the JSON shape expected by Claude /
 /// Gemini (Codex uses TOML and has its own renderer).
 pub(crate) fn mcp_to_json(spec: &McpSpec) -> Value {

@@ -130,13 +130,11 @@ pub trait AgentOwnerProvider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// 2.7 MachineSocketProvider
+// 2.7 MachineSocketProvider — removed after the host-event-bus refactor.
+// Producers that used to call `push_to_frontend(channel, payload)` now emit
+// typed `HostEvent` values through `HostEventEmitter` /
+// `cteno_host_runtime::events`.  See section 2.19.
 // ---------------------------------------------------------------------------
-
-#[async_trait]
-pub trait MachineSocketProvider: Send + Sync {
-    async fn push_to_frontend(&self, channel: &str, payload: Value) -> Result<(), String>;
-}
 
 // ---------------------------------------------------------------------------
 // 2.8 BrowserControlProvider — removed in Wave 2.3b.
@@ -352,12 +350,6 @@ hook_slot!(
     agent_owner
 );
 hook_slot!(
-    MACHINE_SOCKET,
-    dyn MachineSocketProvider,
-    install_machine_socket,
-    machine_socket
-);
-hook_slot!(
     SKILL_REGISTRY,
     dyn SkillRegistryProvider,
     install_skill_registry,
@@ -473,9 +465,9 @@ pub trait HostCallDispatcher: Send + Sync {
     /// - `session_id` identifies the session the call belongs to (may be
     ///   empty for global hooks).
     /// - `hook_name` is the logical hook family, e.g. `"agent_owner"`,
-    ///   `"skillhub"`, `"machine_socket"`.
+    ///   `"skillhub"`, `"local_notification"`.
     /// - `method` is the method within that family, e.g. `"session_owner"`,
-    ///   `"list_skills"`, `"push_to_frontend"`.
+    ///   `"list_skills"`, `"send_local_notification"`.
     /// - `params` is an arbitrary JSON object whose shape is defined by the
     ///   adapter for `(hook_name, method)`.
     async fn call(
@@ -606,4 +598,117 @@ pub fn llm_key_provider() -> Option<Arc<dyn LlmKeyProvider>> {
 
 pub fn current_llm_key() -> Option<String> {
     llm_key_provider().and_then(|p| p.current())
+}
+
+// ---------------------------------------------------------------------------
+// 2.19 HostEventEmitter — bridge from session-internal code to the host
+// event bus (`cteno_host_runtime::events`).
+// ---------------------------------------------------------------------------
+// Session-internal executors (currently `a2ui_render`) that need to emit a
+// host-level domain event go through this trait.  The runtime crate must not
+// reverse-depend on the host crate, so the hook surface stays typed per
+// event — no generic `push_to_frontend(channel, payload)` stringly-typed
+// envelope.  The desktop app installs an impl that forwards to
+// `cteno_host_runtime::events::emit(...)`.
+
+#[async_trait]
+pub trait HostEventEmitter: Send + Sync {
+    /// An `a2ui_render` batch committed changes to the agent's surface.
+    async fn emit_a2ui_updated(&self, agent_id: &str);
+}
+
+static HOST_EVENT_EMITTER: OnceCell<Arc<dyn HostEventEmitter>> = OnceCell::new();
+
+pub fn install_host_event_emitter(e: Arc<dyn HostEventEmitter>) {
+    let _ = HOST_EVENT_EMITTER.set(e);
+}
+
+pub fn host_event_emitter() -> Option<Arc<dyn HostEventEmitter>> {
+    HOST_EVENT_EMITTER.get().cloned()
+}
+
+// ---------------------------------------------------------------------------
+// 2.20 TaskGraphEventEmitter — session-internal DAG lifecycle events.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait TaskGraphEventEmitter: Send + Sync {
+    async fn emit_task_graph_event(&self, session_id: &str, event: &str, payload: Value);
+}
+
+static TASK_GRAPH_EVENT_EMITTER: OnceCell<Arc<dyn TaskGraphEventEmitter>> = OnceCell::new();
+
+pub fn install_task_graph_event_emitter(e: Arc<dyn TaskGraphEventEmitter>) {
+    let _ = TASK_GRAPH_EVENT_EMITTER.set(e);
+}
+
+pub fn task_graph_event_emitter() -> Option<Arc<dyn TaskGraphEventEmitter>> {
+    TASK_GRAPH_EVENT_EMITTER.get().cloned()
+}
+
+// ---------------------------------------------------------------------------
+// 2.21 SubAgentLifecycleEmitter — push subagent state transitions out of
+// the runtime so the host can mirror a SubAgent registry and surface live
+// progress in the UI (BackgroundRunsModal). The runtime owns the canonical
+// SubAgentManager state; the host-side mirror exists purely so the
+// frontend can subscribe to lifecycle Tauri events without polling RPC.
+// ---------------------------------------------------------------------------
+
+/// Vendor-neutral lifecycle DTO. Crosses the runtime ↔ host boundary; the
+/// stdio crate translates this into `Outbound::SubAgentLifecycle` wire
+/// frames, the host-side dispatcher then translates the wire frame into
+/// the desktop's `SessionEventSink::on_subagent_lifecycle` call.
+///
+/// Stays an opaque struct (rather than re-exporting `crate::subagent::SubAgent`)
+/// so the runtime stays agnostic about wire encoding and host adapters
+/// stay agnostic about the runtime's internal SubAgent struct shape.
+#[derive(Debug, Clone)]
+pub enum SubAgentLifecycleEventDto {
+    Spawned {
+        subagent_id: String,
+        agent_id: String,
+        task: String,
+        label: Option<String>,
+        created_at_ms: i64,
+    },
+    Started {
+        subagent_id: String,
+        started_at_ms: i64,
+    },
+    Updated {
+        /// Periodic progress beacon. Optional; emitter may throttle these.
+        subagent_id: String,
+        iteration_count: u32,
+    },
+    Completed {
+        subagent_id: String,
+        result: Option<String>,
+        completed_at_ms: i64,
+    },
+    Failed {
+        subagent_id: String,
+        error: String,
+        completed_at_ms: i64,
+    },
+    Stopped {
+        subagent_id: String,
+        completed_at_ms: i64,
+    },
+}
+
+pub trait SubAgentLifecycleEmitter: Send + Sync {
+    /// Best-effort fire-and-forget; never blocks the SubAgentManager.
+    /// Hosts that don't care (e.g. tests, embedded library use) install
+    /// nothing and the runtime silently skips emission.
+    fn emit(&self, parent_session_id: &str, event: SubAgentLifecycleEventDto);
+}
+
+static SUBAGENT_LIFECYCLE_EMITTER: OnceCell<Arc<dyn SubAgentLifecycleEmitter>> = OnceCell::new();
+
+pub fn install_subagent_lifecycle_emitter(e: Arc<dyn SubAgentLifecycleEmitter>) {
+    let _ = SUBAGENT_LIFECYCLE_EMITTER.set(e);
+}
+
+pub fn subagent_lifecycle_emitter() -> Option<Arc<dyn SubAgentLifecycleEmitter>> {
+    SUBAGENT_LIFECYCLE_EMITTER.get().cloned()
 }

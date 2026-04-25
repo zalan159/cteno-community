@@ -25,29 +25,11 @@ export interface SessionStatus {
     compressionInfo?: CompressionInfo;
 }
 
-function inferCompressionVendor(session: Session): 'cteno' | 'claude' | 'codex' | 'gemini' {
-    const metadataVendor = session.metadata?.vendor?.trim().toLowerCase();
-    if (metadataVendor === 'cteno' || metadataVendor === 'claude' || metadataVendor === 'codex' || metadataVendor === 'gemini') {
-        return metadataVendor;
+function contextWindowForSession(session: Session): number | undefined {
+    if (typeof session.contextWindowTokens === 'number' && session.contextWindowTokens > 0) {
+        return session.contextWindowTokens;
     }
-
-    const flavor = session.metadata?.flavor?.trim().toLowerCase() ?? '';
-    if (flavor.includes('codex') || flavor.includes('openai') || flavor.includes('gpt')) return 'codex';
-    if (flavor.includes('claude')) return 'claude';
-    if (flavor.includes('gemini')) return 'gemini';
-    return 'cteno';
-}
-
-function defaultCompressionThresholdForSession(session: Session): number {
-    switch (inferCompressionVendor(session)) {
-        case 'claude':
-        case 'gemini':
-            return 1_000_000;
-        case 'codex':
-        case 'cteno':
-        default:
-            return 256_000;
-    }
+    return undefined;
 }
 
 /**
@@ -73,8 +55,8 @@ export function useSessionStatus(session: Session): SessionStatus {
 
     const compressionInfo = React.useMemo((): CompressionInfo | undefined => {
         const contextTokens = session.contextTokens ?? session.latestUsage?.contextSize ?? 0;
-        const compressionThreshold = defaultCompressionThresholdForSession(session);
-        if (!Number.isFinite(contextTokens) || !Number.isFinite(compressionThreshold) || compressionThreshold <= 0) {
+        const compressionThreshold = contextWindowForSession(session);
+        if (!Number.isFinite(contextTokens) || !compressionThreshold || !Number.isFinite(compressionThreshold) || compressionThreshold <= 0) {
             return undefined;
         }
         const pct = (contextTokens / compressionThreshold) * 100;
@@ -90,7 +72,7 @@ export function useSessionStatus(session: Session): SessionStatus {
             color,
             text: `${formatK(contextTokens)}/${formatK(compressionThreshold)}`
         };
-    }, [session.contextTokens, session.latestUsage?.contextSize, session.metadata?.vendor, session.metadata?.flavor, theme.colors.status.default]);
+    }, [session.contextTokens, session.contextWindowTokens, session.latestUsage?.contextSize, theme.colors.status.default]);
 
     if (!isOnline) {
         return {

@@ -192,6 +192,8 @@ mod tests {
             user_id: None,
             messages: vec![],
             context_data: None,
+            agent_state: None,
+            agent_state_version: 0,
             status: crate::agent_session::SessionStatus::Active,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

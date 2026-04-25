@@ -7,9 +7,10 @@
 //! still resolves to the unified prompt.
 //!
 //! Subagents / skills are served by reading the authoritative trees directly
-//! from Cteno's own runtime. MCP still needs a project-scoped config file so
-//! the stdio runtime can merge `{project}/.cteno/mcp_servers.yaml` over the
-//! global MCP config at session init.
+//! from Cteno's own runtime. User-configured project MCP still needs a
+//! project-scoped config file so the stdio runtime can merge
+//! `{project}/.cteno/mcp_servers.yaml` over the global MCP config at session
+//! init.
 
 use std::path::Path;
 
@@ -20,6 +21,7 @@ use crate::{
     schemas::{McpSpec, McpTransport, PersonaSpec, SkillSpec},
     symlink::ensure_symlink,
     syncer::{SyncReport, VendorSyncer},
+    vendors::LEGACY_CTENO_MEMORY_MCP_NAME,
 };
 
 pub struct CtenoSyncer;
@@ -43,12 +45,15 @@ impl VendorSyncer for CtenoSyncer {
 
     fn sync_mcp(&self, project: &Path, specs: &[McpSpec]) -> Result<SyncReport> {
         let mut report = SyncReport::default();
-        if specs.is_empty() {
+        let path = project.join(".cteno").join("mcp_servers.yaml");
+        if specs.is_empty() && !path.exists() {
             return Ok(report);
         }
 
-        let path = project.join(".cteno").join("mcp_servers.yaml");
         let mut config = read_yaml_or_empty(&path)?;
+        config
+            .servers
+            .retain(|server| server.id != LEGACY_CTENO_MEMORY_MCP_NAME);
         for spec in specs {
             upsert_server(&mut config.servers, spec);
         }

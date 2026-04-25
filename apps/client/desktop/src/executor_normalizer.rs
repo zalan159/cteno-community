@@ -42,12 +42,12 @@
 //! `task_complete` on `TurnComplete` and on fatal `Error` events — the
 //! session already emits `task_started` before invoking `send_message`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use cteno_agent_runtime::hooks as runtime_hooks;
 use cteno_host_session_registry::{
     BackgroundTaskCategory, BackgroundTaskRecord, BackgroundTaskStatus,
 };
@@ -110,10 +110,12 @@ fn acp_tool_call_payload(
     name: impl Into<String>,
     input: serde_json::Value,
 ) -> serde_json::Value {
+    let name = name.into();
+    let input = canonical_tool_input_for_ui(&name, input);
     json!({
         "type": "tool-call",
         "callId": call_id.into(),
-        "name": name.into(),
+        "name": name,
         "input": input,
         "id": Uuid::new_v4().to_string()
     })
@@ -158,6 +160,101 @@ fn with_host_owned_tool_metadata(input: serde_json::Value, request_id: &str) -> 
             map.insert(HOST_OWNED_TOOL_METADATA_KEY.to_string(), metadata);
             serde_json::Value::Object(map)
         }
+    }
+}
+
+fn is_update_plan_tool_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "update_plan" | "update plan" | "todowrite"
+    )
+}
+
+fn canonical_tool_input_for_ui(name: &str, input: serde_json::Value) -> serde_json::Value {
+    if !is_update_plan_tool_name(name) {
+        return input;
+    }
+
+    let serde_json::Value::Object(mut map) = input else {
+        return input;
+    };
+
+    if let Some(todos) = extract_canonical_todos(&map) {
+        map.insert("todos".to_string(), serde_json::Value::Array(todos));
+    }
+
+    serde_json::Value::Object(map)
+}
+
+fn extract_canonical_todos(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<serde_json::Value>> {
+    ["todos", "newTodos", "items", "plan"]
+        .iter()
+        .find_map(|key| {
+            map.get(*key)
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(canonical_todo_item)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+        })
+}
+
+fn canonical_todo_item(item: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(text) = item
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(json!({
+            "content": text,
+            "status": "pending",
+        }));
+    }
+
+    let object = item.as_object()?;
+    let content = ["content", "step", "task", "text", "title"]
+        .iter()
+        .find_map(|key| {
+            object
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?;
+    let status = canonical_todo_status(object);
+
+    Some(json!({
+        "content": content,
+        "status": status,
+    }))
+}
+
+fn canonical_todo_status(object: &serde_json::Map<String, serde_json::Value>) -> &'static str {
+    if object
+        .get("done")
+        .or_else(|| object.get("completed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "completed";
+    }
+
+    match object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "completed" | "complete" | "done" | "success" | "succeeded" => "completed",
+        "in_progress" | "in-progress" | "inprogress" | "running" | "active" => "in_progress",
+        _ => "pending",
     }
 }
 
@@ -353,6 +450,15 @@ fn native_event_context_usage_payload(payload: &serde_json::Value) -> Option<ser
         data.insert(
             "raw_max_tokens".to_string(),
             serde_json::Value::from(raw_max_tokens),
+        );
+    }
+    if let Some(auto_compact_token_limit) = payload
+        .get("auto_compact_token_limit")
+        .and_then(serde_json::Value::as_u64)
+    {
+        data.insert(
+            "auto_compact_token_limit".to_string(),
+            serde_json::Value::from(auto_compact_token_limit),
         );
     }
     if let Some(percentage) = payload
@@ -741,6 +847,260 @@ fn claude_task_complete_payload(payload: &serde_json::Value) -> Option<serde_jso
     })
 }
 
+fn sidechain_base(payload: &serde_json::Value) -> Option<(String, String)> {
+    let parent_tool_use_id = payload
+        .get("parent_tool_use_id")
+        .or_else(|| payload.get("parentToolUseId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let uuid = payload
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    Some((parent_tool_use_id.to_string(), uuid))
+}
+
+fn sidechain_text_payload(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    let kind = payload.get("kind").and_then(serde_json::Value::as_str)?;
+    let acp_type = match kind {
+        "sidechain_prompt" | "sidechain_text" => "message",
+        "sidechain_thinking" => "thinking",
+        _ => return None,
+    };
+    let text = payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let (parent_tool_use_id, uuid) = sidechain_base(payload)?;
+
+    if acp_type == "thinking" {
+        Some(json!({
+            "type": "thinking",
+            "text": text,
+            "isSidechain": true,
+            "parentToolUseId": parent_tool_use_id,
+            "uuid": uuid,
+        }))
+    } else {
+        Some(json!({
+            "type": "message",
+            "message": text,
+            "isSidechain": true,
+            "parentToolUseId": parent_tool_use_id,
+            "uuid": uuid,
+        }))
+    }
+}
+
+fn sidechain_tool_call_payload(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    if payload.get("kind").and_then(serde_json::Value::as_str) != Some("sidechain_tool_call") {
+        return None;
+    }
+    let call_id = payload
+        .get("tool_use_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let name = payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let (parent_tool_use_id, uuid) = sidechain_base(payload)?;
+
+    Some(json!({
+        "type": "tool-call",
+        "callId": call_id,
+        "name": name,
+        "input": payload.get("input").cloned().unwrap_or(serde_json::Value::Null),
+        "id": uuid,
+        "isSidechain": true,
+        "parentToolUseId": parent_tool_use_id,
+    }))
+}
+
+fn sidechain_tool_result_payload(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    if payload.get("kind").and_then(serde_json::Value::as_str) != Some("sidechain_tool_result") {
+        return None;
+    }
+    let call_id = payload
+        .get("tool_use_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let text = payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let is_error = payload
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let (parent_tool_use_id, uuid) = sidechain_base(payload)?;
+
+    Some(json!({
+        "type": "tool-result",
+        "callId": call_id,
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+        "id": uuid,
+        "isSidechain": true,
+        "parentToolUseId": parent_tool_use_id,
+    }))
+}
+
+fn codex_update_plan_tool_call_payload(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    if payload.get("method").and_then(serde_json::Value::as_str)
+        != Some("rawResponseItem/completed")
+    {
+        return None;
+    }
+
+    let item = payload.get("params")?.get("item")?;
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+        return None;
+    }
+
+    let name = item
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if !is_update_plan_tool_name(name) {
+        return None;
+    }
+
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("callId"))
+        .or_else(|| item.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let input = item
+        .get("arguments")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .or_else(|| item.get("input").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    Some(acp_tool_call_payload(call_id, name, input))
+}
+
+fn task_result_sidechain_payload(
+    parent_tool_use_id: &str,
+    output: &Result<String, String>,
+) -> Option<serde_json::Value> {
+    let text = match output {
+        Ok(text) | Err(text) => text.trim(),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "message",
+        "message": text,
+        "isSidechain": true,
+        "parentToolUseId": parent_tool_use_id,
+        "uuid": Uuid::new_v4().to_string(),
+    }))
+}
+
+fn is_task_like_tool_name(name: &str) -> bool {
+    matches!(name.trim().to_ascii_lowercase().as_str(), "task" | "agent")
+}
+
+fn is_cteno_dispatch_task_tool_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "dispatch_task" | "dispatch-task" | "dispatchtask"
+    )
+}
+
+fn is_shell_like_tool_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "bash" | "shell" | "sh" | "zsh" | "terminal" | "execute" | "command"
+    ) || lower.contains("shell")
+}
+
+fn is_background_tracked_tool_name(name: &str) -> bool {
+    is_task_like_tool_name(name)
+        || is_cteno_dispatch_task_tool_name(name)
+        || is_shell_like_tool_name(name)
+}
+
+fn first_non_empty_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn background_task_id_for_tool(call_id: &str, input: &serde_json::Value) -> String {
+    first_non_empty_json_string(input, &["taskId", "task_id"])
+        .unwrap_or_else(|| call_id.to_string())
+}
+
+fn background_description_for_tool(name: &str, input: &serde_json::Value) -> Option<String> {
+    first_non_empty_json_string(
+        input,
+        &[
+            "description",
+            "summary",
+            "prompt",
+            "task",
+            "command",
+            "cmd",
+            "query",
+            "title",
+        ],
+    )
+    .or_else(|| Some(name.to_string()).filter(|value| !value.trim().is_empty()))
+}
+
+fn background_task_started_record_for_tool(
+    session_id: &str,
+    vendor: &str,
+    call_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    started_at: i64,
+) -> Option<BackgroundTaskRecord> {
+    if !is_background_tracked_tool_name(name) {
+        return None;
+    }
+    let task_id = background_task_id_for_tool(call_id, input);
+    Some(BackgroundTaskRecord {
+        task_id,
+        session_id: session_id.to_string(),
+        vendor: vendor.to_string(),
+        category: BackgroundTaskCategory::ExecutionTask,
+        task_type: first_non_empty_json_string(input, &["taskType", "task_type"])
+            .unwrap_or_else(|| name.to_string()),
+        description: background_description_for_tool(name, input),
+        summary: first_non_empty_json_string(input, &["summary", "lastToolName", "last_tool_name"]),
+        status: BackgroundTaskStatus::Running,
+        started_at,
+        completed_at: None,
+        tool_use_id: Some(call_id.to_string()),
+        output_file: first_non_empty_json_string(input, &["outputFile", "output_file"]),
+        vendor_extra: json!({
+            "toolName": name,
+            "toolInput": input,
+            "source": "tool_call",
+        }),
+    })
+}
+
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -868,6 +1228,202 @@ fn update_claude_background_task_registry(
         }
         _ => None,
     }
+}
+
+fn upsert_background_tool_record(
+    session_id: &str,
+    vendor: &str,
+    call_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    timestamp_millis: i64,
+) -> Option<BackgroundTaskRecord> {
+    let registry = match crate::local_services::background_task_registry() {
+        Ok(registry) => registry,
+        Err(err) => {
+            log::debug!(
+                "[Normalizer {}] background task registry unavailable: {}",
+                session_id,
+                err
+            );
+            return None;
+        }
+    };
+    let record = background_task_started_record_for_tool(
+        session_id,
+        vendor,
+        call_id,
+        name,
+        input,
+        timestamp_millis,
+    )?;
+    registry.upsert(record.clone());
+    registry.get(&record.task_id)
+}
+
+fn complete_background_tool_record(
+    session_id: &str,
+    call_id: &str,
+    output: &Result<String, String>,
+    timestamp_millis: i64,
+    recent_tool: Option<&RecentToolCall>,
+) -> Option<BackgroundTaskRecord> {
+    let registry = match crate::local_services::background_task_registry() {
+        Ok(registry) => registry,
+        Err(err) => {
+            log::debug!(
+                "[Normalizer {}] background task registry unavailable: {}",
+                session_id,
+                err
+            );
+            return None;
+        }
+    };
+
+    let task_id = recent_tool
+        .map(|tool| background_task_id_for_tool(call_id, &tool.input))
+        .unwrap_or_else(|| call_id.to_string());
+    let summary = match output {
+        Ok(text) | Err(text) => text
+            .trim()
+            .chars()
+            .take(240)
+            .collect::<String>()
+            .trim()
+            .to_string(),
+    };
+    let summary = if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    };
+    let status = if output.is_ok() {
+        BackgroundTaskStatus::Completed
+    } else {
+        BackgroundTaskStatus::Failed
+    };
+    registry.update_status(&task_id, status, Some(timestamp_millis), summary);
+    registry.get(&task_id)
+}
+
+fn update_background_tool_record_status(
+    session_id: &str,
+    task_id: &str,
+    status: BackgroundTaskStatus,
+    timestamp_millis: Option<i64>,
+    summary: Option<String>,
+) -> Option<BackgroundTaskRecord> {
+    let registry = match crate::local_services::background_task_registry() {
+        Ok(registry) => registry,
+        Err(err) => {
+            log::debug!(
+                "[Normalizer {}] background task registry unavailable: {}",
+                session_id,
+                err
+            );
+            return None;
+        }
+    };
+    registry.update_status(task_id, status, timestamp_millis, summary);
+    registry.get(task_id)
+}
+
+fn acp_tool_call_parts(data: &serde_json::Value) -> Option<(String, String, serde_json::Value)> {
+    if data.get("type").and_then(serde_json::Value::as_str) != Some("tool-call") {
+        return None;
+    }
+    let call_id = data
+        .get("callId")
+        .or_else(|| data.get("call_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let name = data
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let input = data
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some((call_id, name, input))
+}
+
+fn acp_tool_result_parts(data: &serde_json::Value) -> Option<(String, Result<String, String>)> {
+    if data.get("type").and_then(serde_json::Value::as_str) != Some("tool-result") {
+        return None;
+    }
+    let call_id = data
+        .get("callId")
+        .or_else(|| data.get("call_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let text = data
+        .get("output")
+        .or_else(|| data.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            data.get("content").map(|value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+        })
+        .unwrap_or_default();
+    let is_error = data
+        .get("isError")
+        .or_else(|| data.get("is_error"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if is_error {
+        Some((call_id, Err(text)))
+    } else {
+        Some((call_id, Ok(text)))
+    }
+}
+
+fn cteno_dispatch_group_id_from_output(output: &Result<String, String>) -> Option<String> {
+    let Ok(text) = output else {
+        return None;
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("group_id")
+                .or_else(|| value.get("groupId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn is_cteno_task_graph_runtime_message(data: &serde_json::Value) -> bool {
+    if data.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return false;
+    }
+    if data.get("source").and_then(serde_json::Value::as_str) != Some("subagent") {
+        return false;
+    }
+    if data.get("isSidechain").and_then(serde_json::Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(message) = data
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+    message.starts_with("[Task Complete]")
+        || message.starts_with("[Task Failed]")
+        || message.starts_with("[Task Group Complete]")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1018,6 +1574,12 @@ pub struct ExecutorNormalizer {
     /// Recent tool-call starts so InjectedToolInvocation can annotate the
     /// matching persisted tool card instead of creating an unclosable duplicate.
     recent_tool_calls: Arc<std::sync::Mutex<Vec<RecentToolCall>>>,
+    /// Cteno runtime-native DAG events identify a graph by `groupId`, while
+    /// the UI container is the parent `dispatch_task` tool call. Remember that
+    /// mapping for the lifetime of this turn so node events can nest correctly.
+    cteno_task_group_tools: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// True once a task_complete ACP record was persisted for this turn.
+    task_completed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) async fn surface_terminal_executor_error(
@@ -1121,7 +1683,176 @@ impl ExecutorNormalizer {
             stream_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             accumulated_thinking: Arc::new(std::sync::Mutex::new(String::new())),
             recent_tool_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cteno_task_group_tools: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            task_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    async fn handle_cteno_acp_native_event(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<Option<bool>, String> {
+        if payload.get("kind").and_then(serde_json::Value::as_str) != Some("acp") {
+            return Ok(None);
+        }
+        let delivery = payload
+            .get("delivery")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("persisted");
+        let data = payload
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let data = canonical_acp_data_for_ui(data);
+        if data.get("type").and_then(serde_json::Value::as_str) == Some("task_complete") {
+            self.task_completed.store(true, Ordering::Relaxed);
+        }
+        if data.get("type").and_then(serde_json::Value::as_str) == Some("context_usage") {
+            if let Some(total_tokens) = data.get("total_tokens").and_then(serde_json::Value::as_u64)
+            {
+                self.update_context_tokens_total(total_tokens);
+            }
+        }
+        self.observe_cteno_acp_data(&data).await?;
+        if is_cteno_task_graph_runtime_message(&data) {
+            return Ok(Some(false));
+        }
+        if data.get("type").and_then(serde_json::Value::as_str) == Some("native_event") {
+            return Ok(Some(false));
+        }
+        match delivery {
+            "transient" => {
+                if !self.stream_started.swap(true, Ordering::Relaxed) {
+                    self.emit_stream_callback(json!({ "type": "stream-start" }))
+                        .await;
+                }
+                let callback_payload = data.clone();
+                let (send_result, ()) = tokio::join!(
+                    self.send_transient(data),
+                    self.emit_stream_callback(callback_payload),
+                );
+                send_result?;
+            }
+            _ => {
+                self.send_persisted(data).await?;
+            }
+        }
+        Ok(Some(false))
+    }
+
+    async fn observe_cteno_acp_data(&self, data: &serde_json::Value) -> Result<(), String> {
+        if let Some((call_id, name, input)) = acp_tool_call_parts(data) {
+            self.remember_tool_call(&call_id, &name, &input);
+            let record = upsert_background_tool_record(
+                &self.session_id,
+                self.session_ref.vendor,
+                &call_id,
+                &name,
+                &input,
+                now_millis(),
+            );
+            self.sync_background_task_update(record).await;
+            return Ok(());
+        }
+
+        if let Some((call_id, output)) = acp_tool_result_parts(data) {
+            let recent_tool = self.find_tool_call(&call_id);
+            let keep_running_for_task_graph = recent_tool
+                .as_ref()
+                .map(|tool| is_cteno_dispatch_task_tool_name(&tool.name))
+                .unwrap_or(false)
+                && cteno_dispatch_group_id_from_output(&output).is_some();
+
+            if let Some(tool) = recent_tool.as_ref() {
+                if is_task_like_tool_name(&tool.name) {
+                    if let Some(acp_data) = task_result_sidechain_payload(&call_id, &output) {
+                        self.send_persisted(acp_data).await?;
+                    }
+                }
+                if is_cteno_dispatch_task_tool_name(&tool.name) {
+                    if let Some(group_id) = cteno_dispatch_group_id_from_output(&output) {
+                        self.remember_cteno_task_group(&group_id, &call_id);
+                    }
+                }
+            }
+
+            if !keep_running_for_task_graph {
+                let record = complete_background_tool_record(
+                    &self.session_id,
+                    &call_id,
+                    &output,
+                    now_millis(),
+                    recent_tool.as_ref(),
+                );
+                self.sync_background_task_update(record).await;
+            }
+            self.forget_tool_call(&call_id);
+            return Ok(());
+        }
+
+        if data.get("type").and_then(serde_json::Value::as_str) == Some("native_event") {
+            self.observe_cteno_task_graph_event(data).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn observe_cteno_task_graph_event(&self, data: &serde_json::Value) -> Result<(), String> {
+        let Some(kind) = data.get("kind").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        if !kind.starts_with("task_graph.") {
+            return Ok(());
+        }
+        let payload = data.get("payload").unwrap_or(&serde_json::Value::Null);
+        let Some(group_id) = payload
+            .get("groupId")
+            .or_else(|| payload.get("group_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        // Per-node task_graph.* events used to be re-rendered as sidechain
+        // messages inside the persona transcript. That duplicated each
+        // subagent's result text into the parent UI on top of the handoff
+        // that already feeds back to the persona ReAct loop as a user
+        // message. Per-node progress is now visible only via the
+        // BackgroundRunsModal (which queries the SubAgent registry
+        // independently). Only `task_graph.completed` is consumed here, to
+        // close out the BackgroundTaskStatus row for the dispatch_task call.
+
+        if kind == "task_graph.completed" {
+            let Some(parent_tool_use_id) = self.cteno_task_group_tool_call_id(group_id) else {
+                return Ok(());
+            };
+            let summary = payload
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let failed = summary
+                .as_deref()
+                .map(|value| value.contains("部分失败") || value.contains("[FAIL]"))
+                .unwrap_or(false);
+            let record = update_background_tool_record_status(
+                &self.session_id,
+                &parent_tool_use_id,
+                if failed {
+                    BackgroundTaskStatus::Failed
+                } else {
+                    BackgroundTaskStatus::Completed
+                },
+                Some(now_millis()),
+                summary,
+            );
+            self.sync_background_task_update(record).await;
+            self.forget_cteno_task_group(group_id);
+        }
+
+        Ok(())
     }
 
     fn update_context_tokens(&self, usage: &multi_agent_runtime_core::TokenUsage) {
@@ -1168,6 +1899,16 @@ impl ExecutorNormalizer {
         take_matching_recent_tool_call_id(&mut guard, tool_name, tool_input)
     }
 
+    fn find_tool_call(&self, call_id: &str) -> Option<RecentToolCall> {
+        let Ok(guard) = self.recent_tool_calls.lock() else {
+            return None;
+        };
+        guard
+            .iter()
+            .rfind(|entry| entry.call_id == call_id)
+            .cloned()
+    }
+
     fn forget_tool_call(&self, call_id: &str) {
         let Ok(mut guard) = self.recent_tool_calls.lock() else {
             return;
@@ -1175,6 +1916,27 @@ impl ExecutorNormalizer {
         if let Some(idx) = guard.iter().rposition(|entry| entry.call_id == call_id) {
             guard.remove(idx);
         }
+    }
+
+    fn remember_cteno_task_group(&self, group_id: &str, call_id: &str) {
+        let Ok(mut guard) = self.cteno_task_group_tools.lock() else {
+            return;
+        };
+        guard.insert(group_id.to_string(), call_id.to_string());
+    }
+
+    fn cteno_task_group_tool_call_id(&self, group_id: &str) -> Option<String> {
+        let Ok(guard) = self.cteno_task_group_tools.lock() else {
+            return None;
+        };
+        guard.get(group_id).cloned()
+    }
+
+    fn forget_cteno_task_group(&self, group_id: &str) {
+        let Ok(mut guard) = self.cteno_task_group_tools.lock() else {
+            return;
+        };
+        guard.remove(group_id);
     }
 
     fn append_thinking_delta(&self, content: &str) {
@@ -1204,6 +1966,35 @@ impl ExecutorNormalizer {
         };
 
         self.send_persisted(acp_thinking_payload(thinking)).await
+    }
+
+    async fn sync_background_task_update(&self, record: Option<BackgroundTaskRecord>) {
+        let Some(record) = record else {
+            return;
+        };
+
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            let task = match serde_json::to_value(&record) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    log::debug!(
+                        "[Normalizer {}] Failed to serialize background task update: {}",
+                        session_id,
+                        err
+                    );
+                    return;
+                }
+            };
+
+            cteno_host_runtime::events::emit(
+                cteno_host_runtime::events::HostEvent::BackgroundTaskUpdated {
+                    session_id: session_id.clone(),
+                    task,
+                },
+            )
+            .await;
+        });
     }
 
     /// Dispatch one event. Returns `Ok(true)` when the turn is finished
@@ -1271,6 +2062,15 @@ impl ExecutorNormalizer {
                 // partials via ToolCallInputDelta (claude). UI consumers
                 // already debounce partials.
                 self.remember_tool_call(&tool_use_id, &name, &input);
+                let record = upsert_background_tool_record(
+                    &self.session_id,
+                    &self.session_ref.vendor,
+                    &tool_use_id,
+                    &name,
+                    &input,
+                    now_millis(),
+                );
+                self.sync_background_task_update(record).await;
                 let acp_data = acp_tool_call_payload(tool_use_id, name, input);
                 self.send_persisted(acp_data).await?;
                 Ok(false)
@@ -1298,6 +2098,24 @@ impl ExecutorNormalizer {
                 // text-block array (`[{ type: "text", text: "..." }]`).
                 // The frontend normalizer flattens that array back to the
                 // reducer's tool.result value, so keep this shape stable.
+                let recent_tool = self.find_tool_call(&tool_use_id);
+                if recent_tool
+                    .as_ref()
+                    .map(|tool| is_task_like_tool_name(&tool.name))
+                    .unwrap_or(false)
+                {
+                    if let Some(acp_data) = task_result_sidechain_payload(&tool_use_id, &output) {
+                        self.send_persisted(acp_data).await?;
+                    }
+                }
+                let record = complete_background_tool_record(
+                    &self.session_id,
+                    &tool_use_id,
+                    &output,
+                    now_millis(),
+                    recent_tool.as_ref(),
+                );
+                self.sync_background_task_update(record).await;
                 self.forget_tool_call(&tool_use_id);
                 let acp_data = acp_tool_result_payload(tool_use_id, output);
                 self.send_persisted(acp_data).await?;
@@ -1363,8 +2181,8 @@ impl ExecutorNormalizer {
                 //      has somewhere to deliver the reply.
                 //   2. Publish the ACP `permission-request` + agent-state
                 //      update so the UI shows the approval card.
-                //   3. Spawn a detached task that awaits the reply (with a
-                //      120s timeout), calls `executor.respond_to_permission`,
+                //   3. Spawn a detached task that awaits the reply, calls
+                //      `executor.respond_to_permission`,
                 //      and closes the pending `agentState.completedRequests`
                 //      entry.
                 // Crucially, `process_event` returns immediately (Ok(false))
@@ -1438,13 +2256,8 @@ impl ExecutorNormalizer {
                     // adapter can echo it back verbatim.
                     let mut response_vendor_option: Option<String> = None;
 
-                    let result = match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(120),
-                        rx,
-                    )
-                    .await
-                    {
-                        Ok(Ok(response)) => {
+                    let result = match rx.await {
+                        Ok(response) => {
                             log::info!(
                                 "[Normalizer {}] Permission reply for {}: approved={} decision={:?} mode={:?} allow_tools={:?} vendor_option={:?}",
                                 normalizer_id,
@@ -1465,7 +2278,7 @@ impl ExecutorNormalizer {
                                 &tool_name_for_task,
                             )
                         }
-                        Ok(Err(_)) => {
+                        Err(_) => {
                             log::warn!(
                                 "[Normalizer {}] Permission channel closed for {}",
                                 normalizer_id,
@@ -1473,15 +2286,6 @@ impl ExecutorNormalizer {
                             );
                             response_reason = Some("Permission channel closed".to_string());
                             PermissionCheckResult::Denied("Permission channel closed".to_string())
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "[Normalizer {}] Permission timeout for {} → Deny",
-                                normalizer_id,
-                                request_id_for_task
-                            );
-                            response_reason = Some("Permission timeout (120s)".to_string());
-                            PermissionCheckResult::Denied("Permission timeout (120s)".to_string())
                         }
                     };
 
@@ -1606,8 +2410,10 @@ impl ExecutorNormalizer {
                     });
                     self.send_persisted(acp_data).await?;
                 }
-                self.send_persisted(acp_task_complete_payload(&self.task_id))
-                    .await?;
+                if !self.task_completed.swap(true, Ordering::Relaxed) {
+                    self.send_persisted(acp_task_complete_payload(&self.task_id))
+                        .await?;
+                }
                 self.emit_stream_callback(json!({ "type": "stream-end" }))
                     .await;
                 self.emit_stream_callback(json!({ "type": "finished" }))
@@ -1627,25 +2433,25 @@ impl ExecutorNormalizer {
                 );
                 let callback_message = message.clone();
                 let acp_data = acp_error_payload(message, recoverable);
-                // Always persist so the user sees the error as a chat bubble.
-                // Recoverable errors (e.g. "not logged in", transient network
-                // blip) used to go out as transient-only events that the user
-                // never noticed. Persisting them matches the principle that
-                // anything that ends a turn — or even meaningfully affects it
-                // — should be visible in chat history.
                 if !recoverable {
                     self.flush_accumulated_thinking().await?;
                 }
+                // Persist recoverable errors too: they may be the only user
+                // visible explanation for a stopped turn, and the frontend
+                // renders their retry guidance from the ACP error payload.
                 self.send_persisted(acp_data).await?;
                 self.emit_stream_callback(json!({
                     "type": "error",
                     "message": callback_message,
+                    "recoverable": recoverable,
                 }))
                 .await;
                 if !recoverable {
                     // Fatal: close the turn explicitly.
-                    self.send_persisted(acp_task_complete_payload(&self.task_id))
-                        .await?;
+                    if !self.task_completed.swap(true, Ordering::Relaxed) {
+                        self.send_persisted(acp_task_complete_payload(&self.task_id))
+                            .await?;
+                    }
                     self.emit_stream_callback(json!({ "type": "stream-end" }))
                         .await;
                     self.emit_stream_callback(json!({ "type": "finished" }))
@@ -1667,7 +2473,28 @@ impl ExecutorNormalizer {
                         .take(400)
                         .collect::<String>()
                 );
+                if provider.as_ref() == "cteno" {
+                    if let Some(done) = self.handle_cteno_acp_native_event(&payload).await? {
+                        return Ok(done);
+                    }
+                }
                 if provider.as_ref() == "codex" {
+                    if let Some(acp_data) = codex_update_plan_tool_call_payload(&payload) {
+                        if let Some((call_id, name, input)) = acp_tool_call_parts(&acp_data) {
+                            self.remember_tool_call(&call_id, &name, &input);
+                            let record = upsert_background_tool_record(
+                                &self.session_id,
+                                &self.session_ref.vendor,
+                                &call_id,
+                                &name,
+                                &input,
+                                now_millis(),
+                            );
+                            self.sync_background_task_update(record).await;
+                        }
+                        self.send_persisted(acp_data).await?;
+                        return Ok(false);
+                    }
                     if let Some(completion) = codex_guardian_completion(&payload) {
                         self.permission_handler
                             .complete_permission_request(
@@ -1687,7 +2514,18 @@ impl ExecutorNormalizer {
                     }
                 }
                 if let Some(acp_data) = native_event_error_payload(provider.as_ref(), &payload) {
-                    self.send_transient(acp_data).await?;
+                    self.send_persisted(acp_data).await?;
+                }
+                if matches!(provider.as_ref(), "claude" | "codex" | "gemini" | "cteno") {
+                    if let Some(acp_data) = sidechain_text_payload(&payload) {
+                        self.send_persisted(acp_data).await?;
+                    }
+                    if let Some(acp_data) = sidechain_tool_call_payload(&payload) {
+                        self.send_persisted(acp_data).await?;
+                    }
+                    if let Some(acp_data) = sidechain_tool_result_payload(&payload) {
+                        self.send_persisted(acp_data).await?;
+                    }
                 }
                 if provider.as_ref() == "claude" {
                     if let Some(acp_data) = claude_task_started_payload(&payload) {
@@ -1759,41 +2597,9 @@ impl ExecutorNormalizer {
     }
 
     async fn sync_claude_background_task(&self, payload: &serde_json::Value) {
-        let Some(record) =
-            update_claude_background_task_registry(&self.session_id, payload, now_millis())
-        else {
-            return;
-        };
-
-        let Some(socket) = runtime_hooks::machine_socket() else {
-            return;
-        };
-
-        let session_id = self.session_id.clone();
-        tokio::spawn(async move {
-            let payload = match serde_json::to_value(&record) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    log::debug!(
-                        "[Normalizer {}] Failed to serialize background task update: {}",
-                        session_id,
-                        err
-                    );
-                    return;
-                }
-            };
-
-            if let Err(err) = socket
-                .push_to_frontend("background-task-update", payload)
-                .await
-            {
-                log::debug!(
-                    "[Normalizer {}] Failed to emit background-task-update: {}",
-                    session_id,
-                    err
-                );
-            }
-        });
+        let record =
+            update_claude_background_task_registry(&self.session_id, payload, now_millis());
+        self.sync_background_task_update(record).await;
     }
 
     async fn emit_stream_callback(&self, delta_json: serde_json::Value) {
@@ -1852,6 +2658,31 @@ impl ExecutorNormalizer {
             text,
             local_id,
         )
+    }
+}
+
+fn canonical_acp_data_for_ui(data: serde_json::Value) -> serde_json::Value {
+    if data.get("type").and_then(serde_json::Value::as_str) != Some("tool-call") {
+        return data;
+    }
+    let Some(name) = data
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return data;
+    };
+    let Some(input) = data.get("input").cloned() else {
+        return data;
+    };
+
+    let input = canonical_tool_input_for_ui(&name, input);
+    match data {
+        serde_json::Value::Object(mut map) => {
+            map.insert("input".to_string(), input);
+            serde_json::Value::Object(map)
+        }
+        other => other,
     }
 }
 
@@ -1940,6 +2771,57 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn update_plan_inputs_are_canonicalized_to_todos() {
+        let payload = acp_tool_call_payload(
+            "call-plan",
+            "update_plan",
+            json!({
+                "plan": [
+                    { "step": "确认 raw plan 会进入动态 todo", "status": "completed" },
+                    { "step": "渲染在输入框上方", "status": "in_progress" },
+                    { "step": "不要回退成消息卡片", "status": "queued" }
+                ]
+            }),
+        );
+
+        assert_eq!(payload["name"], "update_plan");
+        assert_eq!(
+            payload["input"]["todos"][0]["content"],
+            "确认 raw plan 会进入动态 todo"
+        );
+        assert_eq!(payload["input"]["todos"][0]["status"], "completed");
+        assert_eq!(payload["input"]["todos"][1]["content"], "渲染在输入框上方");
+        assert_eq!(payload["input"]["todos"][1]["status"], "in_progress");
+        assert_eq!(
+            payload["input"]["todos"][2]["content"],
+            "不要回退成消息卡片"
+        );
+        assert_eq!(payload["input"]["todos"][2]["status"], "pending");
+    }
+
+    #[test]
+    fn codex_raw_update_plan_function_call_maps_to_tool_call() {
+        let payload = codex_update_plan_tool_call_payload(&json!({
+            "method": "rawResponseItem/completed",
+            "params": {
+                "item": {
+                    "type": "function_call",
+                    "name": "update_plan",
+                    "call_id": "call-update-plan",
+                    "arguments": "{\"plan\":[{\"step\":\"准备一个待办清单\",\"status\":\"in_progress\"}]}"
+                }
+            }
+        }))
+        .expect("codex update_plan function call should map");
+
+        assert_eq!(payload["type"], "tool-call");
+        assert_eq!(payload["callId"], "call-update-plan");
+        assert_eq!(payload["name"], "update_plan");
+        assert_eq!(payload["input"]["todos"][0]["content"], "准备一个待办清单");
+        assert_eq!(payload["input"]["todos"][0]["status"], "in_progress");
+    }
+
     #[derive(Default)]
     struct RecordingLocalSink {
         persisted: Mutex<Vec<String>>,
@@ -1949,6 +2831,15 @@ mod tests {
     impl RecordingLocalSink {
         fn persisted_messages(&self) -> Vec<Value> {
             self.persisted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|raw| serde_json::from_str(raw).unwrap())
+                .collect()
+        }
+
+        fn transient_messages(&self) -> Vec<Value> {
+            self.transient
                 .lock()
                 .unwrap()
                 .iter()
@@ -2000,6 +2891,7 @@ mod tests {
                 supports_injected_tools: false,
                 supports_permission_closure: false,
                 supports_interrupt: false,
+                autonomous_turn: false,
             }
         }
 
@@ -2008,7 +2900,7 @@ mod tests {
             _spec: SpawnSessionSpec,
         ) -> Result<SessionRef, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "spawn_session",
+                capability: "spawn_session".to_string(),
             })
         }
 
@@ -2018,7 +2910,7 @@ mod tests {
             _hints: ResumeHints,
         ) -> Result<SessionRef, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "resume_session",
+                capability: "resume_session".to_string(),
             })
         }
 
@@ -2037,13 +2929,13 @@ mod tests {
             _decision: PermissionDecision,
         ) -> Result<(), AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "respond_to_permission",
+                capability: "respond_to_permission".to_string(),
             })
         }
 
         async fn interrupt(&self, _session: &SessionRef) -> Result<(), AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "interrupt",
+                capability: "interrupt".to_string(),
             })
         }
 
@@ -2057,7 +2949,7 @@ mod tests {
             _mode: PermissionMode,
         ) -> Result<(), AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "set_permission_mode",
+                capability: "set_permission_mode".to_string(),
             })
         }
 
@@ -2067,7 +2959,7 @@ mod tests {
             _model: ModelSpec,
         ) -> Result<ModelChangeOutcome, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "set_model",
+                capability: "set_model".to_string(),
             })
         }
 
@@ -2083,7 +2975,7 @@ mod tests {
             _session_id: &NativeSessionId,
         ) -> Result<SessionInfo, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "get_session_info",
+                capability: "get_session_info".to_string(),
             })
         }
 
@@ -2629,6 +3521,97 @@ mod tests {
     }
 
     #[test]
+    fn task_and_shell_tool_calls_map_to_background_records() {
+        let task_record = background_task_started_record_for_tool(
+            "session-under-test",
+            "codex",
+            "toolu_task",
+            "Task",
+            &json!({
+                "taskId": "task-123",
+                "prompt": "Inspect repo",
+                "taskType": "spawnAgent",
+            }),
+            1234,
+        )
+        .expect("Task should be tracked as background work");
+        assert_eq!(task_record.task_id, "task-123");
+        assert_eq!(task_record.vendor, "codex");
+        assert_eq!(task_record.task_type, "spawnAgent");
+        assert_eq!(task_record.description.as_deref(), Some("Inspect repo"));
+        assert_eq!(task_record.tool_use_id.as_deref(), Some("toolu_task"));
+
+        let shell_record = background_task_started_record_for_tool(
+            "session-under-test",
+            "gemini",
+            "toolu_shell",
+            "Bash",
+            &json!({ "command": "sleep 30" }),
+            5678,
+        )
+        .expect("shell tool should be tracked as background work");
+        assert_eq!(shell_record.task_id, "toolu_shell");
+        assert_eq!(shell_record.vendor, "gemini");
+        assert_eq!(shell_record.task_type, "Bash");
+        assert_eq!(shell_record.description.as_deref(), Some("sleep 30"));
+    }
+
+    #[test]
+    fn task_tool_result_maps_to_sidechain_text() {
+        let payload = task_result_sidechain_payload(
+            "toolu_task",
+            &Ok("subagent completed with notes".to_string()),
+        )
+        .expect("non-empty task result should map to sidechain text");
+
+        assert_eq!(payload["type"], "message");
+        assert_eq!(payload["message"], "subagent completed with notes");
+        assert_eq!(payload["isSidechain"], true);
+        assert_eq!(payload["parentToolUseId"], "toolu_task");
+    }
+
+    #[test]
+    fn cteno_dispatch_task_is_background_tracked_without_task_result_sidechain() {
+        let record = background_task_started_record_for_tool(
+            "session-under-test",
+            "cteno",
+            "cteno_dispatch_1",
+            "dispatch_task",
+            &json!({ "task": "run child worker" }),
+            1234,
+        )
+        .expect("dispatch_task should be tracked as background work");
+
+        assert_eq!(record.vendor, "cteno");
+        assert_eq!(record.task_id, "cteno_dispatch_1");
+        assert_eq!(record.description.as_deref(), Some("run child worker"));
+        assert!(is_cteno_dispatch_task_tool_name("dispatch_task"));
+        assert!(!is_task_like_tool_name("dispatch_task"));
+    }
+
+    #[test]
+    fn cteno_task_graph_runtime_messages_are_not_persisted_as_bare_chat() {
+        assert!(is_cteno_task_graph_runtime_message(&json!({
+            "type": "message",
+            "message": "[Task Group Complete] 全部完成\n\n- [OK] task_a",
+            "isSidechain": true,
+            "source": "subagent",
+        })));
+        assert!(is_cteno_task_graph_runtime_message(&json!({
+            "type": "message",
+            "message": "[Task Complete] task_a\n\n测试成功 A",
+            "isSidechain": true,
+            "source": "subagent",
+        })));
+        assert!(!is_cteno_task_graph_runtime_message(&json!({
+            "type": "message",
+            "message": "ordinary assistant text",
+            "isSidechain": true,
+            "source": "subagent",
+        })));
+    }
+
+    #[test]
     fn claude_task_progress_maps_to_task_tool_update() {
         let tool_call_delta = claude_task_progress_delta_payload(&json!({
             "kind": "task_progress",
@@ -2803,5 +3786,191 @@ mod tests {
         assert_eq!(persisted[0]["content"]["data"]["recoverable"], false);
         assert_eq!(persisted[1]["content"]["data"]["type"], "task_complete");
         assert_eq!(persisted[1]["content"]["data"]["id"], task_id);
+    }
+
+    #[tokio::test]
+    async fn recoverable_executor_errors_are_visible_and_wait_for_turn_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cteno.db");
+        init_agent_sessions_table(&db_path);
+
+        let session_id = "session-recoverable-error".to_string();
+        let task_id = "task-recoverable-error".to_string();
+        let sink = Arc::new(RecordingLocalSink::default());
+        let socket = Arc::new(HappySocket::local(ConnectionType::SessionScoped {
+            session_id: session_id.clone(),
+        }));
+        socket.install_local_sink(sink.clone());
+
+        let normalizer = ExecutorNormalizer::new(
+            session_id.clone(),
+            socket,
+            SessionMessageCodec::plaintext(),
+            None,
+            Arc::new(PermissionHandler::new(session_id.clone(), 0)),
+            task_id,
+            Arc::new(NoopExecutor),
+            SessionRef {
+                id: NativeSessionId::new("native-session"),
+                vendor: "cteno",
+                process_handle: multi_agent_runtime_core::ProcessHandleToken::new(),
+                spawned_at: chrono::Utc::now(),
+                workdir: temp.path().to_path_buf(),
+            },
+            "http://127.0.0.1:1".to_string(),
+            "local-test".to_string(),
+            db_path,
+            None,
+            None,
+        );
+
+        let done = normalizer
+            .process_event(ExecutorEvent::Error {
+                message: "cteno-agent response timed out after 600s. The turn was stopped so you can retry.".to_string(),
+                recoverable: true,
+            })
+            .await
+            .expect("recoverable error should normalize");
+        assert!(
+            !done,
+            "recoverable error should wait for the turn terminator"
+        );
+
+        let persisted = sink.persisted_messages();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0]["content"]["data"]["type"], "error");
+        assert_eq!(persisted[0]["content"]["data"]["recoverable"], true);
+        assert_eq!(
+            persisted[0]["content"]["data"]["message"],
+            "cteno-agent response timed out after 600s. The turn was stopped so you can retry."
+        );
+
+        assert!(
+            sink.transient_messages().is_empty(),
+            "recoverable errors are persisted as chat-visible retry notices"
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_native_errors_are_visible_retry_notices() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cteno.db");
+        init_agent_sessions_table(&db_path);
+
+        let session_id = "session-native-recoverable-error".to_string();
+        let task_id = "task-native-recoverable-error".to_string();
+        let sink = Arc::new(RecordingLocalSink::default());
+        let socket = Arc::new(HappySocket::local(ConnectionType::SessionScoped {
+            session_id: session_id.clone(),
+        }));
+        socket.install_local_sink(sink.clone());
+
+        let normalizer = ExecutorNormalizer::new(
+            session_id.clone(),
+            socket,
+            SessionMessageCodec::plaintext(),
+            None,
+            Arc::new(PermissionHandler::new(session_id.clone(), 0)),
+            task_id,
+            Arc::new(NoopExecutor),
+            SessionRef {
+                id: NativeSessionId::new("native-session"),
+                vendor: "claude",
+                process_handle: multi_agent_runtime_core::ProcessHandleToken::new(),
+                spawned_at: chrono::Utc::now(),
+                workdir: temp.path().to_path_buf(),
+            },
+            "http://127.0.0.1:1".to_string(),
+            "local-test".to_string(),
+            db_path,
+            None,
+            None,
+        );
+
+        let done = normalizer
+            .process_event(ExecutorEvent::NativeEvent {
+                provider: "claude".into(),
+                payload: json!({ "kind": "rate_limit_event" }),
+            })
+            .await
+            .expect("recoverable native error should normalize");
+        assert!(!done, "native retry notices do not terminate the turn");
+
+        let persisted = sink.persisted_messages();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0]["content"]["data"]["type"], "error");
+        assert_eq!(persisted[0]["content"]["data"]["recoverable"], true);
+        assert_eq!(
+            persisted[0]["content"]["data"]["message"],
+            "Claude API rate limit reached. Retrying automatically."
+        );
+        assert!(
+            sink.transient_messages().is_empty(),
+            "recoverable native errors should survive refresh/reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn cteno_acp_native_events_are_control_only_not_raw_chat_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cteno.db");
+        init_agent_sessions_table(&db_path);
+
+        let session_id = "cteno-native-event-control-only".to_string();
+        let sink = Arc::new(RecordingLocalSink::default());
+        let socket = Arc::new(HappySocket::local(ConnectionType::SessionScoped {
+            session_id: session_id.clone(),
+        }));
+        socket.install_local_sink(sink.clone());
+
+        let normalizer = ExecutorNormalizer::new(
+            session_id.clone(),
+            socket,
+            SessionMessageCodec::plaintext(),
+            None,
+            Arc::new(PermissionHandler::new(session_id.clone(), 0)),
+            "task-native-event".to_string(),
+            Arc::new(NoopExecutor),
+            SessionRef {
+                id: NativeSessionId::new("native-session"),
+                vendor: "cteno",
+                process_handle: multi_agent_runtime_core::ProcessHandleToken::new(),
+                spawned_at: chrono::Utc::now(),
+                workdir: temp.path().to_path_buf(),
+            },
+            "http://127.0.0.1:1".to_string(),
+            "local-test".to_string(),
+            db_path,
+            None,
+            None,
+        );
+
+        let done = normalizer
+            .process_event(ExecutorEvent::NativeEvent {
+                provider: "cteno".into(),
+                payload: json!({
+                    "kind": "acp",
+                    "delivery": "persisted",
+                    "data": {
+                        "type": "native_event",
+                        "kind": "task_graph.node_completed",
+                        "payload": {
+                            "groupId": "group-without-visible-parent",
+                            "taskId": "task",
+                            "result": "测试成功"
+                        },
+                        "id": "event-1"
+                    }
+                }),
+            })
+            .await
+            .expect("cteno native event should normalize as a control event");
+
+        assert!(!done);
+        assert!(
+            sink.persisted_messages().is_empty(),
+            "raw native_event ACP envelopes must not appear as chat messages"
+        );
+        assert!(sink.transient_messages().is_empty());
     }
 }

@@ -27,6 +27,7 @@ import { ModalProvider } from '@/modal';
 import { PostHogProvider } from 'posthog-react-native';
 import { tracking } from '@/track/tracking';
 import { syncInitLocalMode, syncRestore } from '@/sync/sync';
+import { isCloudSyncEnabled } from '@/config/capabilities';
 import '@/utils/debugEncryption'; // 加载调试工具
 import { useTrackScreens } from '@/track/useTrackScreens';
 import { RealtimeProvider } from '@/realtime/RealtimeProvider';
@@ -313,12 +314,13 @@ export default function RootLayout() {
                 await loadFonts();
                 await sodium.ready;
                 const credentials = await TokenStorage.getCredentials();
-                const localMode = !credentials && isDesktopLocalModeEnabled();
+                const cloudSync = isCloudSyncEnabled();
+                const localMode = isDesktopLocalModeEnabled() && (!credentials || !cloudSync);
                 console.log('credentials', credentials);
-                if (credentials) {
+                if (credentials && cloudSync) {
                     await syncRestore(credentials);
                 } else if (localMode) {
-                    await syncInitLocalMode();
+                    await syncInitLocalMode(credentials);
                 }
 
                 setInitState({ credentials, localMode });
@@ -345,7 +347,7 @@ export default function RootLayout() {
     //
 
     if (!initState) {
-        if (!hasStoredCredentials && isDesktopLocalModeEnabled()) {
+        if (isDesktopLocalModeEnabled() && (!hasStoredCredentials || !isCloudSyncEnabled())) {
             return <AnonymousAuthBoot />;
         }
         return null;

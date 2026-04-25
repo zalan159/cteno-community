@@ -99,6 +99,7 @@ impl SubAgentManager {
             label.clone(),
             cleanup.clone(),
         );
+        let created_at_ms = subagent.created_at;
 
         // Store in memory
         self.subagents.write().await.insert(id.clone(), subagent);
@@ -110,12 +111,34 @@ impl SubAgentManager {
             agent_id
         );
 
+        // Best-effort lifecycle emission to the host (mirror sink).
+        // Skipped silently if no emitter is installed (tests / library use).
+        if let Some(emitter) = crate::hooks::subagent_lifecycle_emitter() {
+            emitter.emit(
+                &parent_session_id,
+                crate::hooks::SubAgentLifecycleEventDto::Spawned {
+                    subagent_id: id.clone(),
+                    agent_id: agent_id.clone(),
+                    task: task.clone(),
+                    label: label.clone(),
+                    created_at_ms,
+                },
+            );
+        }
+
         // Execute in background
         let manager = self.clone();
         let id_for_spawn = id.clone();
+        let parent_for_lifecycle = parent_session_id.clone();
         tokio::spawn(async move {
             manager
-                .execute_in_background(id_for_spawn, agent_config, task, exec_ctx)
+                .execute_in_background(
+                    id_for_spawn,
+                    parent_for_lifecycle,
+                    agent_config,
+                    task,
+                    exec_ctx,
+                )
                 .await;
         });
 
@@ -126,6 +149,7 @@ impl SubAgentManager {
     async fn execute_in_background(
         &self,
         id: String,
+        parent_session_id: String,
         agent_config: AgentConfig,
         task: String,
         exec_ctx: SubAgentContext,
@@ -136,15 +160,30 @@ impl SubAgentManager {
         self.update_field(&id, |sa| sa.started_at = Some(started_at))
             .await;
 
+        if let Some(emitter) = crate::hooks::subagent_lifecycle_emitter() {
+            emitter.emit(
+                &parent_session_id,
+                crate::hooks::SubAgentLifecycleEventDto::Started {
+                    subagent_id: id.clone(),
+                    started_at_ms: started_at,
+                },
+            );
+        }
+
         log::info!("[SubAgentManager] Starting execution of SubAgent '{}'", id);
 
-        // Execute the SubAgent (reuse existing executor)
+        // Execute the SubAgent (reuse existing executor). Pass the
+        // SubAgent record id as the session id override so the agent
+        // session row in `agent_sessions` shares the SubAgent's id —
+        // clicking the entry in BackgroundRunsModal then navigates to
+        // `/session/{subagent.id}` and finds its transcript.
         let result = crate::agent::executor::execute_sub_agent(
             &agent_config,
             &task,
             None, // context
             &exec_ctx,
             0, // depth = 0 (top-level, SubAgent is not a recursive call)
+            Some(id.clone()),
         )
         .await;
 
@@ -153,6 +192,35 @@ impl SubAgentManager {
         // Update result
         match result {
             Ok(response) => {
+                if is_agent_abort_response(&response) {
+                    log::warn!(
+                        "[SubAgentManager] SubAgent '{}' aborted by user; treating as failed",
+                        id
+                    );
+
+                    self.update_field(&id, |sa| {
+                        sa.status = SubAgentStatus::Failed;
+                        sa.error = Some(response.clone());
+                        sa.completed_at = Some(completed_at);
+                    })
+                    .await;
+
+                    if let Some(emitter) = crate::hooks::subagent_lifecycle_emitter() {
+                        emitter.emit(
+                            &parent_session_id,
+                            crate::hooks::SubAgentLifecycleEventDto::Failed {
+                                subagent_id: id.clone(),
+                                error: response.clone(),
+                                completed_at_ms: completed_at,
+                            },
+                        );
+                    }
+
+                    self.notify_parent(&id, SubAgentStatus::Failed, None, Some(response))
+                        .await;
+                    return;
+                }
+
                 log::info!(
                     "[SubAgentManager] SubAgent '{}' completed successfully, response length: {}",
                     id,
@@ -165,6 +233,17 @@ impl SubAgentManager {
                     sa.completed_at = Some(completed_at);
                 })
                 .await;
+
+                if let Some(emitter) = crate::hooks::subagent_lifecycle_emitter() {
+                    emitter.emit(
+                        &parent_session_id,
+                        crate::hooks::SubAgentLifecycleEventDto::Completed {
+                            subagent_id: id.clone(),
+                            result: Some(response.clone()),
+                            completed_at_ms: completed_at,
+                        },
+                    );
+                }
 
                 // Send notification
                 self.notify_parent(&id, SubAgentStatus::Completed, Some(response), None)
@@ -179,6 +258,17 @@ impl SubAgentManager {
                     sa.completed_at = Some(completed_at);
                 })
                 .await;
+
+                if let Some(emitter) = crate::hooks::subagent_lifecycle_emitter() {
+                    emitter.emit(
+                        &parent_session_id,
+                        crate::hooks::SubAgentLifecycleEventDto::Failed {
+                            subagent_id: id.clone(),
+                            error: e.clone(),
+                            completed_at_ms: completed_at,
+                        },
+                    );
+                }
 
                 self.notify_parent(&id, SubAgentStatus::Failed, None, Some(e))
                     .await;
@@ -229,9 +319,15 @@ impl SubAgentManager {
             subagent_id
         );
 
-        // Push-based delivery: send through registered session channel
-        let message = notification.to_message();
-        {
+        let graph_owned = crate::task_graph::manager::is_task_graph_subagent(subagent_id).await;
+        if graph_owned {
+            log::info!(
+                "[SubAgentManager] SubAgent '{}' is owned by a TaskGraph; suppressing generic parent notification",
+                subagent_id
+            );
+        } else {
+            // Push-based delivery: send through registered session channel.
+            let message = notification.to_message();
             let senders = self.session_senders.read().await;
             if let Some(sender) = senders.get(&parent_sid) {
                 match sender.send(message) {
@@ -262,7 +358,12 @@ impl SubAgentManager {
         queue
             .entry(parent_sid)
             .or_insert_with(Vec::new)
-            .push(notification);
+            .push(notification.clone());
+
+        // Runtime-owned DAGs advance from SubAgent completion here. This is
+        // queued instead of awaited to avoid tying the SubAgent executor's
+        // Send-ness to downstream graph scheduling.
+        crate::task_graph::manager::observe_subagent_complete(notification);
     }
 
     /// Send a message to a registered session's notification channel.
@@ -329,11 +430,22 @@ impl SubAgentManager {
         // For now, just update status
         log::info!("[SubAgentManager] Stopping SubAgent '{}'", id);
 
+        let completed_at = Utc::now().timestamp_millis();
         self.update_status(id, SubAgentStatus::Stopped).await;
         self.update_field(id, |sa| {
-            sa.completed_at = Some(Utc::now().timestamp_millis());
+            sa.completed_at = Some(completed_at);
         })
         .await;
+
+        if let Some(emitter) = crate::hooks::subagent_lifecycle_emitter() {
+            emitter.emit(
+                &subagent.parent_session_id,
+                crate::hooks::SubAgentLifecycleEventDto::Stopped {
+                    subagent_id: id.to_string(),
+                    completed_at_ms: completed_at,
+                },
+            );
+        }
 
         Ok(())
     }
@@ -393,6 +505,13 @@ impl Default for SubAgentManager {
     }
 }
 
+fn is_agent_abort_response(response: &str) -> bool {
+    matches!(
+        response.trim(),
+        "Agent execution was aborted by user." | "Agent execution aborted by user"
+    )
+}
+
 /// SubAgent statistics
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SubAgentStats {
@@ -408,6 +527,17 @@ pub struct SubAgentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_abort_response_is_failed_subagent_signal() {
+        assert!(is_agent_abort_response(
+            "Agent execution was aborted by user."
+        ));
+        assert!(is_agent_abort_response("Agent execution aborted by user"));
+        assert!(!is_agent_abort_response(
+            "The child task reported that another agent execution was aborted by user."
+        ));
+    }
 
     #[tokio::test]
     async fn test_manager_create() {

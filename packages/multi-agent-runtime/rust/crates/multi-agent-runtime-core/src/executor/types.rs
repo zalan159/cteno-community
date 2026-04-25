@@ -505,6 +505,11 @@ pub struct Attachment {
 pub struct UserMessage {
     /// Primary text content of the message.
     pub content: String,
+    /// Optional host task id for this turn. Vendors that can emit native ACP
+    /// lifecycle records may use this to close the exact task started by the
+    /// host UI.
+    #[serde(default)]
+    pub task_id: Option<String>,
     /// Optional attachments (images, files, etc.).
     #[serde(default)]
     pub attachments: Vec<Attachment>,

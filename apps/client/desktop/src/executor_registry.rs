@@ -129,8 +129,13 @@ impl ExecutorRegistry {
     /// Returns `Err` only when the Cteno executor cannot be constructed
     /// (missing cteno-agent binary); missing claude/codex/gemini CLIs are
     /// tolerated by storing `None`.
-    pub fn build(session_store: Arc<dyn SessionStoreProvider>) -> Result<Self, String> {
-        Self::build_with_supervisor(session_store, None)
+    ///
+    /// `async` because `set_autonomous_turn_handler` is registered on the
+    /// cteno executor during construction (the call is fast — the handler
+    /// is just slotted into an `Arc<Mutex<Option<...>>>` on the executor —
+    /// but the trait method is `async` so `build` must be too).
+    pub async fn build(session_store: Arc<dyn SessionStoreProvider>) -> Result<Self, String> {
+        Self::build_with_supervisor(session_store, None).await
     }
 
     /// Variant of [`build`] that wires a `SubprocessSupervisor` into the
@@ -138,7 +143,7 @@ impl ExecutorRegistry {
     /// pid file. Claude / Codex / Gemini adapters do not currently take a
     /// supervisor (their subprocess spawning lives inside their own crates
     /// and will be wired in a future commit).
-    pub fn build_with_supervisor(
+    pub async fn build_with_supervisor(
         session_store: Arc<dyn SessionStoreProvider>,
         supervisor: Option<Arc<SubprocessSupervisor>>,
     ) -> Result<Self, String> {
@@ -147,14 +152,107 @@ impl ExecutorRegistry {
             "ExecutorRegistry: cteno-agent binary = {}",
             cteno_path.display()
         );
+        // The legacy `BackgroundAcpSink` workaround that injected subagent
+        // text back into the persona session via `send_initial_user_message`
+        // is no longer wired. It conflated "agent self-initiated turn" with
+        // "host-driven user input" — making turn boundaries fuzzy and
+        // dependending on host-side REPL emulation. The replacement path
+        // (set_autonomous_turn_handler below) keeps wake decisions inside
+        // the agent process: cteno-agent emits an explicit
+        // `Outbound::AutonomousTurnStart` frame; the cteno adapter's
+        // session-level dispatcher hands the resulting `EventStream` to
+        // this handler; the handler spawns a fresh normalizer keyed by the
+        // session id. No socket relay, no queue push, no synthetic user
+        // message.
         let cteno_exec =
             multi_agent_runtime_cteno::CtenoAgentExecutor::new(cteno_path, session_store.clone());
         let cteno_exec = match supervisor.clone() {
             Some(sup) => cteno_exec.with_supervisor(sup),
             None => cteno_exec,
         };
+        // Hook the global LocalSink (which also implements
+        // `SessionEventSink`) so subagent lifecycle frames flow into the
+        // process-local SubAgent registry mirror. If the sink isn't yet
+        // installed (early boot / tests), skip — `BackgroundRunsModal`
+        // simply won't see live subagent state until it is.
+        let cteno_exec = if let Some(sink) = crate::happy_client::local_sink::global() {
+            let sink_arc: multi_agent_runtime_cteno::SessionEventSinkArc = sink.clone();
+            // Background ACP sink — receives subagent ACP frames whose
+            // session_id is not registered with the connection's per-session
+            // router (i.e. the subagent's *own* session_id, stamped by
+            // `acp_sender_factory` in cteno-agent-stdio). Each such frame is
+            // appended to the desktop's `agent_sessions` row for that
+            // subagent_id (pre-created on the Spawned lifecycle), so
+            // navigating to `/session/{subagent.id}` in the UI surfaces the
+            // subagent's full transcript.
+            let bg_sink_for_subagent_acp: multi_agent_runtime_cteno::BackgroundAcpSink = {
+                let sink_for_bg = sink.clone();
+                Arc::new(move |session_id: String, acp_data: serde_json::Value| {
+                    sink_for_bg.append_subagent_acp(&session_id, acp_data);
+                })
+            };
+            cteno_exec
+                .with_session_event_sink(sink_arc)
+                .await
+                .with_background_acp_sink(bg_sink_for_subagent_acp)
+        } else {
+            log::warn!(
+                "ExecutorRegistry: LocalSink not installed before cteno executor build — subagent lifecycle events will be dropped"
+            );
+            cteno_exec
+        };
         let cteno_concrete = Arc::new(cteno_exec);
         let cteno: Arc<dyn AgentExecutor> = cteno_concrete.clone();
+
+        // Register the autonomous-turn handler. Each invocation receives
+        // (session_id, EventStream) for one autonomous turn; we look up the
+        // corresponding session connection and let it spawn a consumer task
+        // that feeds the stream into a freshly-built normalizer (mirrors
+        // what user-driven turns do via `run_executor_turn`).
+        let cteno_autonomous_handler: multi_agent_runtime_core::AutonomousTurnHandler =
+            Arc::new(|session_id: String, synthetic_user_message, stream| {
+                tokio::spawn(async move {
+                    let spawn_config = match crate::local_services::spawn_config() {
+                        Ok(config) => config,
+                        Err(e) => {
+                            log::warn!(
+                                "[Session {}] Autonomous turn arrived but spawn_config unavailable: {}",
+                                session_id,
+                                e
+                            );
+                            return;
+                        }
+                    };
+                    let conn = if let Some(conn) =
+                        spawn_config.session_connections.get(&session_id).await
+                    {
+                        conn
+                    } else if let Some((_, conn)) = spawn_config
+                        .session_connections
+                        .get_by_executor_session_id(&session_id)
+                        .await
+                    {
+                        conn
+                    } else {
+                        log::warn!(
+                            "[Session {}] Autonomous turn dropped: no matching session connection",
+                            session_id
+                        );
+                        return;
+                    };
+                    conn.message_handle()
+                        .spawn_autonomous_turn_consumer(synthetic_user_message, stream);
+                });
+            });
+        if let Err(e) = cteno_concrete
+            .set_autonomous_turn_handler(Some(cteno_autonomous_handler))
+            .await
+        {
+            log::warn!(
+                "ExecutorRegistry: cteno set_autonomous_turn_handler failed: {}",
+                e
+            );
+        }
 
         let claude = match resolve_claude_path() {
             Some(path) => {
@@ -834,6 +932,15 @@ fn resolve_vendor_cli_path(env_var: &str, binary_name: &str) -> Option<PathBuf> 
     which::which(binary_name).ok()
 }
 
+fn macos_codex_app_cli_path() -> Option<PathBuf> {
+    let path = PathBuf::from("/Applications/Codex.app/Contents/Resources/codex");
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Locate the `cteno-agent` sidecar binary. Falls back to `CTENO_AGENT_PATH`,
 /// then PATH `which`, then a sibling of the current executable.
 fn resolve_cteno_agent_path() -> Result<PathBuf, String> {
@@ -906,8 +1013,19 @@ fn resolve_claude_path() -> Option<PathBuf> {
 }
 
 /// Locate the `codex` CLI binary, respecting `CODEX_PATH`.
-fn resolve_codex_path() -> Option<PathBuf> {
-    resolve_vendor_cli_path("CODEX_PATH", "codex")
+///
+/// On macOS the Codex desktop app may ship a newer app-server than the npm
+/// shim in `/opt/homebrew/bin`. Prefer that bundled binary when no explicit
+/// override is set so ACP model discovery and execution use the same fresh
+/// capability surface the user sees in the Codex app.
+pub(crate) fn resolve_codex_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CODEX_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    macos_codex_app_cli_path().or_else(|| which::which("codex").ok())
 }
 
 /// Locate the `gemini` CLI binary, respecting `GEMINI_PATH`.
@@ -981,6 +1099,7 @@ mod tests {
                 supports_injected_tools: false,
                 supports_permission_closure: false,
                 supports_interrupt: false,
+                autonomous_turn: false,
             }
         }
 
@@ -989,7 +1108,7 @@ mod tests {
             _spec: SpawnSessionSpec,
         ) -> Result<SessionRef, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "spawn_session",
+                capability: "spawn_session".to_string(),
             })
         }
         async fn resume_session(
@@ -998,7 +1117,7 @@ mod tests {
             _hints: ResumeHints,
         ) -> Result<SessionRef, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "resume_session",
+                capability: "resume_session".to_string(),
             })
         }
         async fn send_message(
@@ -1049,7 +1168,7 @@ mod tests {
             _session_id: &NativeSessionId,
         ) -> Result<SessionInfo, AgentExecutorError> {
             Err(AgentExecutorError::Unsupported {
-                capability: "get_session_info",
+                capability: "get_session_info".to_string(),
             })
         }
         async fn get_session_messages(
@@ -1331,6 +1450,7 @@ mod tests {
                     supports_injected_tools: false,
                     supports_permission_closure: false,
                     supports_interrupt: false,
+                autonomous_turn: false,
                 }
             }
             async fn spawn_session(
@@ -1338,7 +1458,7 @@ mod tests {
                 _spec: SpawnSessionSpec,
             ) -> Result<SessionRef, AgentExecutorError> {
                 Err(AgentExecutorError::Unsupported {
-                    capability: "spawn_session",
+                    capability: "spawn_session".to_string(),
                 })
             }
             async fn resume_session(
@@ -1347,7 +1467,7 @@ mod tests {
                 _h: ResumeHints,
             ) -> Result<SessionRef, AgentExecutorError> {
                 Err(AgentExecutorError::Unsupported {
-                    capability: "resume_session",
+                    capability: "resume_session".to_string(),
                 })
             }
             async fn send_message(
@@ -1399,7 +1519,7 @@ mod tests {
                 _id: &NativeSessionId,
             ) -> Result<SessionInfo, AgentExecutorError> {
                 Err(AgentExecutorError::Unsupported {
-                    capability: "get_session_info",
+                    capability: "get_session_info".to_string(),
                 })
             }
             async fn get_session_messages(
@@ -1520,6 +1640,7 @@ mod tests {
                     supports_injected_tools: false,
                     supports_permission_closure: false,
                     supports_interrupt: false,
+                autonomous_turn: false,
                 }
             }
             async fn spawn_session(
@@ -1527,7 +1648,7 @@ mod tests {
                 _s: SpawnSessionSpec,
             ) -> Result<SessionRef, AgentExecutorError> {
                 Err(AgentExecutorError::Unsupported {
-                    capability: "spawn_session",
+                    capability: "spawn_session".to_string(),
                 })
             }
             async fn resume_session(
@@ -1536,7 +1657,7 @@ mod tests {
                 _h: ResumeHints,
             ) -> Result<SessionRef, AgentExecutorError> {
                 Err(AgentExecutorError::Unsupported {
-                    capability: "resume_session",
+                    capability: "resume_session".to_string(),
                 })
             }
             async fn send_message(
@@ -1588,7 +1709,7 @@ mod tests {
                 _i: &NativeSessionId,
             ) -> Result<SessionInfo, AgentExecutorError> {
                 Err(AgentExecutorError::Unsupported {
-                    capability: "get_session_info",
+                    capability: "get_session_info".to_string(),
                 })
             }
             async fn get_session_messages(

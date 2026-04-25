@@ -25,12 +25,10 @@ use cteno_agent_runtime::permission::PermissionDecision;
 pub type ToolExecResult = Result<String, String>;
 
 /// Shared pending-permission map. Keyed by `request_id`.
-pub type PendingPermissions =
-    Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
+pub type PendingPermissions = Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
 
 /// Shared pending-tool-execution map. Keyed by `request_id`.
-pub type PendingToolExecs =
-    Arc<Mutex<HashMap<String, oneshot::Sender<ToolExecResult>>>>;
+pub type PendingToolExecs = Arc<Mutex<HashMap<String, oneshot::Sender<ToolExecResult>>>>;
 
 /// Construct a fresh, empty pending-permissions map.
 pub fn new_pending_permissions() -> PendingPermissions {
@@ -48,9 +46,7 @@ pub fn new_pending_tool_execs() -> PendingToolExecs {
 pub fn parse_decision(s: &str) -> PermissionDecision {
     match s.to_ascii_lowercase().as_str() {
         "allow" | "approve" | "approved" => PermissionDecision::Approved,
-        "allow_for_session" | "approved_for_session" => {
-            PermissionDecision::ApprovedForSession
-        }
+        "allow_for_session" | "approved_for_session" => PermissionDecision::ApprovedForSession,
         "abort" => PermissionDecision::Abort,
         _ => PermissionDecision::Denied,
     }
@@ -76,8 +72,7 @@ pub fn new_tool_exec_id() -> String {
 pub type HostCallResult = Result<Value, String>;
 
 /// Shared pending-host-call map. Keyed by `request_id`.
-pub type PendingHostCalls =
-    Arc<Mutex<HashMap<String, oneshot::Sender<HostCallResult>>>>;
+pub type PendingHostCalls = Arc<Mutex<HashMap<String, oneshot::Sender<HostCallResult>>>>;
 
 /// Construct a fresh, empty pending-host-calls map.
 pub fn new_pending_host_calls() -> PendingHostCalls {

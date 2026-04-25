@@ -22,6 +22,7 @@ import { deleteAccount } from '@/sync/apiAccount';
 import { getWechatOAuthParams, disconnectWechat } from '@/sync/apiWechat';
 import { openExternalUrl } from '@/utils/openExternalUrl';
 import { getHostedConsoleUrl, isHostedCloudConfigured } from '@/sync/serverConfig';
+import { isCloudSyncEnabled } from '@/config/capabilities';
 
 export default React.memo(() => {
     const { theme } = useUnistyles();
@@ -30,7 +31,8 @@ export default React.memo(() => {
     const [analyticsOptOut, setAnalyticsOptOut] = useSettingMutable('analyticsOptOut');
     const profile = useProfile();
     const hasSignedInAccess = !!auth.credentials?.token?.trim();
-    const hostedCloudAvailable = hasSignedInAccess && isHostedCloudConfigured();
+    const cloudSyncEnabled = isCloudSyncEnabled();
+    const hostedCloudAvailable = hasSignedInAccess && cloudSyncEnabled && isHostedCloudConfigured();
 
     // Profile display values
     const displayName = getDisplayName(profile);
@@ -136,7 +138,10 @@ export default React.memo(() => {
                         showChevron={false}
                     />
                 </ItemGroup>
-                <ItemGroup footer="登录后可启用云端同步、多端账号、已连接服务等功能。本地模式不依赖账号。">
+                <ItemGroup footer={cloudSyncEnabled
+                    ? "登录后可启用云端同步、多端账号、已连接服务等功能。本地模式不依赖账号。"
+                    : "登录后仅用于 Cteno agent 内置模型鉴权，本地模式不会启用云同步。"}
+                >
                     <Item
                         title="登录 / 注册 Cteno 账号"
                         subtitle="邮箱 / Google / Apple / WeChat"

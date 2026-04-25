@@ -308,6 +308,19 @@ class ApiSocket {
     }
 
     /**
+     * Route a locally-sourced event (e.g. from the Tauri `local-host-event`
+     * bridge) through the same handler registry used by Socket.IO messages.
+     * Lets callers add a single subscriber via `onMessage` and receive both
+     * remote (socket) and local (Tauri) deliveries without double wiring.
+     */
+    dispatchLocalMessage(event: string, data: any) {
+        const handler = this.messageHandlers.get(event);
+        if (handler) {
+            handler(data);
+        }
+    }
+
+    /**
      * RPC call for sessions. Tries local IPC first (desktop) and falls back
      * to Socket.IO. Payloads are plaintext JSON.
      */

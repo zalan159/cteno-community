@@ -177,25 +177,105 @@ impl rt::SessionWaker for AppSessionWaker {
 }
 
 // ---------------------------------------------------------------------------
-// 2.7 MachineSocketProvider (Wave 2.3a)
-// Used by `a2ui_render` executor to push `hypothesis-push` events to the
-// frontend after each render batch.  Community build has no machine socket;
-// the impl returns an Err that a2ui_render swallows (fire-and-forget).
+// 2.19 HostEventEmitter — agent-runtime → host event bus bridge.
+// Forwards session-internal emissions (currently `a2ui_render`) to the
+// transport-agnostic `cteno_host_runtime::events` bus.  Bus fan-out is
+// handled by the desktop sinks below.
 // ---------------------------------------------------------------------------
 
-struct AppMachineSocketProvider;
+struct AppHostEventEmitter;
 
 #[async_trait]
-impl rt::MachineSocketProvider for AppMachineSocketProvider {
-    async fn push_to_frontend(
-        &self,
-        channel: &str,
-        payload: serde_json::Value,
-    ) -> Result<(), String> {
-        let sock = crate::local_services::machine_socket()?;
-        sock.emit(channel, payload)
-            .await
-            .map_err(|e| format!("machine socket emit failed: {}", e))
+impl rt::HostEventEmitter for AppHostEventEmitter {
+    async fn emit_a2ui_updated(&self, agent_id: &str) {
+        cteno_host_runtime::events::emit(cteno_host_runtime::events::HostEvent::A2uiUpdated {
+            agent_id: agent_id.to_string(),
+        })
+        .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host event sinks
+// ---------------------------------------------------------------------------
+// `TauriHostEventSink` is always installed: it emits a single
+// `local-host-event` Tauri event carrying the serialised `HostEvent`. The
+// frontend's `sync.ts` subscribes once and re-dispatches to the existing
+// per-type listener paths (agentPushListeners, background-task handlers).
+// Community builds rely on this path exclusively.
+//
+// `SocketHostEventSink` (commercial-cloud only) fans the same event out
+// through the machine socket using the legacy channel / payload shapes so
+// mobile / other devices keep receiving updates over Socket.IO without any
+// wire-format change.
+
+use cteno_host_runtime::events::{HostEvent, HostEventSink};
+use tauri::Emitter;
+
+struct TauriHostEventSink;
+
+#[async_trait]
+impl HostEventSink for TauriHostEventSink {
+    async fn emit(&self, event: &HostEvent) {
+        let Some(handle) = crate::APP_HANDLE.get() else {
+            log::debug!("[HostEvent] Tauri sink dropped event: AppHandle not initialised");
+            return;
+        };
+        let payload = match serde_json::to_value(event) {
+            Ok(value) => value,
+            Err(err) => {
+                log::warn!("[HostEvent] Failed to serialise event for Tauri emit: {err}");
+                return;
+            }
+        };
+        if let Err(err) = handle.emit("local-host-event", payload) {
+            log::warn!("[HostEvent] Tauri emit failed: {err}");
+        }
+    }
+}
+
+#[cfg(feature = "commercial-cloud")]
+struct SocketHostEventSink;
+
+#[cfg(feature = "commercial-cloud")]
+#[async_trait]
+impl HostEventSink for SocketHostEventSink {
+    async fn emit(&self, event: &HostEvent) {
+        let Ok(sock) = crate::local_services::machine_socket() else {
+            return;
+        };
+        let (channel, payload): (&str, serde_json::Value) = match event {
+            HostEvent::PersonaSessionReady { persona_id, .. } => (
+                "hypothesis-push",
+                serde_json::json!({
+                    "type": "hypothesis-push",
+                    "agentId": persona_id,
+                    "event": "persona_session_ready",
+                }),
+            ),
+            HostEvent::PersonaSessionFailed { persona_id, .. } => (
+                "hypothesis-push",
+                serde_json::json!({
+                    "type": "hypothesis-push",
+                    "agentId": persona_id,
+                    "event": "persona_session_failed",
+                }),
+            ),
+            HostEvent::A2uiUpdated { agent_id } => (
+                "hypothesis-push",
+                serde_json::json!({
+                    "type": "hypothesis-push",
+                    "agentId": agent_id,
+                    "event": "a2ui_updated",
+                }),
+            ),
+            HostEvent::BackgroundTaskUpdated { task, .. } => {
+                ("background-task-update", task.clone())
+            }
+        };
+        if let Err(err) = sock.emit(channel, payload).await {
+            log::debug!("[HostEvent] Socket relay failed for {channel}: {err}");
+        }
     }
 }
 
@@ -558,11 +638,12 @@ impl rt::SubagentBootstrapProvider for AppSubagentBootstrapProvider {
             profile_id: Some(final_profile_id),
             use_proxy,
             profile_model,
-            acp_sender: None,
+            acp_sender_factory: None,
             permission_checker: None,
             abort_flag: None,
             thinking_flag: None,
             api_format: cteno_agent_runtime::llm_profile::ApiFormat::Anthropic,
+            sandbox_policy: None,
         };
 
         Ok((agent_config, exec_ctx))
@@ -672,8 +753,24 @@ pub fn install_all(
     // 2.6 AgentOwner — used by `memory` executor for display labels.
     rt::install_agent_owner(Arc::new(AppAgentOwnerProvider));
 
-    // 2.7 MachineSocket — used by `a2ui_render` executor to push update events.
-    rt::install_machine_socket(Arc::new(AppMachineSocketProvider));
+    // 2.19 HostEventEmitter + host event bus sinks.  TauriHostEventSink is
+    // always installed (community + commercial); SocketHostEventSink is
+    // compiled only in commercial builds and relays events to other devices
+    // over Socket.IO using legacy channel shapes.
+    rt::install_host_event_emitter(Arc::new(AppHostEventEmitter));
+    let sinks: Vec<Arc<dyn cteno_host_runtime::events::HostEventSink>> = {
+        #[allow(unused_mut)]
+        let mut v: Vec<Arc<dyn cteno_host_runtime::events::HostEventSink>> =
+            vec![Arc::new(TauriHostEventSink)];
+        #[cfg(feature = "commercial-cloud")]
+        {
+            v.push(Arc::new(SocketHostEventSink));
+        }
+        v
+    };
+    cteno_host_runtime::events::install_sink(Arc::new(
+        cteno_host_runtime::events::CompositeHostEventSink::new(sinks),
+    ));
 
     // 2.18 LocalNotification — use host app identity for desktop notifications.
     rt::install_local_notification(Arc::new(AppLocalNotificationProvider));

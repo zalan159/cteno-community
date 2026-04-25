@@ -11,7 +11,7 @@ use super::models::{
     Persona, PersonaSessionLink, PersonaSessionType, TaskNodeInput, TaskNodeStatus,
 };
 use super::store::PersonaStore;
-use crate::task_graph::{TaskGraphDelegate, TaskGraphEngine, TaskNodeState, build_group_summary};
+use crate::task_graph::{build_group_summary, TaskGraphDelegate, TaskGraphEngine, TaskNodeState};
 
 /// Summary of an active task session.
 #[derive(Debug, Clone, serde::Serialize)]

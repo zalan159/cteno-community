@@ -769,6 +769,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Reviews code".to_string(),
                         prompt: "Review".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,
@@ -787,6 +788,7 @@ mod tests {
                     agent: RoleAgentSpec {
                         description: "Writes code".to_string(),
                         prompt: "Implement".to_string(),
+                        provider: Some(MultiAgentProvider::Cteno),
                         tools: None,
                         disallowed_tools: None,
                         model: None,

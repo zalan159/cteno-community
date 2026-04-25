@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, ActivityIndicator, Pressable, Linking, Platform } from 'react-native';
+import { View, Pressable, Linking, Platform } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolCall } from '@/sync/typesMessage';
@@ -105,7 +105,6 @@ export const ScreenshotView = React.memo((props: { tool: ToolCall, metadata: Met
         return (
             <View style={styles.container}>
                 <View style={styles.runningRow}>
-                    <ActivityIndicator size="small" />
                     <Text style={styles.runningText}>Taking screenshot...</Text>
                 </View>
             </View>

@@ -45,3 +45,9 @@ AGENTEOF
 - **expect**: Standard worker (no custom agent_type) should have both write and shell tools. Should successfully create the file AND cat it.
 - **anti-pattern**: Failing to execute shell command
 - **severity**: high
+
+### [pending] Cteno allowed_tools 白名单在 stdio session 中强制生效
+- **message**: "用 restricted-worker 通过 Cteno stdio session 执行 `echo should-not-run`，然后读取 AGENT.md 并总结限制。"
+- **expect**: stdio runner 拉取 runtime native tools 后按 `allowed_tools` 过滤，LLM 工具列表里没有 shell；agent 可以读取 AGENT.md，但不能调用 shell，回答中应说明 shell 不可用。
+- **anti-pattern**: shell/edit/write 等未列入白名单的工具仍出现在 Cteno 工具列表；因为 adapter/前端过滤缺失而让 stdio 侧实际执行了 shell；只在 prompt 里说不能用但工具仍可调用。
+- **severity**: high

@@ -93,7 +93,6 @@ pub const BROWSER_WHITELIST: &[&str] = &[
 pub const PERSONA_ONLY: &[&str] = &[
     "dispatch_task",
     "list_task_sessions",
-    "get_session_output",
     "send_to_session",
     "close_task_session",
     "update_personality",

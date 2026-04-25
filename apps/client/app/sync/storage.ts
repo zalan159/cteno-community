@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { useShallow } from 'zustand/react/shallow'
-import { Session, Machine, GitStatus, Persona, WorkspaceSummary, SessionTaskLifecycleEntry } from "./storageTypes";
+import { Session, Machine, GitStatus, Persona, PersonaProject, WorkspaceSummary, SessionTaskLifecycleEntry } from "./storageTypes";
 import { createReducer, reducer, ReducerState } from "./reducer/reducer";
 import { Message } from "./typesMessage";
 import { NormalizedMessage } from "./typesRaw";
@@ -11,7 +11,7 @@ import { LocalProxyUsage, LocalProxyUsageRecord, upsertLocalProxyUsageRecord } f
 import { TodoState } from "../-zen/model/ops";
 import { Profile } from "./profile";
 import { UserProfile, RelationshipUpdatedEvent } from "./friendTypes";
-import { loadSettings, loadLocalSettings, saveLocalSettings, saveSettings, loadLocalProxyUsage, saveLocalProxyUsage, loadProfile, saveProfile, loadSessionDrafts, saveSessionDrafts, loadSessionPermissionModes, saveSessionPermissionModes, loadSessionRuntimeEfforts, saveSessionRuntimeEfforts, loadSessionSandboxPolicies, saveSessionSandboxPolicies, loadPersonaReadTimestamps, savePersonaReadTimestamps, loadCachedPersonas, saveCachedPersonas, loadCachedAgentWorkspaces, saveCachedAgentWorkspaces } from "./persistence";
+import { loadSettings, loadLocalSettings, saveLocalSettings, saveSettings, loadLocalProxyUsage, saveLocalProxyUsage, loadProfile, saveProfile, loadSessionDrafts, saveSessionDrafts, loadSessionPermissionModes, saveSessionPermissionModes, loadSessionRuntimeEfforts, saveSessionRuntimeEfforts, loadSessionSandboxPolicies, saveSessionSandboxPolicies, loadPersonaReadTimestamps, savePersonaReadTimestamps, loadCachedPersonas, saveCachedPersonas, loadCachedPersonaProjects, saveCachedPersonaProjects, loadCachedAgentWorkspaces, saveCachedAgentWorkspaces } from "./persistence";
 import type { PermissionMode } from '@/components/PermissionModeSelector';
 import React from "react";
 import { sync } from "./sync";
@@ -29,6 +29,76 @@ function debugLog(msg: string) {
     }
     const ts = new Date().toISOString().slice(11, 23);
     console.debug(`[sync/storage ${ts}] ${msg}`);
+}
+
+type SessionTodo = {
+    content: string;
+    status: 'pending' | 'in_progress' | 'completed';
+    priority?: 'high' | 'medium' | 'low';
+    id?: string;
+};
+
+function isPlanToolName(name: string): boolean {
+    const normalized = name.trim().toLowerCase();
+    return normalized === 'update_plan' || normalized === 'update plan' || normalized === 'todowrite';
+}
+
+function planItemsFromInput(input: any): unknown {
+    return input?.todos ?? input?.newTodos ?? input?.items ?? input?.plan;
+}
+
+function latestTodosFromStoredMessages(messages: Message[]): SessionTodo[] | null {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const message = messages[i];
+        if (message.kind !== 'tool-call' || !isPlanToolName(message.tool.name)) {
+            continue;
+        }
+        const rawTodos = planItemsFromInput(message.tool.input);
+        if (!Array.isArray(rawTodos)) {
+            continue;
+        }
+        if (rawTodos.length === 0) {
+            return [];
+        }
+        const todos = rawTodos
+            .map((todo, index): SessionTodo | null => {
+                const content = typeof todo?.content === 'string'
+                    ? todo.content
+                    : typeof todo?.step === 'string'
+                        ? todo.step
+                        : typeof todo?.text === 'string'
+                            ? todo.text
+                            : typeof todo?.title === 'string'
+                                ? todo.title
+                                : typeof todo?.task === 'string'
+                                    ? todo.task
+                                    : '';
+                if (!content.trim()) {
+                    return null;
+                }
+                const rawStatus = typeof todo?.status === 'string' ? todo.status.trim().toLowerCase() : '';
+                const status = rawStatus === 'completed' || rawStatus === 'complete' || rawStatus === 'done'
+                    ? 'completed'
+                    : rawStatus === 'in_progress' || rawStatus === 'in-progress' || rawStatus === 'inprogress' || rawStatus === 'running'
+                        ? 'in_progress'
+                        : rawStatus === 'pending' || rawStatus === 'queued'
+                            ? 'pending'
+                        : 'pending';
+                return {
+                    content,
+                    status,
+                    priority: todo?.priority === 'high' || todo?.priority === 'medium' || todo?.priority === 'low'
+                        ? todo.priority
+                        : undefined,
+                    id: typeof todo?.id === 'string' ? todo.id : `stored-plan-${message.id}-${index}`,
+                };
+            })
+            .filter((todo): todo is SessionTodo => todo !== null);
+        if (todos.length > 0) {
+            return todos;
+        }
+    }
+    return null;
 }
 
 function buildHiddenWorkspaceMemberSessionIds(workspaces: WorkspaceSummary[]): Set<string> {
@@ -111,13 +181,14 @@ interface StorageState {
     personaReadTimestamps: Record<string, number>;
     cachedPersonas: Persona[];
     cachedPersonasLoadedAt: number; // timestamp ms, 0 = never loaded
+    cachedPersonaProjects: PersonaProject[];
     cachedAgentWorkspaces: WorkspaceSummary[];
     machines: Record<string, Machine>;
     /**
-     * Per-machine vendor usage snapshot, keyed by `${machineId}:${vendor}`.
-     * Populated by the 60s poll against the daemon's `usage-read` RPC.
+     * Per-machine vendor quota snapshot, keyed by `${machineId}:${vendor}`.
+     * Populated by the 60s poll against the daemon's `quota-read` RPC.
      */
-    vendorUsage: Record<string, import('./storageTypes').VendorUsage>;
+    vendorQuota: Record<string, import('./storageTypes').VendorQuota>;
     friends: Record<string, UserProfile>;  // All relationships (friends, pending, requested, etc.)
     users: Record<string, UserProfile | null>;  // Global user cache, null = 404/failed fetch
     feedItems: FeedItem[];  // Simple list of feed items
@@ -144,10 +215,11 @@ interface StorageState {
     todoState: TodoState | null;
     todosLoaded: boolean;
     applySessions: (sessions: (Omit<Session, 'presence'> & { presence?: "online" | number })[]) => void;
+    bindPendingPersonaSession: (pendingSessionId: string, session: Omit<Session, 'presence'> & { presence?: "online" | number }) => void;
     applyMachines: (machines: Machine[], replace?: boolean) => void;
-    applyVendorUsage: (
+    applyVendorQuota: (
         machineId: string,
-        entries: Record<string, import('./storageTypes').VendorUsage>,
+        entries: Record<string, import('./storageTypes').VendorQuota>,
     ) => void;
     applyLoaded: () => void;
     applyReady: () => void;
@@ -180,6 +252,8 @@ interface StorageState {
     deleteMachine: (machineId: string) => void;
     markPersonaRead: (chatSessionId: string) => void;
     applyPersonas: (personas: Persona[]) => void;
+    upsertPersonaProject: (project: Pick<PersonaProject, 'machineId' | 'workdir'>) => void;
+    deletePersonaProject: (machineId: string, workdir: string) => void;
     applyAgentWorkspaces: (workspaces: WorkspaceSummary[]) => void;
     // Project management methods
     getProjects: () => import('./projectManager').Project[];
@@ -323,7 +397,7 @@ export const storage = create<StorageState>()((set, get) => {
         profile,
         sessions: {},
         machines: {},
-        vendorUsage: {},
+        vendorQuota: {},
         friends: {},  // Initialize relationships cache
         users: {},  // Initialize global user cache
         feedItems: [],  // Initialize feed items list
@@ -341,6 +415,7 @@ export const storage = create<StorageState>()((set, get) => {
         personaReadTimestamps,
         cachedPersonas: loadCachedPersonas(),
         cachedPersonasLoadedAt: 0,
+        cachedPersonaProjects: loadCachedPersonaProjects(),
         cachedAgentWorkspaces: loadCachedAgentWorkspaces(),
         realtimeStatus: 'disconnected',
         realtimeMode: 'idle',
@@ -557,6 +632,127 @@ export const storage = create<StorageState>()((set, get) => {
                 sessionMessages: updatedSessionMessages
             };
         }),
+        bindPendingPersonaSession: (pendingSessionId: string, session: Omit<Session, 'presence'> & { presence?: "online" | number }) => set((state) => {
+            if (!pendingSessionId || pendingSessionId === session.id) {
+                return state;
+            }
+
+            const pendingSession = state.sessions[pendingSessionId];
+            const existingRealSession = state.sessions[session.id];
+            const presence = resolveSessionOnlineState(session);
+            const realSession: Session = {
+                ...session,
+                presence,
+                draft: pendingSession?.draft || existingRealSession?.draft || session.draft || null,
+                permissionMode: pendingSession?.permissionMode || existingRealSession?.permissionMode || session.permissionMode || 'default',
+                runtimeEffort: pendingSession?.runtimeEffort || existingRealSession?.runtimeEffort || session.runtimeEffort || 'default',
+                sandboxPolicy: (pendingSession?.sandboxPolicy || existingRealSession?.sandboxPolicy || session.sandboxPolicy || 'workspace_write') as any,
+                modelMode: pendingSession?.modelMode || existingRealSession?.modelMode || session.modelMode || null,
+                promptSuggestions: session.promptSuggestions ?? existingRealSession?.promptSuggestions ?? pendingSession?.promptSuggestions,
+            };
+
+            const { [pendingSessionId]: _pendingSession, ...sessionsWithoutPending } = state.sessions;
+            const mergedSessions: Record<string, Session> = {
+                ...sessionsWithoutPending,
+                [session.id]: realSession,
+            };
+
+            const pendingMessages = state.sessionMessages[pendingSessionId];
+            const realMessages = state.sessionMessages[session.id];
+            const { [pendingSessionId]: _pendingMessages, ...messagesWithoutPending } = state.sessionMessages;
+            let mergedMessages = messagesWithoutPending;
+            if (pendingMessages || realMessages) {
+                const mergedMessagesMap = {
+                    ...(realMessages?.messagesMap ?? {}),
+                    ...(pendingMessages?.messagesMap ?? {}),
+                };
+                mergedMessages = {
+                    ...messagesWithoutPending,
+                    [session.id]: {
+                        ...(realMessages ?? pendingMessages ?? createEmptySessionMessages()),
+                        messages: Object.values(mergedMessagesMap).sort((a, b) => a.createdAt - b.createdAt),
+                        messagesMap: mergedMessagesMap,
+                        taskLifecycle: {
+                            ...(realMessages?.taskLifecycle ?? {}),
+                            ...(pendingMessages?.taskLifecycle ?? {}),
+                        },
+                        reducerState: realMessages?.reducerState ?? pendingMessages?.reducerState ?? createReducer(),
+                        isLoaded: realMessages?.isLoaded ?? pendingMessages?.isLoaded ?? true,
+                        hasOlderMessages: realMessages?.hasOlderMessages ?? pendingMessages?.hasOlderMessages ?? false,
+                        oldestSeq: realMessages?.oldestSeq ?? pendingMessages?.oldestSeq ?? 0,
+                        isLoadingOlder: false,
+                        isSyncing: realMessages?.isSyncing ?? false,
+                        relayError: realMessages?.relayError ?? pendingMessages?.relayError ?? null,
+                        lastReducerAgentStateVersion: Math.max(
+                            realMessages?.lastReducerAgentStateVersion ?? 0,
+                            pendingMessages?.lastReducerAgentStateVersion ?? 0,
+                        ),
+                    },
+                };
+            }
+
+            const { [pendingSessionId]: pendingGitStatus, ...gitStatusWithoutPending } = state.sessionGitStatus;
+            const sessionGitStatus = pendingGitStatus !== undefined
+                ? { ...gitStatusWithoutPending, [session.id]: state.sessionGitStatus[session.id] ?? pendingGitStatus }
+                : gitStatusWithoutPending;
+
+            const drafts = loadSessionDrafts();
+            if (drafts[pendingSessionId] && !drafts[session.id]) {
+                drafts[session.id] = drafts[pendingSessionId];
+            }
+            delete drafts[pendingSessionId];
+            saveSessionDrafts(drafts);
+
+            const modes = loadSessionPermissionModes();
+            if (modes[pendingSessionId] && !modes[session.id]) {
+                modes[session.id] = modes[pendingSessionId];
+            }
+            delete modes[pendingSessionId];
+            saveSessionPermissionModes(modes);
+
+            const efforts = loadSessionRuntimeEfforts();
+            if (efforts[pendingSessionId] && !efforts[session.id]) {
+                efforts[session.id] = efforts[pendingSessionId];
+            }
+            delete efforts[pendingSessionId];
+            saveSessionRuntimeEfforts(efforts);
+
+            const policies = loadSessionSandboxPolicies();
+            if (policies[pendingSessionId] && !policies[session.id]) {
+                policies[session.id] = policies[pendingSessionId];
+            }
+            delete policies[pendingSessionId];
+            saveSessionSandboxPolicies(policies);
+
+            const personaReadTimestamps = { ...state.personaReadTimestamps };
+            if (personaReadTimestamps[pendingSessionId] && !personaReadTimestamps[session.id]) {
+                personaReadTimestamps[session.id] = personaReadTimestamps[pendingSessionId];
+            }
+            delete personaReadTimestamps[pendingSessionId];
+            savePersonaReadTimestamps(personaReadTimestamps);
+
+            const sessionListViewData = buildSessionListViewData(
+                mergedSessions,
+                buildHiddenWorkspaceMemberSessionIds(state.cachedAgentWorkspaces)
+            );
+
+            const machineMetadataMap = new Map<string, any>();
+            Object.values(state.machines).forEach(machine => {
+                if (machine.metadata) {
+                    machineMetadataMap.set(machine.id, machine.metadata);
+                }
+            });
+            projectManager.updateSessions(Object.values(mergedSessions), machineMetadataMap);
+
+            return {
+                ...state,
+                sessions: mergedSessions,
+                sessionMessages: mergedMessages,
+                sessionGitStatus,
+                personaReadTimestamps,
+                sessionListViewData,
+            };
+        }),
         applyLoaded: () => set((state) => {
             const result = {
                 ...state,
@@ -568,11 +764,11 @@ export const storage = create<StorageState>()((set, get) => {
             ...state,
             isDataReady: true
         })),
-        applyVendorUsage: (
+        applyVendorQuota: (
             machineId: string,
-            entries: Record<string, import('./storageTypes').VendorUsage>,
+            entries: Record<string, import('./storageTypes').VendorQuota>,
         ) => set((state) => {
-            const next = { ...state.vendorUsage };
+            const next = { ...state.vendorQuota };
             // Replace every entry for this machine. The daemon always returns
             // its full known set in one shot, so we can drop stale vendors
             // (e.g. user logged out of Gemini) in the same pass.
@@ -584,7 +780,7 @@ export const storage = create<StorageState>()((set, get) => {
             for (const [vendor, usage] of Object.entries(entries)) {
                 next[`${machineId}:${vendor}`] = usage;
             }
-            return { ...state, vendorUsage: next };
+            return { ...state, vendorQuota: next };
         }),
         upsertSessionMessages: (sessionId: string, messages: NormalizedMessage[]) => {
             let changed = new Set<string>();
@@ -1105,6 +1301,8 @@ export const storage = create<StorageState>()((set, get) => {
                             a.modelId !== b.modelId ||
                             a.agent !== b.agent ||
                             a.workdir !== b.workdir ||
+                            a.chatSessionId !== b.chatSessionId ||
+                            a.continuousBrowsing !== b.continuousBrowsing ||
                             a.updatedAt !== b.updatedAt
                         ) { equivalent = false; break; }
                     }
@@ -1117,6 +1315,47 @@ export const storage = create<StorageState>()((set, get) => {
                 };
             });
         },
+        upsertPersonaProject: (project: Pick<PersonaProject, 'machineId' | 'workdir'>) => set((state) => {
+            const workdir = project.workdir.trim();
+            if (!project.machineId || !workdir) return state;
+
+            const now = Date.now();
+            let found = false;
+            const projects = state.cachedPersonaProjects.map((existing) => {
+                if (existing.machineId === project.machineId && existing.workdir === workdir) {
+                    found = true;
+                    return { ...existing, updatedAt: now };
+                }
+                return existing;
+            });
+
+            if (!found) {
+                projects.push({
+                    machineId: project.machineId,
+                    workdir,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            }
+
+            saveCachedPersonaProjects(projects);
+            return {
+                ...state,
+                cachedPersonaProjects: projects,
+            };
+        }),
+        deletePersonaProject: (machineId: string, workdir: string) => set((state) => {
+            const trimmed = workdir.trim();
+            const projects = state.cachedPersonaProjects.filter(
+                (project) => !(project.machineId === machineId && project.workdir === trimmed)
+            );
+            if (projects.length === state.cachedPersonaProjects.length) return state;
+            saveCachedPersonaProjects(projects);
+            return {
+                ...state,
+                cachedPersonaProjects: projects,
+            };
+        }),
         applyAgentWorkspaces: (workspaces: WorkspaceSummary[]) => set((state) => {
             saveCachedAgentWorkspaces(workspaces);
             const hiddenSessionIds = new Set(
@@ -1306,6 +1545,16 @@ export function useSessionUsage(sessionId: string) {
     }));
 }
 
+export function useSessionTodos(sessionId: string) {
+    return storage(useShallow((state) => {
+        const sessionMessages = state.sessionMessages[sessionId];
+        return sessionMessages?.reducerState?.latestTodos?.todos
+            ?? latestTodosFromStoredMessages(sessionMessages?.messages ?? [])
+            ?? state.sessions[sessionId]?.todos
+            ?? null;
+    }));
+}
+
 export function useSettings(): Settings {
     return storage(useShallow((state) => state.settings));
 }
@@ -1357,6 +1606,10 @@ export function useAllSessions(): Session[] {
 
 export function useCachedPersonas(): Persona[] {
     return storage((state) => state.cachedPersonas);
+}
+
+export function useCachedPersonaProjects(): PersonaProject[] {
+    return storage((state) => state.cachedPersonaProjects);
 }
 
 export function useCachedAgentWorkspaces(): WorkspaceSummary[] {

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // `./ops` pulls in a broad RPC surface (sync, storage, apiSocket, Tauri
 // helpers, etc). Stub the transitive React-Native / expo / Tauri imports so
@@ -24,8 +24,10 @@ vi.mock('./sync', () => ({ sync: {} }));
 vi.mock('./storage', () => ({ storage: { getState: () => ({ sessions: {} }) } }));
 vi.mock('./apiKv', () => ({ kvGet: vi.fn(), kvSet: vi.fn() }));
 
-const { resolveVendorMeta } = await import('./ops');
+const { resolveVendorMeta, listAvailableVendors, probeVendorConnection } = await import('./ops');
+const { apiSocket } = await import('./apiSocket');
 type VendorMeta = Parameters<typeof resolveVendorMeta>[0];
+const machineRPC = vi.mocked(apiSocket.machineRPC);
 
 const baseCapabilities = {
     setModel: true,
@@ -40,6 +42,10 @@ const baseCapabilities = {
 };
 
 describe('resolveVendorMeta connection defaulting', () => {
+    beforeEach(() => {
+        machineRPC.mockReset();
+    });
+
     it('populates a default `unknown` connection when the daemon omits it', () => {
         const input: VendorMeta = {
             name: 'cteno',
@@ -128,5 +134,101 @@ describe('resolveVendorMeta connection defaulting', () => {
             state: 'unknown',
             checkedAtUnixMs: 0,
         });
+    });
+
+    it('normalizes the daemon top-level `connection` field into status.connection', async () => {
+        machineRPC.mockResolvedValueOnce({
+            vendors: [
+                {
+                    name: 'claude',
+                    available: true,
+                    installed: true,
+                    loggedIn: true,
+                    capabilities: baseCapabilities,
+                    status: {
+                        installState: 'installed',
+                        authState: 'loggedIn',
+                    },
+                    connection: {
+                        state: 'connected',
+                        checkedAtUnixMs: 1_744_000_000_456,
+                        latencyMs: 17,
+                    },
+                },
+            ],
+        });
+
+        const resolved = await listAvailableVendors('machine-1');
+        expect(machineRPC).toHaveBeenCalledWith('machine-1', 'list_available_vendors', {});
+        expect(resolved[0].status.connection).toEqual({
+            state: 'connected',
+            checkedAtUnixMs: 1_744_000_000_456,
+            latencyMs: 17,
+        });
+        expect('connection' in resolved[0]).toBe(false);
+    });
+
+    it('still lets local selector fixtures pass top-level connection through resolveVendorMeta', () => {
+        const resolved = resolveVendorMeta(
+            {
+                name: 'claude',
+                available: true,
+                installed: true,
+                loggedIn: true,
+                capabilities: baseCapabilities,
+                status: {
+                    installState: 'installed',
+                    authState: 'loggedIn',
+                },
+                connection: {
+                    state: 'connected',
+                    checkedAtUnixMs: 1_744_000_000_456,
+                    latencyMs: 17,
+                },
+            },
+        );
+
+        expect(resolved.status.connection).toEqual({
+            state: 'connected',
+            checkedAtUnixMs: 1_744_000_000_456,
+            latencyMs: 17,
+        });
+        expect('connection' in resolved).toBe(false);
+    });
+
+    it('normalizes remote probe wrapper responses before updating the selector', async () => {
+        machineRPC.mockResolvedValueOnce({
+            success: true,
+            vendor: 'gemini',
+            connection: {
+                state: 'failed',
+                reason: 'gemini auth probe failed',
+                checkedAtUnixMs: 1_744_000_000_789,
+            },
+        });
+
+        const result = await probeVendorConnection('machine-1', 'gemini');
+        expect(machineRPC).toHaveBeenCalledWith(
+            'machine-1',
+            'probe_vendor_connection',
+            { vendor: 'gemini' },
+        );
+        expect(result).toEqual({
+            state: 'failed',
+            reason: 'gemini auth probe failed',
+            checkedAtUnixMs: 1_744_000_000_789,
+        });
+    });
+
+    it('throws the daemon probe error when the remote wrapper reports failure', async () => {
+        machineRPC.mockResolvedValueOnce({
+            success: false,
+            vendor: 'codex',
+            error: 'codex app-server connection is closed',
+        });
+
+        await expect(probeVendorConnection('machine-1', 'codex')).rejects.toThrow(
+            'codex app-server connection is closed',
+        );
     });
 });

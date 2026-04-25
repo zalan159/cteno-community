@@ -96,15 +96,13 @@ tags:
 
 ## 内置 Skill 参考
 
-当前已有的 Skill（避免重复创建）：
+默认启用的内置 Skill（避免重复创建）：
 
 | ID | 名称 | 用途 |
 |----|------|------|
 | `orchestration` | 编排系统 | 多 Agent 编排脚本 |
 | `browser-automation` | 浏览器自动化 | CDP 脚本编写 |
 | `mcp` | MCP Skill | 解析 MCP 文档并自动安装/注册 MCP Server |
-| `ctenoctl` | ctenoctl CLI | 通过 ctenoctl 执行 daemon/RPC/MCP 标准操作 |
-| `a2ui` | A2UI Builder | 声明式 UI 组件 |
 | `pptx` | PPTX | PowerPoint 创建/编辑 |
 | `xlsx` | XLSX | Excel 读取/生成 |
 | `agent-create` | Agent 创建 | 创建自定义 Agent |

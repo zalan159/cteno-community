@@ -1,5 +1,7 @@
 ---
+id: pdf
 name: minimax-pdf
+version: "1.0"
 description: >
   Use this skill when visual quality and design identity matter for a PDF.
   CREATE (generate from scratch): "make a PDF", "generate a report", "write a proposal",
@@ -13,6 +15,12 @@ description: >
   from the document type and flow through every page. The output is print-ready.
   Prefer this skill when appearance matters, not just when any PDF output is needed.
 license: MIT
+when_to_use: "Use when the user wants to generate, fill, inspect, reformat, restyle, or produce a polished PDF."
+tags:
+  - pdf
+  - document-generation
+  - forms
+  - design
 metadata:
   version: "1.0"
   category: document-generation

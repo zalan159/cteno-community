@@ -1,0 +1,14 @@
+{
+  "extends": "../../apps/client/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@cteno/client-sync": ["src/index.ts"],
+      "@cteno/client-sync/*": ["src/*"],
+      "react": ["../../apps/client/node_modules/@types/react"],
+      "react/*": ["../../apps/client/node_modules/@types/react/*"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules"]
+}

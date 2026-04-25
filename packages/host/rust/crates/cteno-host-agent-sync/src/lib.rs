@@ -1,7 +1,7 @@
 //! Cross-vendor agent config syncer.
 //!
-//! The authoritative source of truth for MCP servers, markdown subagents,
-//! skills, and per-project system prompt lives under Cteno's own trees
+//! The authoritative source of truth for user-configured MCP servers, markdown
+//! subagents, skills, and per-project system prompt lives under Cteno's own trees
 //! (`~/.cteno/`, `{project}/.cteno/`). This crate owns the reconciliation
 //! job that writes that same content into each vendor's native config
 //! location so Claude / Codex / Gemini / Cteno all see the same things.

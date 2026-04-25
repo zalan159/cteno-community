@@ -124,6 +124,10 @@ pub struct AgentSession {
     pub user_id: Option<String>,
     pub messages: Vec<SessionMessage>,
     pub context_data: Option<serde_json::Value>,
+    #[serde(default)]
+    pub agent_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub agent_state_version: u64,
     pub status: SessionStatus,
     pub created_at: String,
     pub updated_at: String,
@@ -240,6 +244,8 @@ impl AgentSessionManager {
                 user_id TEXT,
                 messages TEXT NOT NULL DEFAULT '[]',
                 context_data TEXT,
+                agent_state TEXT,
+                agent_state_version INTEGER NOT NULL DEFAULT 0,
                 status TEXT DEFAULT 'active' CHECK(status IN ('active', 'expired', 'closed')),
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now')),
@@ -267,6 +273,7 @@ impl AgentSessionManager {
         }
 
         Self::ensure_vendor_column(conn)?;
+        Self::ensure_agent_state_columns(conn)?;
         Ok(())
     }
 
@@ -300,6 +307,32 @@ impl AgentSessionManager {
                 [],
             )?;
             log::info!("[agent_session] migrated agent_sessions: added vendor column");
+        }
+        Ok(())
+    }
+
+    fn ensure_agent_state_columns(conn: &Connection) -> SqliteResult<()> {
+        let table_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_sessions'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_exists == 0 {
+            return Ok(());
+        }
+
+        let has_agent_state: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name='agent_state'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_agent_state == 0 {
+            conn.execute("ALTER TABLE agent_sessions ADD COLUMN agent_state TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE agent_sessions ADD COLUMN agent_state_version INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            log::info!("[agent_session] migrated agent_sessions: added agent_state columns");
         }
         Ok(())
     }
@@ -348,6 +381,8 @@ impl AgentSessionManager {
             user_id: user_id.map(|s| s.to_string()),
             messages: vec![],
             context_data: None,
+            agent_state: None,
+            agent_state_version: 0,
             status: SessionStatus::Active,
             created_at,
             updated_at: now.to_rfc3339(),
@@ -406,6 +441,8 @@ impl AgentSessionManager {
             user_id: user_id.map(|s| s.to_string()),
             messages: vec![],
             context_data: None,
+            agent_state: None,
+            agent_state_version: 0,
             status: SessionStatus::Active,
             created_at,
             updated_at: now.to_rfc3339(),
@@ -442,7 +479,7 @@ impl AgentSessionManager {
             let status_str = status.as_str();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                      FROM agent_sessions WHERE vendor = ?1 AND status = ?2 ORDER BY updated_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -456,7 +493,7 @@ impl AgentSessionManager {
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                      FROM agent_sessions WHERE vendor = ?1 ORDER BY updated_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -478,7 +515,7 @@ impl AgentSessionManager {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                  FROM agent_sessions WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -501,6 +538,15 @@ impl AgentSessionManager {
                 user_id: row.get(2).map_err(|e| e.to_string())?,
                 messages,
                 context_data,
+                agent_state: row
+                    .get::<_, Option<String>>(11)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                agent_state_version: row
+                    .get::<_, Option<i64>>(12)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default()
+                    .max(0) as u64,
                 status: SessionStatus::from_str(&status_str),
                 created_at: row.get(6).map_err(|e| e.to_string())?,
                 updated_at: row.get(7).map_err(|e| e.to_string())?,
@@ -569,6 +615,30 @@ impl AgentSessionManager {
         conn.execute(
             "UPDATE agent_sessions SET context_data = ?1, updated_at = ?2 WHERE id = ?3",
             params![context_json, now, session_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    /// Persist the latest host-facing agent state snapshot.
+    pub fn update_agent_state(
+        &self,
+        session_id: &str,
+        agent_state: Option<&serde_json::Value>,
+        version: u64,
+    ) -> Result<(), String> {
+        let conn = self.connect().map_err(|e| e.to_string())?;
+
+        let state_json = agent_state
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Invalid agent_state: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "UPDATE agent_sessions SET agent_state = ?1, agent_state_version = ?2, updated_at = ?3 WHERE id = ?4",
+            params![state_json, version as i64, now, session_id],
         )
         .map_err(|e| e.to_string())?;
 
@@ -701,7 +771,7 @@ impl AgentSessionManager {
         let sessions: Vec<AgentSession> = if let Some(status) = status_filter {
             let status_str = status.as_str();
             let mut stmt = conn.prepare(
-                "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                  FROM agent_sessions WHERE agent_id = ?1 AND status = ?2 ORDER BY updated_at DESC"
             ).map_err(|e| e.to_string())?;
 
@@ -716,7 +786,7 @@ impl AgentSessionManager {
                 .map_err(|e| e.to_string())?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                  FROM agent_sessions WHERE agent_id = ?1 ORDER BY updated_at DESC"
             ).map_err(|e| e.to_string())?;
 
@@ -742,7 +812,7 @@ impl AgentSessionManager {
             let status_str = status.as_str();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                      FROM agent_sessions WHERE status = ?1 ORDER BY updated_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -756,7 +826,7 @@ impl AgentSessionManager {
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor
+                    "SELECT id, agent_id, user_id, messages, context_data, status, created_at, updated_at, expires_at, owner_session_id, vendor, agent_state, agent_state_version
                      FROM agent_sessions ORDER BY updated_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -800,6 +870,17 @@ impl AgentSessionManager {
             user_id: row.get(2)?,
             messages,
             context_data,
+            agent_state: row
+                .get::<_, Option<String>>(11)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            agent_state_version: row
+                .get::<_, Option<i64>>(12)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .max(0) as u64,
             status: SessionStatus::from_str(&status_str),
             created_at: row.get(6)?,
             updated_at: row.get(7)?,

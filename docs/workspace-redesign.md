@@ -2,10 +2,11 @@
 
 ## 设计原则
 
-1. **去掉 DAG 通用引擎**：不做 node/edge/stage/vote 的通用状态机
+1. **去掉 workspace DAG 通用引擎**：workspace 层不做 node/edge/stage/vote 的通用状态机；DAG / subagent / fork-style 子任务属于单个 vendor session 内部能力，由 Cteno / Claude / Codex / Gemini 各自 runtime 或 adapter 管理
 2. **每种编排模式写专门代码**：GroupChat、GatedTasks、Autoresearch 各自一个 Rust 模块
 3. **收口在共用 UI 和交互**：workspace 壳（创建、角色管理、activity feed）统一
 4. **新模板 = 新代码模块**：不是配置一个 JSON 模板，而是写一段 Rust 调度逻辑
+5. **workspace 只管顶层 session**：workspace orchestrator 可以把消息路由给某个 role session，但不展开、持久化或推进该 session 内部的 DAG/subagent 节点
 
 ---
 
@@ -29,9 +30,9 @@
 
 | 模块 | 问题 | 处理 |
 |------|------|------|
-| WorkspaceRuntime (1547 行) | 通用 DAG 引擎，claim window、vote phase、workflow node dispatch | 替换为 WorkspaceOrchestrator trait 的具体实现 |
+| WorkspaceRuntime (1547 行) | workspace 级通用 workflow/claim/vote 状态机，容易被误用成 session 内 DAG 引擎 | 替换为 WorkspaceOrchestrator trait 的具体实现；session 内 DAG 迁移到 vendor runtime |
 | CtenoWorkspaceAdapter (adapter.rs) | 包装 WorkspaceRuntime 的胶水层 | 简化为直接调用 orchestrator |
-| WorkspaceTemplate.workflow | node/edge/stage 定义 | 改为 orchestrator_type 字符串 |
+| WorkspaceTemplate.workflow | node/edge/stage 定义 | 改为 orchestrator_type 字符串；不再表达 vendor session 内部 task graph |
 | send_workspace_turn (adapter.rs) | 100+ 行通用调度（claim → vote → dispatch） | 拆到各 orchestrator 模块 |
 | 前端孤儿组件 | WorkspaceTimeline、WorkflowStatus、DecisionPanel 未挂载 | 按模板类型条件渲染 |
 
@@ -115,6 +116,14 @@ pub struct OrchestratorResponse {
     pub template_state: serde_json::Value,   // 更新后的模板状态
 }
 ```
+
+### 与 Session 内 DAG / Subagent 的边界
+
+Workspace orchestrator 只编排顶层 role/session，例如把一个用户请求交给 researcher、coder、reviewer，或在 gated task 模式下等待某个顶层 session 的结果。它不能拥有某个 vendor session 内部的 task graph、subagent、fork skill 或 wait/merge 状态。
+
+- Cteno 的 DAG / subagent 能力落在 `cteno-agent-runtime`，通过 `cteno-agent-stdio` 对 host 输出普通事件。
+- Claude / Codex / Gemini 的同类能力由对应 adapter 接入原生机制；没有原生能力时返回明确的 unsupported / degraded behavior。
+- 旧的 persona `dispatch_task` DAG 是兼容入口，不能作为新 workspace 设计的基础设施继续扩张。
 
 ### 三种 Orchestrator 实现
 

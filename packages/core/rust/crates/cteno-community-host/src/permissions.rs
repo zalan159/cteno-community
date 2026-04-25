@@ -124,79 +124,18 @@ pub fn ensure_shell_command_permissions(command: &str) -> Result<(), String> {
     ))
 }
 
-/// Install/update `ctenoctl` symlink in user bin directory.
-/// Creates a symlink from `~/.local/bin/ctenoctl` → current executable.
-/// Skips if the existing symlink already points to the same binary (same version).
+/// Install/update `ctenoctl` in the user bin directory and make it discoverable
+/// for child processes spawned by this app. This is best-effort and never blocks
+/// app startup.
 pub fn install_ctenoctl_symlink_if_needed() {
-    let target_exe = match ctenoctl_target_path() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("[ctenoctl] Failed to resolve target exe path: {}", e);
-            return;
-        }
-    };
-
-    let bin_dir = if cfg!(windows) {
-        dirs::data_local_dir().map(|d| d.join("bin"))
-    } else {
-        dirs::home_dir().map(|d| d.join(".local").join("bin"))
-    };
-
-    let bin_dir = match bin_dir {
-        Some(d) => d,
-        None => {
-            log::warn!("[ctenoctl] Failed to determine user bin directory");
-            return;
-        }
-    };
-
-    let link_name = if cfg!(windows) {
-        "ctenoctl.exe"
-    } else {
-        "ctenoctl"
-    };
-    let link_path = bin_dir.join(link_name);
-
-    if link_path.is_symlink() {
-        if let Ok(existing_target) = std::fs::read_link(&link_path) {
-            if existing_target == target_exe {
-                log::debug!("[ctenoctl] Symlink already up-to-date: {:?}", link_path);
-                return;
+    match install_ctenoctl_impl() {
+        Ok(()) => {
+            if let Ok(path) = ctenoctl_symlink_path() {
+                log::info!("[ctenoctl] Installed at {:?}", path);
             }
         }
+        Err(err) => log::warn!("[ctenoctl] Failed to install: {err}"),
     }
-
-    if let Err(e) = std::fs::create_dir_all(&bin_dir) {
-        log::warn!("[ctenoctl] Failed to create bin dir {:?}: {}", bin_dir, e);
-        return;
-    }
-
-    if link_path.exists() || link_path.is_symlink() {
-        if let Err(e) = std::fs::remove_file(&link_path) {
-            log::warn!("[ctenoctl] Failed to remove old {:?}: {}", link_path, e);
-            return;
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        if let Err(e) = std::os::unix::fs::symlink(&target_exe, &link_path) {
-            log::warn!("[ctenoctl] Failed to create symlink: {}", e);
-            return;
-        }
-    }
-    #[cfg(windows)]
-    {
-        if let Err(e) = std::os::windows::fs::symlink_file(&target_exe, &link_path) {
-            log::info!("[ctenoctl] Symlink failed, copying binary instead: {}", e);
-            if let Err(e2) = std::fs::copy(&target_exe, &link_path) {
-                log::warn!("[ctenoctl] Failed to copy binary: {}", e2);
-                return;
-            }
-        }
-    }
-
-    log::info!("[ctenoctl] Installed: {:?} -> {:?}", link_path, target_exe);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,78 +150,29 @@ pub struct CtenoCliInstallStatus {
 }
 
 fn install_ctenoctl_impl() -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let symlink_path = ctenoctl_symlink_path()?;
-        let target_path = ctenoctl_target_path()?;
+    let symlink_path = ctenoctl_symlink_path()?;
+    let target_path = ctenoctl_target_path()?;
+    let install_dir = symlink_path
+        .parent()
+        .ok_or_else(|| "Invalid ctenoctl install path".to_string())?
+        .to_path_buf();
 
-        if let Some(parent) = symlink_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
-        }
-
-        if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-            let metadata = symlink_path
-                .symlink_metadata()
-                .map_err(|e| format!("Failed to read {}: {}", symlink_path.display(), e))?;
-            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "{} exists and is a directory",
-                    symlink_path.display()
-                ));
-            }
-            fs::remove_file(&symlink_path).map_err(|e| {
-                format!(
-                    "Failed to remove existing {}: {}",
-                    symlink_path.display(),
-                    e
-                )
-            })?;
-        }
-
-        std::os::unix::fs::symlink(&target_path, &symlink_path).map_err(|e| {
-            format!(
-                "Failed to create symlink {} -> {}: {}",
-                symlink_path.display(),
-                target_path.display(),
-                e
-            )
-        })?;
-
-        Ok(())
+    install_ctenoctl_link_or_copy(&target_path, &symlink_path)?;
+    prepend_process_path(&install_dir);
+    if let Err(err) = persist_user_path(&install_dir) {
+        log::warn!(
+            "[ctenoctl] Installed for this app session, but failed to persist PATH: {}",
+            err
+        );
     }
-    #[cfg(not(unix))]
-    {
-        Err("ctenoctl installation is only supported on Unix-like systems".to_string())
-    }
+    Ok(())
 }
 
 fn get_ctenoctl_install_status_impl() -> Result<CtenoCliInstallStatus, String> {
     let symlink_path = ctenoctl_symlink_path()?;
     let target_path = ctenoctl_target_path()?;
 
-    #[cfg(unix)]
-    let installed = match symlink_path.symlink_metadata() {
-        Ok(meta) => {
-            if !meta.file_type().is_symlink() {
-                false
-            } else {
-                let actual = fs::read_link(&symlink_path).ok();
-                match actual {
-                    Some(actual_target) => {
-                        let actual_abs = absolutize_path(actual_target, symlink_path.parent());
-                        let expected_abs = canonicalize_or_keep(target_path.clone());
-                        actual_abs == expected_abs
-                    }
-                    None => false,
-                }
-            }
-        }
-        Err(_) => false,
-    };
-
-    #[cfg(not(unix))]
-    let installed = false;
+    let installed = ctenoctl_install_matches(&target_path, &symlink_path);
 
     let in_path = path_contains_dir(
         symlink_path
@@ -290,20 +180,21 @@ fn get_ctenoctl_install_status_impl() -> Result<CtenoCliInstallStatus, String> {
             .ok_or_else(|| "Invalid ctenoctl symlink path".to_string())?,
     );
 
+    let install_dir = symlink_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(default_ctenoctl_install_dir_hint);
+
     let path_hint = if in_path {
         None
+    } else if cfg!(windows) {
+        Some(format!("Add to User PATH: {}", install_dir))
     } else {
-        Some(format!(
-            "Add to your shell profile: export PATH=\"{}:$PATH\"",
-            symlink_path
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "~/.local/bin".to_string())
-        ))
+        Some(format!("Add to your shell profile: export PATH=\"{}:$PATH\"", install_dir))
     };
 
     Ok(CtenoCliInstallStatus {
-        supported: cfg!(unix),
+        supported: cfg!(unix) || cfg!(windows),
         installed,
         symlink_path: symlink_path.display().to_string(),
         target_path: target_path.display().to_string(),
@@ -341,13 +232,125 @@ fn ctenoctl_target_path() -> Result<PathBuf, String> {
 fn ctenoctl_symlink_path() -> Result<PathBuf, String> {
     let install_dir = match std::env::var("CTENO_CLI_INSTALL_DIR") {
         Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+        _ if cfg!(windows) => dirs::data_local_dir()
+            .ok_or_else(|| "Failed to resolve LocalAppData directory".to_string())?
+            .join("Cteno")
+            .join("bin"),
         _ => {
             let home =
                 dirs::home_dir().ok_or_else(|| "Failed to resolve home directory".to_string())?;
             home.join(".local").join("bin")
         }
     };
-    Ok(install_dir.join("ctenoctl"))
+    let binary_name = if cfg!(windows) {
+        "ctenoctl.exe"
+    } else {
+        "ctenoctl"
+    };
+    Ok(install_dir.join(binary_name))
+}
+
+fn default_ctenoctl_install_dir_hint() -> String {
+    if cfg!(windows) {
+        "%LOCALAPPDATA%\\Cteno\\bin".to_string()
+    } else {
+        "~/.local/bin".to_string()
+    }
+}
+
+fn install_ctenoctl_link_or_copy(target_path: &Path, symlink_path: &Path) -> Result<(), String> {
+    if let Some(parent) = symlink_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    if ctenoctl_install_matches(target_path, symlink_path) {
+        return Ok(());
+    }
+
+    if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+        let metadata = symlink_path
+            .symlink_metadata()
+            .map_err(|e| format!("Failed to read {}: {}", symlink_path.display(), e))?;
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            return Err(format!("{} exists and is a directory", symlink_path.display()));
+        }
+        fs::remove_file(symlink_path)
+            .map_err(|e| format!("Failed to remove existing {}: {}", symlink_path.display(), e))?;
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target_path, symlink_path).map_err(|e| {
+            format!(
+                "Failed to create symlink {} -> {}: {}",
+                symlink_path.display(),
+                target_path.display(),
+                e
+            )
+        })?;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Err(err) = std::os::windows::fs::symlink_file(target_path, symlink_path) {
+            log::info!("[ctenoctl] Symlink failed, copying binary instead: {}", err);
+            fs::copy(target_path, symlink_path).map_err(|e| {
+                format!(
+                    "Failed to copy {} to {}: {}",
+                    target_path.display(),
+                    symlink_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::copy(target_path, symlink_path).map_err(|e| {
+            format!(
+                "Failed to copy {} to {}: {}",
+                target_path.display(),
+                symlink_path.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn ctenoctl_install_matches(target_path: &Path, symlink_path: &Path) -> bool {
+    let Ok(meta) = symlink_path.symlink_metadata() else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        let Some(parent) = symlink_path.parent() else {
+            return false;
+        };
+        let Some(actual_target) = fs::read_link(symlink_path).ok() else {
+            return false;
+        };
+        return absolutize_path(actual_target, Some(parent))
+            == canonicalize_or_keep(target_path.to_path_buf());
+    }
+    if !meta.is_file() {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        let target_meta = fs::metadata(target_path).ok();
+        return target_meta
+            .map(|target| target.len() == meta.len())
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn canonicalize_or_keep(path: PathBuf) -> PathBuf {
@@ -366,11 +369,196 @@ fn absolutize_path(path: PathBuf, base_dir: Option<&Path>) -> PathBuf {
 }
 
 fn path_contains_dir(dir: &Path) -> bool {
+    let dir_abs = canonicalize_or_keep(dir.to_path_buf());
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|entry| {
+                let entry_abs = canonicalize_or_keep(entry);
+                if cfg!(windows) {
+                    entry_abs
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&dir_abs.to_string_lossy())
+                } else {
+                    entry_abs == dir_abs
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn prepend_process_path(dir: &Path) {
+    if path_contains_dir(dir) {
+        return;
+    }
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    match std::env::join_paths(paths) {
+        Ok(value) => std::env::set_var("PATH", value),
+        Err(err) => log::warn!("[ctenoctl] Failed to update process PATH: {}", err),
+    }
+}
+
+fn persist_user_path(dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        persist_user_path_windows(dir)
+    }
+
+    #[cfg(unix)]
+    {
+        persist_user_path_unix(dir)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn persist_user_path_unix(dir: &Path) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or_else(|| "Failed to resolve home directory".to_string())?;
     let dir_text = dir.display().to_string();
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|entry| entry == dir_text)
+    let export_line = format!("export PATH=\"{}:$PATH\"", dir_text);
+    let block = format!(
+        "\n# >>> ctenoctl >>>\n{}\n# <<< ctenoctl <<<\n",
+        export_line
+    );
+
+    let mut profiles = vec![home.join(".profile")];
+    if cfg!(target_os = "macos") {
+        profiles.insert(0, home.join(".zshrc"));
+    } else {
+        profiles.push(home.join(".bashrc"));
+        profiles.push(home.join(".zshrc"));
+    }
+
+    for profile in profiles {
+        upsert_path_block(&profile, &block)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Err(err) = persist_macos_launchd_path(dir) {
+        log::warn!(
+            "[ctenoctl] Failed to update launchd PATH for GUI apps: {}",
+            err
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn persist_macos_launchd_path(dir: &Path) -> Result<(), String> {
+    let current_from_launchd = Command::new("launchctl")
+        .args(["getenv", "PATH"])
+        .output()
+        .map_err(|e| format!("Failed to run launchctl getenv PATH: {}", e))?;
+
+    let mut current = if current_from_launchd.status.success() {
+        String::from_utf8_lossy(&current_from_launchd.stdout)
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    if current.is_empty() {
+        current = std::env::var("PATH").unwrap_or_default();
+    }
+
+    let next = prepend_path_text(dir, &current);
+    let status = Command::new("launchctl")
+        .args(["setenv", "PATH", &next])
+        .status()
+        .map_err(|e| format!("Failed to run launchctl setenv PATH: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("launchctl setenv PATH exited with status {}", status))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn prepend_path_text(dir: &Path, current: &str) -> String {
+    let dir_text = dir.display().to_string();
+    let dir_abs = canonicalize_or_keep(dir.to_path_buf());
+    let contains = current.split(':').any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        canonicalize_or_keep(PathBuf::from(entry)) == dir_abs
+    });
+
+    if contains {
+        current.to_string()
+    } else if current.is_empty() {
+        dir_text
+    } else {
+        format!("{}:{}", dir_text, current)
+    }
+}
+
+#[cfg(unix)]
+fn upsert_path_block(path: &Path, block: &str) -> Result<(), String> {
+    const START: &str = "# >>> ctenoctl >>>";
+    const END: &str = "# <<< ctenoctl <<<";
+
+    let original = fs::read_to_string(path).unwrap_or_default();
+    let next = if let Some(start) = original.find(START) {
+        if let Some(end_rel) = original[start..].find(END) {
+            let end = start + end_rel + END.len();
+            format!(
+                "{}{}{}",
+                original[..start].trim_end(),
+                block,
+                original[end..].trim_start()
+            )
+        } else {
+            format!("{}{}", original.trim_end(), block)
+        }
+    } else {
+        format!("{}{}", original.trim_end(), block)
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    fs::write(path, next).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+#[cfg(windows)]
+fn persist_user_path_windows(dir: &Path) -> Result<(), String> {
+    let dir_text = dir.display().to_string();
+    let script = r#"
+$dir = $args[0]
+$old = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ([string]::IsNullOrWhiteSpace($old)) {
+  [Environment]::SetEnvironmentVariable('Path', $dir, 'User')
+  exit 0
+}
+$parts = $old -split ';' | Where-Object { $_ -ne '' }
+foreach ($part in $parts) {
+  if ([string]::Equals($part.TrimEnd([char]'\'), $dir.TrimEnd([char]'\'), [StringComparison]::OrdinalIgnoreCase)) {
+    exit 0
+  }
+}
+[Environment]::SetEnvironmentVariable('Path', "$dir;$old", 'User')
+"#;
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script, &dir_text])
+        .status()
+        .map_err(|e| format!("Failed to run powershell: {}", e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("powershell exited with status {}", status))
+    }
 }
 
 fn request_permission_impl(kind: PermissionKind) -> Result<(), String> {

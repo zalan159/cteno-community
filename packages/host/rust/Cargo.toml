@@ -6,7 +6,7 @@ members = [
   "crates/cteno-host-session-registry",
   "crates/cteno-host-session-codec",
   "crates/cteno-host-session-wire",
-  "crates/cteno-host-usage-monitor",
+  "crates/cteno-host-quota-monitor",
   "crates/cteno-host-memory-mcp",
   "crates/cteno-host-agent-sync",
 ]

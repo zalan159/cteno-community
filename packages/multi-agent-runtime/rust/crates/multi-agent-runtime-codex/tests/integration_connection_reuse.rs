@@ -134,6 +134,7 @@ async fn live_two_threads_share_one_app_server_then_interrupt_a_completes_b() {
         .send_message(
             &sess_a,
             UserMessage {
+                task_id: None,
                 content:
                     "Count slowly from 1 to 50 with a short pause. Don't stop until you reach 50."
                         .to_string(),
@@ -154,7 +155,8 @@ async fn live_two_threads_share_one_app_server_then_interrupt_a_completes_b() {
             .send_message(
                 &sess_b_clone,
                 UserMessage {
-                    content: "Say 'hello from B' and stop.".to_string(),
+                task_id: None,
+                content: "Say 'hello from B' and stop.".to_string(),
                     attachments: Vec::new(),
                     parent_tool_use_id: None,
                     injected_tools: Vec::new(),

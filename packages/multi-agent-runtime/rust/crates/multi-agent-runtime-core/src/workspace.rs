@@ -107,7 +107,7 @@ mod tests {
             orchestrator_prompt: None,
             allowed_tools: None,
             disallowed_tools: None,
-            permission_mode: Some(PermissionMode::default()),
+            permission_mode: Some(PermissionMode::Default),
             setting_sources: None,
             roles: vec![RoleSpec {
                 id: "coder".to_string(),
@@ -118,6 +118,7 @@ mod tests {
                 agent: RoleAgentSpec {
                     description: "Writes code".to_string(),
                     prompt: "Implement changes".to_string(),
+                    provider: Some(MultiAgentProvider::Cteno),
                     tools: None,
                     disallowed_tools: None,
                     model: None,

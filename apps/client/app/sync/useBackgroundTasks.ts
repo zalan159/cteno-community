@@ -26,7 +26,9 @@ function normalizeBackgroundTaskUpdate(payload: unknown): BackgroundTaskUpdate {
     return {
         sessionId: typeof (payload as { sessionId?: unknown }).sessionId === 'string'
             ? (payload as { sessionId: string }).sessionId
-            : undefined,
+            : typeof (payload as { session_id?: unknown }).session_id === 'string'
+                ? (payload as { session_id: string }).session_id
+                : undefined,
     };
 }
 

@@ -105,6 +105,7 @@ async fn two_sessions_on_one_connection_route_independent_events() {
         .send_message(
             &s1,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "hi".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -118,6 +119,7 @@ async fn two_sessions_on_one_connection_route_independent_events() {
         .send_message(
             &s2,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "hi".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -167,6 +169,7 @@ async fn send_message_completes_with_turn_complete_and_usage() {
         .send_message(
             &session,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "hi".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -243,6 +246,7 @@ async fn respond_to_permission_correlates_by_inbound_request_id() {
         .send_message(
             &session,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "please run".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -368,6 +372,7 @@ async fn apply_model_skips_set_model_when_provider_is_not_gemini() {
         .send_message(
             &session,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "hi".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -412,6 +417,7 @@ async fn apply_model_skips_set_model_for_unknown_gemini_id() {
         .send_message(
             &session,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "hi".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -487,7 +493,8 @@ async fn apply_model_does_not_poison_shared_connection_across_sessions() {
             .send_message(
                 session,
                 multi_agent_runtime_core::UserMessage {
-                    content: "hi".to_string(),
+                task_id: None,
+                content: "hi".to_string(),
                     attachments: Vec::new(),
                     parent_tool_use_id: None,
                     injected_tools: Vec::new(),
@@ -545,6 +552,7 @@ async fn live_smoke_initialize_plus_prompt() {
         .send_message(
             &session,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "Reply with exactly the single word PONG.".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,
@@ -595,6 +603,7 @@ async fn live_bogus_model_does_not_surface_500() {
         .send_message(
             &session,
             multi_agent_runtime_core::UserMessage {
+                task_id: None,
                 content: "Reply with exactly PONG.".to_string(),
                 attachments: Vec::new(),
                 parent_tool_use_id: None,

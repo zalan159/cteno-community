@@ -41,11 +41,7 @@ pub struct InjectedToolExecutor {
 }
 
 impl InjectedToolExecutor {
-    pub fn new(
-        tool_name: String,
-        writer: OutboundWriter,
-        pending: PendingToolExecs,
-    ) -> Self {
+    pub fn new(tool_name: String, writer: OutboundWriter, pending: PendingToolExecs) -> Self {
         Self {
             tool_name,
             writer,

@@ -117,6 +117,12 @@ pub fn setup_tauri_host(
         ),
     ));
 
+    // Install the SubAgent mirror so subagent lifecycle events from
+    // cteno-agent get reflected into a host-side registry the
+    // BackgroundRunsModal can read via list_subagents RPC + the
+    // `local-session:subagents-updated` Tauri event.
+    crate::subagent_mirror::install(app.handle().clone());
+
     // Install the unified AuthStore before any other service so the agent
     // runtime's CredentialsProvider hook is ready on the first tool call.
     if let Err(e) = crate::auth_store_boot::install_auth_store(&host_paths.app_data_dir) {

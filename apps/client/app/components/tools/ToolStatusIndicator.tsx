@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { ToolCall } from '@/sync/typesMessage';
 interface ToolStatusIndicatorProps {
@@ -17,7 +17,7 @@ export function ToolStatusIndicator({ tool }: ToolStatusIndicatorProps) {
 function StatusIndicator({ state }: { state: ToolCall['state'] }) {
     switch (state) {
         case 'running':
-            return <ActivityIndicator size="small" color="#007AFF" />;
+            return null;
         case 'completed':
             return <Ionicons name="checkmark-circle" size={22} color="#34C759" />;
         case 'error':

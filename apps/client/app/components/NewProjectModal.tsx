@@ -29,6 +29,7 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
     const [workdir, setWorkdir] = useState('~/');
     const [saving, setSaving] = useState(false);
     const [showDirectoryPicker, setShowDirectoryPicker] = useState(false);
+    const canBrowseDirectories = !!machineId && !!homeDir;
 
     // Match sidebar width calculation from SidebarNavigator/SidebarView
     const sidebarWidth = Math.min(Math.max(Math.floor(windowWidth * 0.3), 250), 360);
@@ -111,9 +112,16 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
                     }}
                 />
                 <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10 }}>
-                    <Pressable onPress={() => setShowDirectoryPicker(true)}>
-                        <Text style={{ fontSize: 13, color: theme.colors.textLink, ...Typography.default('semiBold') }}>
-                            浏览或新建目录
+                    <Pressable
+                        onPress={() => canBrowseDirectories && setShowDirectoryPicker(true)}
+                        disabled={!canBrowseDirectories}
+                    >
+                        <Text style={{
+                            fontSize: 13,
+                            color: canBrowseDirectories ? theme.colors.textLink : theme.colors.textSecondary,
+                            ...Typography.default('semiBold'),
+                        }}>
+                            {canBrowseDirectories ? '浏览或新建目录' : '目录信息加载中'}
                         </Text>
                     </Pressable>
                 </View>

@@ -8,7 +8,7 @@ mod commercial_impl {
     use qrcode::{render::unicode, QrCode};
     use serde_json::{json, Value};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::time::{sleep, Duration};
@@ -1176,34 +1176,414 @@ mod commercial_impl {
         let sub = args.first().map(String::as_str);
 
         match sub {
+            Some("schema") => print_json(&memory_cli_schema()),
             Some("list") => {
-                let result = rpc_call("memory-list-files", json!({})).await?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&result).unwrap_or_default()
-                );
-                Ok(())
+                let opts = parse_memory_options(&args[1..])?;
+                let workspace = memory_workspace_dir()?;
+                let persona_workdir = opts.persona_workdir()?;
+                let files = cteno_community_core::memory::memory_list_core(
+                    &workspace,
+                    persona_workdir.as_deref(),
+                )?;
+                let data: Vec<String> = match opts.scope {
+                    MemoryCliScope::Private => files
+                        .into_iter()
+                        .filter(|path| path.starts_with("[private] "))
+                        .collect(),
+                    MemoryCliScope::Global => files
+                        .into_iter()
+                        .filter(|path| path.starts_with("[global] "))
+                        .collect(),
+                    MemoryCliScope::Auto => files,
+                };
+                print_json(&json!({
+                    "success": true,
+                    "data": data,
+                    "scope": opts.scope.as_str(),
+                    "projectDir": opts.project_dir_display(),
+                }))
+            }
+            Some("recall") | Some("search") => {
+                let opts = parse_memory_options(&args[1..])?;
+                let query = opts
+                    .query
+                    .as_deref()
+                    .or_else(|| opts.positionals.first().map(String::as_str))
+                    .ok_or("Usage: ctenoctl memory recall --query <text> [--project-dir <path>]")?;
+                let workspace = memory_workspace_dir()?;
+                let persona_workdir = opts.persona_workdir()?;
+                let chunks = cteno_community_core::memory::memory_search_core(
+                    &workspace,
+                    query,
+                    persona_workdir.as_deref(),
+                    opts.limit.unwrap_or(10),
+                    opts.memory_type.as_deref(),
+                )?;
+                print_json(&json!({
+                    "success": true,
+                    "data": chunks,
+                    "scope": opts.scope.as_str(),
+                    "projectDir": opts.project_dir_display(),
+                }))
             }
             Some("read") => {
-                let key = args.get(1).ok_or("Usage: ctenoctl memory read <key>")?;
-
-                let result = rpc_call("memory-read", json!({ "key": key })).await?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&result).unwrap_or_default()
-                );
-                Ok(())
+                let opts = parse_memory_options(&args[1..])?;
+                let file_path = opts
+                    .file_path
+                    .as_deref()
+                    .or_else(|| opts.positionals.first().map(String::as_str))
+                    .ok_or("Usage: ctenoctl memory read <file_path> [--project-dir <path>]")?;
+                let workspace = memory_workspace_dir()?;
+                let persona_workdir = opts.persona_workdir()?;
+                let content = cteno_community_core::memory::memory_read_core(
+                    &workspace,
+                    file_path,
+                    persona_workdir.as_deref(),
+                )?;
+                let found = content.is_some();
+                print_json(&json!({
+                    "success": true,
+                    "data": content,
+                    "found": found,
+                    "scope": opts.scope.as_str(),
+                    "projectDir": opts.project_dir_display(),
+                }))
+            }
+            Some("save") | Some("write") => {
+                let opts = parse_memory_options(&args[1..])?;
+                let file_path = opts
+                    .file_path
+                    .as_deref()
+                    .or_else(|| opts.positionals.first().map(String::as_str))
+                    .ok_or("Usage: ctenoctl memory save --file-path <path> --content <markdown>")?;
+                let content = opts
+                    .content
+                    .as_deref()
+                    .or_else(|| opts.positionals.get(1).map(String::as_str))
+                    .ok_or("Usage: ctenoctl memory save --file-path <path> --content <markdown>")?;
+                let workspace = memory_workspace_dir()?;
+                let persona_workdir = opts.write_persona_workdir()?;
+                cteno_community_core::memory::memory_write_core(
+                    &workspace,
+                    file_path,
+                    content,
+                    persona_workdir.as_deref(),
+                )?;
+                print_json(&json!({
+                    "success": true,
+                    "action": "save",
+                    "filePath": file_path,
+                    "scope": opts.scope.as_str(),
+                    "projectDir": opts.project_dir_display(),
+                }))
+            }
+            Some("append") => {
+                let opts = parse_memory_options(&args[1..])?;
+                let file_path = opts
+                    .file_path
+                    .as_deref()
+                    .or_else(|| opts.positionals.first().map(String::as_str))
+                    .ok_or(
+                        "Usage: ctenoctl memory append --file-path <path> --content <markdown>",
+                    )?;
+                let content = opts
+                    .content
+                    .as_deref()
+                    .or_else(|| opts.positionals.get(1).map(String::as_str))
+                    .ok_or(
+                        "Usage: ctenoctl memory append --file-path <path> --content <markdown>",
+                    )?;
+                let workspace = memory_workspace_dir()?;
+                let persona_workdir = opts.write_persona_workdir()?;
+                cteno_community_core::memory::memory_append_core(
+                    &workspace,
+                    file_path,
+                    content,
+                    persona_workdir.as_deref(),
+                )?;
+                print_json(&json!({
+                    "success": true,
+                    "action": "append",
+                    "filePath": file_path,
+                    "scope": opts.scope.as_str(),
+                    "projectDir": opts.project_dir_display(),
+                }))
+            }
+            Some("delete") | Some("rm") => {
+                let opts = parse_memory_options(&args[1..])?;
+                let file_path = opts
+                    .file_path
+                    .as_deref()
+                    .or_else(|| opts.positionals.first().map(String::as_str))
+                    .ok_or("Usage: ctenoctl memory delete <file_path> [--project-dir <path>]")?;
+                let workspace = memory_workspace_dir()?;
+                let persona_workdir = opts.write_persona_workdir()?;
+                cteno_community_core::memory::memory_delete_core(
+                    &workspace,
+                    file_path,
+                    persona_workdir.as_deref(),
+                )?;
+                print_json(&json!({
+                    "success": true,
+                    "action": "delete",
+                    "filePath": file_path,
+                    "scope": opts.scope.as_str(),
+                    "projectDir": opts.project_dir_display(),
+                }))
             }
             Some("--help") | Some("-h") | None => {
-                println!("Usage: ctenoctl memory <subcommand>");
-                println!();
-                println!("Subcommands:");
-                println!("  list              List memory files");
-                println!("  read <key>        Read a memory entry");
+                print_memory_help();
                 Ok(())
             }
             Some(other) => Err(format!("Unknown memory subcommand: {}", other)),
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MemoryCliScope {
+        Auto,
+        Private,
+        Global,
+    }
+
+    impl MemoryCliScope {
+        fn as_str(self) -> &'static str {
+            match self {
+                MemoryCliScope::Auto => "auto",
+                MemoryCliScope::Private => "private",
+                MemoryCliScope::Global => "global",
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct MemoryCliOptions {
+        project_dir: Option<PathBuf>,
+        scope: MemoryCliScope,
+        limit: Option<usize>,
+        memory_type: Option<String>,
+        query: Option<String>,
+        file_path: Option<String>,
+        content: Option<String>,
+        positionals: Vec<String>,
+    }
+
+    impl MemoryCliOptions {
+        fn project_dir_or_cwd(&self) -> Result<PathBuf, String> {
+            match &self.project_dir {
+                Some(path) => Ok(expand_path(path)),
+                None => std::env::current_dir().map_err(|e| format!("resolve current_dir: {e}")),
+            }
+        }
+
+        fn persona_workdir(&self) -> Result<Option<String>, String> {
+            match self.scope {
+                MemoryCliScope::Global => Ok(None),
+                MemoryCliScope::Auto | MemoryCliScope::Private => {
+                    Ok(Some(self.project_dir_or_cwd()?.display().to_string()))
+                }
+            }
+        }
+
+        fn write_persona_workdir(&self) -> Result<Option<String>, String> {
+            match self.scope {
+                MemoryCliScope::Global => Ok(None),
+                MemoryCliScope::Auto | MemoryCliScope::Private => {
+                    Ok(Some(self.project_dir_or_cwd()?.display().to_string()))
+                }
+            }
+        }
+
+        fn project_dir_display(&self) -> Option<String> {
+            match self.scope {
+                MemoryCliScope::Global => None,
+                MemoryCliScope::Auto | MemoryCliScope::Private => self
+                    .project_dir_or_cwd()
+                    .ok()
+                    .map(|path| path.display().to_string()),
+            }
+        }
+    }
+
+    fn parse_memory_options(args: &[String]) -> Result<MemoryCliOptions, String> {
+        let mut opts = MemoryCliOptions {
+            project_dir: None,
+            scope: MemoryCliScope::Auto,
+            limit: None,
+            memory_type: None,
+            query: None,
+            file_path: None,
+            content: None,
+            positionals: Vec::new(),
+        };
+
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "--project-dir" | "--workdir" => {
+                    i += 1;
+                    let value = args.get(i).ok_or(format!("Missing value for {arg}"))?;
+                    opts.project_dir = Some(PathBuf::from(value));
+                }
+                "--scope" => {
+                    i += 1;
+                    let value = args.get(i).ok_or("Missing value for --scope")?;
+                    opts.scope = match value.as_str() {
+                        "auto" => MemoryCliScope::Auto,
+                        "private" | "project" => MemoryCliScope::Private,
+                        "global" => MemoryCliScope::Global,
+                        other => {
+                            return Err(format!(
+                                "Invalid --scope '{}'. Use auto, private, or global.",
+                                other
+                            ));
+                        }
+                    };
+                }
+                "--limit" => {
+                    i += 1;
+                    let value = args.get(i).ok_or("Missing value for --limit")?;
+                    opts.limit = Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| format!("Invalid --limit '{}'", value))?,
+                    );
+                }
+                "--type" => {
+                    i += 1;
+                    opts.memory_type = Some(args.get(i).ok_or("Missing value for --type")?.clone());
+                }
+                "--query" | "-q" => {
+                    i += 1;
+                    opts.query = Some(
+                        args.get(i)
+                            .ok_or(format!("Missing value for {arg}"))?
+                            .clone(),
+                    );
+                }
+                "--file-path" | "--path" | "--key" => {
+                    i += 1;
+                    opts.file_path = Some(
+                        args.get(i)
+                            .ok_or(format!("Missing value for {arg}"))?
+                            .clone(),
+                    );
+                }
+                "--content" => {
+                    i += 1;
+                    opts.content = Some(args.get(i).ok_or("Missing value for --content")?.clone());
+                }
+                "--json" => {}
+                "--help" | "-h" => {
+                    print_memory_help();
+                    return Err("".to_string());
+                }
+                flag if flag.starts_with("--") => {
+                    return Err(format!("Unknown memory option: {}", flag));
+                }
+                value => opts.positionals.push(value.to_string()),
+            }
+            i += 1;
+        }
+
+        Ok(opts)
+    }
+
+    fn memory_workspace_dir() -> Result<PathBuf, String> {
+        let target = std::env::var("CTENO_ENV").ok();
+        let identity = core::resolve_cli_target_identity_paths(target.as_deref())?;
+        let workspace = identity.app_data_dir.join("workspace");
+        std::fs::create_dir_all(&workspace)
+            .map_err(|e| format!("Failed to create {}: {}", workspace.display(), e))?;
+        Ok(workspace)
+    }
+
+    fn expand_path(path: &Path) -> PathBuf {
+        let s = path.to_string_lossy();
+        let expanded = shellexpand::tilde(&s);
+        PathBuf::from(expanded.as_ref())
+    }
+
+    fn memory_cli_schema() -> Value {
+        json!({
+            "name": "ctenoctl memory",
+            "description": "Direct CLI bridge for Cteno markdown memory. No MCP server is required.",
+            "commands": {
+                "list": {
+                    "args": {
+                        "project_dir": { "type": "string", "required": false },
+                        "scope": { "type": "string", "enum": ["auto", "private", "global"], "default": "auto" }
+                    }
+                },
+                "recall": {
+                    "args": {
+                        "query": { "type": "string", "required": true },
+                        "project_dir": { "type": "string", "required": false },
+                        "limit": { "type": "integer", "default": 10 },
+                        "type": { "type": "string", "required": false }
+                    }
+                },
+                "read": {
+                    "args": {
+                        "file_path": { "type": "string", "required": true },
+                        "project_dir": { "type": "string", "required": false },
+                        "scope": { "type": "string", "enum": ["auto", "private", "global"], "default": "auto" }
+                    }
+                },
+                "save": {
+                    "args": {
+                        "file_path": { "type": "string", "required": true },
+                        "content": { "type": "string", "required": true },
+                        "project_dir": { "type": "string", "required": false },
+                        "scope": { "type": "string", "enum": ["private", "global"], "default": "private" }
+                    }
+                },
+                "append": {
+                    "args": {
+                        "file_path": { "type": "string", "required": true },
+                        "content": { "type": "string", "required": true },
+                        "project_dir": { "type": "string", "required": false },
+                        "scope": { "type": "string", "enum": ["private", "global"], "default": "private" }
+                    }
+                },
+                "delete": {
+                    "args": {
+                        "file_path": { "type": "string", "required": true },
+                        "project_dir": { "type": "string", "required": false },
+                        "scope": { "type": "string", "enum": ["private", "global"], "default": "private" }
+                    }
+                }
+            },
+            "output": { "success": "boolean", "data": "command-specific JSON" }
+        })
+    }
+
+    fn print_memory_help() {
+        println!("Usage: ctenoctl memory <subcommand> [options]");
+        println!();
+        println!("Subcommands:");
+        println!("  schema                         Print machine-readable command schema");
+        println!("  list [--project-dir <path>]    List memory files");
+        println!("  recall --query <text>          Search memory chunks");
+        println!("  read <file_path>               Read a memory file");
+        println!("  save --file-path <path> --content <markdown>");
+        println!("  append --file-path <path> --content <markdown>");
+        println!("  delete <file_path>");
+        println!();
+        println!("Options:");
+        println!("  --project-dir, --workdir <path>  Project root for private memory");
+        println!("  --scope auto|private|global      Memory scope (default: auto)");
+        println!("  --limit <n>                      Recall result limit (default: 10)");
+        println!("  --type <frontmatter-type>        Filter recall by YAML frontmatter type");
+    }
+
+    fn print_json(value: &Value) -> Result<(), String> {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).map_err(|e| e.to_string())?
+        );
+        Ok(())
     }
 
     // ============================================================================

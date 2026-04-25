@@ -66,18 +66,80 @@ pub async fn local_rpc(
     scope_id: String,
     params: serde_json::Value,
     state: tauri::State<'_, RpcRegistryState>,
+    local_host: tauri::State<'_, LocalHostInfoState>,
 ) -> Result<serde_json::Value, String> {
     let full_method = format!("{}:{}", scope_id, method);
     let request = cteno_host_rpc_core::RpcRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         method: full_method,
-        params,
+        params: params.clone(),
     };
     let response = state.0.handle(request).await;
     if let Some(error) = response.error {
+        let local_machine_id = local_host.machine_id.trim();
+        if is_unknown_method_error(&error)
+            && is_machine_scope_id(&scope_id)
+            && !local_machine_id.is_empty()
+            && scope_id != local_machine_id
+        {
+            let local_method = format!("{}:{}", local_machine_id, method);
+            if state.0.has_method(&local_method).await {
+                log::warn!(
+                    "[LocalIPC] Retrying machine RPC '{}' from stale scope '{}' on local machine '{}'",
+                    method,
+                    scope_id,
+                    local_machine_id
+                );
+                let retry = cteno_host_rpc_core::RpcRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    method: local_method,
+                    params,
+                };
+                let retry_response = state.0.handle(retry).await;
+                if let Some(retry_error) = retry_response.error {
+                    return Err(retry_error);
+                }
+                return Ok(retry_response.result.unwrap_or(serde_json::Value::Null));
+            }
+        }
         Err(error)
     } else {
         Ok(response.result.unwrap_or(serde_json::Value::Null))
+    }
+}
+
+fn is_unknown_method_error(error: &str) -> bool {
+    error.contains("Unknown method") || error.contains("No handler registered")
+}
+
+fn is_machine_scope_id(scope_id: &str) -> bool {
+    scope_id.starts_with("cteno-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_machine_scope_id, is_unknown_method_error};
+
+    #[test]
+    fn stale_machine_retry_only_targets_cteno_machine_scopes() {
+        assert!(is_machine_scope_id(
+            "cteno-199fba5c-9535-4220-8fb0-8db64c5368b2"
+        ));
+        assert!(!is_machine_scope_id(
+            "session-199fba5c-9535-4220-8fb0-8db64c5368b2"
+        ));
+        assert!(!is_machine_scope_id("199fba5c-9535-4220-8fb0-8db64c5368b2"));
+    }
+
+    #[test]
+    fn stale_machine_retry_only_handles_missing_handler_errors() {
+        assert!(is_unknown_method_error(
+            "Unknown method: cteno-old:create-persona"
+        ));
+        assert!(is_unknown_method_error(
+            "No handler registered for method: cteno-old:create-persona"
+        ));
+        assert!(!is_unknown_method_error("Persona not found"));
     }
 }
 

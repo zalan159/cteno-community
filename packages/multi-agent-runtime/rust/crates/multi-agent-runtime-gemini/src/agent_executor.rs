@@ -31,7 +31,7 @@ use multi_agent_runtime_core::{
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -127,15 +127,25 @@ impl GeminiAgentExecutor {
             }
         });
 
-        let response = timeout(
+        let response = match timeout(
             self.spawn_ready_timeout,
             conn.call("initialize", init_params),
         )
         .await
-        .map_err(|_| AgentExecutorError::Timeout {
-            operation: "initialize".to_string(),
-            seconds: self.spawn_ready_timeout.as_secs(),
-        })??;
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                Arc::clone(&conn).shutdown().await;
+                return Err(err);
+            }
+            Err(_) => {
+                Arc::clone(&conn).shutdown().await;
+                return Err(AgentExecutorError::Timeout {
+                    operation: "initialize".to_string(),
+                    seconds: self.spawn_ready_timeout.as_secs(),
+                });
+            }
+        };
 
         // Cache auth methods + capabilities.
         if let Some(methods) = response.get("authMethods").and_then(Value::as_array) {
@@ -222,8 +232,16 @@ impl GeminiAgentExecutor {
             conn.ingest_available_models(available).await;
         }
 
+        let initial_model = response
+            .pointer("/models/currentModelId")
+            .and_then(Value::as_str)
+            .or_else(|| spec.model.as_ref().map(|model| model.model_id.as_str()))
+            .map(ToOwned::to_owned);
+
         // Register session state on the connection.
-        let state = conn.register_session(session_id.as_str().to_string()).await;
+        let state = conn
+            .register_session(session_id.as_str().to_string(), initial_model)
+            .await;
 
         // Apply requested permission mode / model if necessary.
         if !matches!(spec.permission_mode, PermissionMode::Default) {
@@ -336,6 +354,9 @@ impl GeminiAgentExecutor {
             "modelId": model.model_id,
         });
         conn.call("session/set_model", params).await?;
+        if let Some(state) = conn.get_session(session_id).await {
+            *state.current_model.lock().await = Some(model.model_id.clone());
+        }
         Ok(())
     }
 
@@ -417,6 +438,7 @@ impl AgentExecutor for GeminiAgentExecutor {
             supports_injected_tools: false,
             supports_permission_closure: true,
             supports_interrupt: true,
+            autonomous_turn: false,
         }
     }
 
@@ -441,7 +463,7 @@ impl AgentExecutor for GeminiAgentExecutor {
             .unwrap_or(false);
         if !supports_load {
             return Err(AgentExecutorError::Unsupported {
-                capability: "resume_session",
+                capability: "resume_session".to_string(),
             });
         }
 
@@ -507,10 +529,38 @@ impl AgentExecutor for GeminiAgentExecutor {
         let prompt_conn = Arc::clone(&conn);
         let turn_timeout = self.turn_timeout;
         let events_tx = state.events_tx.clone();
+        let state_for_timeout = Arc::clone(&state);
 
         tokio::spawn(async move {
-            match timeout(turn_timeout, prompt_conn.call("session/prompt", params)).await {
-                Ok(Ok(response)) => {
+            let prompt_call = prompt_conn.call("session/prompt", params);
+            tokio::pin!(prompt_call);
+            let deadline = tokio::time::sleep(turn_timeout);
+            tokio::pin!(deadline);
+            let mut permission_tick = tokio::time::interval(Duration::from_secs(1));
+
+            let response = loop {
+                tokio::select! {
+                    response = &mut prompt_call => break response,
+                    _ = &mut deadline, if state_for_timeout.pending_permission_count.load(std::sync::atomic::Ordering::SeqCst) == 0 => {
+                        let _ = events_tx.send(ExecutorEvent::Error {
+                            message: format!(
+                                "gemini session/prompt timed out after {}s",
+                                turn_timeout.as_secs()
+                            ),
+                            recoverable: true,
+                        });
+                        return;
+                    }
+                    _ = permission_tick.tick(), if state_for_timeout.pending_permission_count.load(std::sync::atomic::Ordering::SeqCst) > 0 => {
+                        deadline
+                            .as_mut()
+                            .reset(Instant::now() + turn_timeout);
+                    }
+                }
+            };
+
+            match response {
+                Ok(response) => {
                     let stop_reason = response
                         .get("stopReason")
                         .and_then(Value::as_str)
@@ -531,6 +581,14 @@ impl AgentExecutor for GeminiAgentExecutor {
                     // indicator X value never updates for gemini sessions.
                     if usage.input_tokens > 0 || usage.output_tokens > 0 {
                         let _ = events_tx.send(ExecutorEvent::UsageUpdate(usage.clone()));
+                        let model_hint = state_for_timeout.current_model.lock().await.clone();
+                        if let Some(event) = gemini_context_usage_native_event(
+                            &response,
+                            &usage,
+                            model_hint.as_deref(),
+                        ) {
+                            let _ = events_tx.send(event);
+                        }
                     }
                     let _ = events_tx.send(ExecutorEvent::TurnComplete {
                         final_text: None,
@@ -541,18 +599,9 @@ impl AgentExecutor for GeminiAgentExecutor {
                         log::debug!("gemini turn end stopReason={reason}");
                     }
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     let _ = events_tx.send(ExecutorEvent::Error {
                         message: format!("gemini session/prompt failed: {err}"),
-                        recoverable: true,
-                    });
-                }
-                Err(_) => {
-                    let _ = events_tx.send(ExecutorEvent::Error {
-                        message: format!(
-                            "gemini session/prompt timed out after {}s",
-                            turn_timeout.as_secs()
-                        ),
                         recoverable: true,
                     });
                 }
@@ -634,6 +683,11 @@ impl AgentExecutor for GeminiAgentExecutor {
                 ))
             })?;
         let outcome = permission_decision_outcome(decision);
+        let _ = state.pending_permission_count.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |count| Some(count.saturating_sub(1)),
+        );
         reply_tx.send(outcome).map_err(|_| {
             AgentExecutorError::Protocol(
                 "gemini permission reply channel dropped before forwarding".to_string(),
@@ -845,25 +899,89 @@ fn extract_usage(response: &Value) -> multi_agent_runtime_core::TokenUsage {
     }
 }
 
-fn find_f64_by_keys(value: &Value, keys: &[&str]) -> Option<f64> {
-    match value {
-        Value::Object(map) => {
-            for key in keys {
-                if let Some(found) = map.get(*key).and_then(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_u64().map(|n| n as f64))
-                        .or_else(|| v.as_i64().map(|n| n as f64))
-                }) {
-                    return Some(found);
-                }
-            }
-            map.values()
-                .find_map(|nested| find_f64_by_keys(nested, keys))
-        }
-        Value::Array(items) => items
-            .iter()
-            .find_map(|nested| find_f64_by_keys(nested, keys)),
-        _ => None,
+fn gemini_context_usage_native_event(
+    response: &Value,
+    usage: &multi_agent_runtime_core::TokenUsage,
+    model_hint: Option<&str>,
+) -> Option<ExecutorEvent> {
+    let total_tokens = usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .saturating_add(usage.cache_creation_tokens)
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.reasoning_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let model = response_model(response).or_else(|| {
+        model_hint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    let context_window = explicit_context_window(response)
+        .or_else(|| model.as_deref().and_then(gemini_model_context_window));
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "kind".to_string(),
+        Value::String("context_usage".to_string()),
+    );
+    payload.insert("total_tokens".to_string(), Value::from(total_tokens));
+    if let Some(context_window) = context_window {
+        payload.insert("max_tokens".to_string(), Value::from(context_window));
+        payload.insert("raw_max_tokens".to_string(), Value::from(context_window));
+    }
+    if let Some(model) = model {
+        payload.insert("model".to_string(), Value::String(model));
+    }
+
+    Some(ExecutorEvent::NativeEvent {
+        provider: Cow::Borrowed(VENDOR_NAME),
+        payload: Value::Object(payload),
+    })
+}
+
+fn response_model(response: &Value) -> Option<String> {
+    response
+        .pointer("/_meta/quota/model_usage/0/model")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("model").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn explicit_context_window(response: &Value) -> Option<u64> {
+    find_u64_by_keys(
+        response,
+        &[
+            "context_window",
+            "contextWindow",
+            "model_context_window",
+            "modelContextWindow",
+            "max_tokens",
+            "maxTokens",
+            "raw_max_tokens",
+            "rawMaxTokens",
+        ],
+    )
+}
+
+fn gemini_model_context_window(model: &str) -> Option<u64> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    // Mirrors Gemini CLI's `tokenLimit()` as of the local reference:
+    // all supported Gemini 2.5 / 3.x CLI models use a 1,048,576-token window,
+    // and the CLI defaults unknown Gemini model ids to the same value.
+    if model.starts_with("gemini-") || model.starts_with("auto-gemini-") {
+        Some(1_048_576)
+    } else {
+        None
     }
 }
 
@@ -882,5 +1000,123 @@ fn find_u64_by_keys(value: &Value, keys: &[&str]) -> Option<u64> {
             .iter()
             .find_map(|nested| find_u64_by_keys(nested, keys)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_mode_mapping_matches_gemini_acp_mode_ids() {
+        assert_eq!(permission_mode_id(PermissionMode::Default), "default");
+        assert_eq!(permission_mode_id(PermissionMode::AcceptEdits), "autoEdit");
+        assert_eq!(permission_mode_id(PermissionMode::Plan), "plan");
+        assert_eq!(
+            permission_mode_id(PermissionMode::BypassPermissions),
+            "yolo"
+        );
+        assert_eq!(
+            permission_mode_id(PermissionMode::WorkspaceWrite),
+            "autoEdit"
+        );
+        assert_eq!(permission_mode_id(PermissionMode::DangerFullAccess), "yolo");
+    }
+
+    #[test]
+    fn prompt_response_maps_model_usage_to_context_usage_native_event() {
+        let usage = extract_usage(&json!({
+            "stopReason": "end_turn",
+            "_meta": {
+                "quota": {
+                    "token_count": {
+                        "input_tokens": 11_700,
+                        "output_tokens": 2,
+                        "reasoning_tokens": 3
+                    },
+                    "model_usage": [{
+                        "model": "gemini-3-flash-preview",
+                        "token_count": {
+                            "input_tokens": 11_700,
+                            "output_tokens": 2
+                        }
+                    }]
+                }
+            }
+        }));
+        let event = gemini_context_usage_native_event(
+            &json!({
+                "_meta": {
+                    "quota": {
+                        "model_usage": [{
+                            "model": "gemini-3-flash-preview"
+                        }]
+                    }
+                }
+            }),
+            &usage,
+            Some("auto-gemini-3"),
+        )
+        .expect("context usage event");
+
+        match event {
+            ExecutorEvent::NativeEvent { provider, payload } => {
+                assert_eq!(provider.as_ref(), VENDOR_NAME);
+                assert_eq!(
+                    payload,
+                    json!({
+                        "kind": "context_usage",
+                        "total_tokens": 11_705_u64,
+                        "max_tokens": 1_048_576_u64,
+                        "raw_max_tokens": 1_048_576_u64,
+                        "model": "gemini-3-flash-preview"
+                    })
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_response_explicit_context_window_wins_over_model_limit() {
+        let usage = extract_usage(&json!({
+            "_meta": {
+                "quota": {
+                    "token_count": {
+                        "input_tokens": 4,
+                        "output_tokens": 1
+                    }
+                },
+                "context": {
+                    "modelContextWindow": 123_456
+                }
+            }
+        }));
+        let event = gemini_context_usage_native_event(
+            &json!({
+                "_meta": {
+                    "context": {
+                        "modelContextWindow": 123_456
+                    }
+                }
+            }),
+            &usage,
+            Some("gemini-2.5-pro"),
+        )
+        .expect("context usage event");
+
+        match event {
+            ExecutorEvent::NativeEvent { payload, .. } => {
+                assert_eq!(
+                    payload.get("max_tokens").and_then(Value::as_u64),
+                    Some(123_456)
+                );
+                assert_eq!(
+                    payload.get("raw_max_tokens").and_then(Value::as_u64),
+                    Some(123_456)
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

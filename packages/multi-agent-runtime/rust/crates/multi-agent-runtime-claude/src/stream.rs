@@ -73,6 +73,12 @@ pub enum ClaudeJsonEvent {
         /// Native session id propagated on every assistant frame.
         #[serde(default)]
         session_id: Option<String>,
+        /// Claude Code sidechain parent tool id for subagent messages.
+        #[serde(default)]
+        parent_tool_use_id: Option<String>,
+        /// Per-event uuid emitted by the SDK.
+        #[serde(default)]
+        uuid: Option<String>,
     },
     /// User-originating frames — the Claude CLI echoes tool results and
     /// plain user text through `user` envelopes. We parse the content so the
@@ -85,6 +91,12 @@ pub enum ClaudeJsonEvent {
         /// Native session id propagated on every user frame.
         #[serde(default)]
         session_id: Option<String>,
+        /// Claude Code sidechain parent tool id for subagent messages.
+        #[serde(default)]
+        parent_tool_use_id: Option<String>,
+        /// Per-event uuid emitted by the SDK.
+        #[serde(default)]
+        uuid: Option<String>,
     },
     /// Rate-limit notices — transport-level, not a turn signal.
     #[serde(rename = "rate_limit_event")]
@@ -178,6 +190,9 @@ pub enum ClaudeJsonEvent {
         /// The raw Anthropic SSE event payload.
         #[serde(default)]
         event: Option<Value>,
+        /// Claude Code sidechain parent tool id for subagent deltas.
+        #[serde(default)]
+        parent_tool_use_id: Option<String>,
     },
     /// Terminal frame for a turn.
     #[serde(rename = "result")]

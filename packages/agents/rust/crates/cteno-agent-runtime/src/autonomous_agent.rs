@@ -10,8 +10,8 @@ use crate::agent_queue::{AgentMessage, AgentMessageQueue};
 use crate::agent_session::{AgentSessionManager, SessionMessage};
 use crate::chat_compression::CompressionService;
 use crate::llm::{
-    ContentBlock, LLMClient, LLMResponseType, Message, MessageContent, MessageRole, StreamCallback,
-    Tool, Usage, parse_session_content, serialize_content_for_session,
+    parse_session_content, serialize_content_for_session, ContentBlock, LLMClient, LLMResponseType,
+    Message, MessageContent, MessageRole, StreamCallback, Tool, Usage,
 };
 use crate::permission::PermissionCheckResult;
 use chrono::Utc;
@@ -20,8 +20,8 @@ use serde_json::json;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// Callback for sending intermediate ACP messages (tool-call, tool-result, task lifecycle).
 /// Receives an ACP data payload (serde_json::Value) and sends it asynchronously.
@@ -106,8 +106,8 @@ fn normalize_tool_call_for_ui(
         "read" => ("Read".to_string(), tool_input.clone()),
         "websearch" => ("WebSearch".to_string(), tool_input.clone()),
 
-        // Plan tool → TodoWrite for frontend TodoView rendering
-        "update_plan" => ("TodoWrite".to_string(), tool_input.clone()),
+        // Plan tool is rendered by the frontend as the fixed todolist surface.
+        "update_plan" => ("update_plan".to_string(), tool_input.clone()),
 
         // Unknown/unmapped: keep as-is
         _ => (tool_name.to_string(), tool_input.clone()),
@@ -431,6 +431,15 @@ pub struct AgentExecutionResult {
     pub iteration_count: usize,
     pub intermediate_messages: Vec<String>, // Tool execution progress messages
     pub total_usage: Usage,                 // Accumulated token usage across all LLM calls
+    pub context_usage: Option<ContextUsage>, // Last LLM call context-window snapshot
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextUsage {
+    pub total_tokens: u32,
+    pub max_tokens: u32,
+    pub raw_max_tokens: u32,
+    pub auto_compact_token_limit: u32,
 }
 
 /// Build LLM Tool definitions from agents that have expose_as_tool=true.
@@ -521,6 +530,36 @@ pub fn build_deferred_tools_context(
     Some(lines.join("\n"))
 }
 
+/// Build the runtime-owned tool surface and companion prompt context for one
+/// turn. Transport wrappers such as `cteno-agent-stdio` should call this
+/// instead of duplicating tool prompt policy.
+pub async fn build_native_tool_surface_for_turn(
+    supports_function_calling: bool,
+    allowed_tools: Option<&[String]>,
+) -> (Vec<Tool>, Vec<String>) {
+    if !supports_function_calling {
+        return (
+            Vec::new(),
+            vec![
+                "<system-reminder>\nIMPORTANT: You do NOT have any tools available in this session. \
+                 Do NOT attempt to call any tools or functions. Respond directly with text and/or images only.\n</system-reminder>"
+                    .to_string(),
+            ],
+        );
+    }
+
+    let (mut tools, deferred_summaries) = fetch_native_tools_split().await;
+    if let Some(allowed) = allowed_tools {
+        let allowed: std::collections::HashSet<&str> = allowed.iter().map(String::as_str).collect();
+        tools.retain(|tool| allowed.contains(tool.name.as_str()));
+    }
+
+    let context = build_deferred_tools_context(&deferred_summaries)
+        .into_iter()
+        .collect();
+    (tools, context)
+}
+
 /// Execute autonomous agent with session management and queue integration
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_autonomous_agent_with_session(
@@ -535,6 +574,7 @@ pub async fn execute_autonomous_agent_with_session(
     tools: &[Tool],
     temperature: f32,
     max_tokens: u32,
+    context_window_tokens: Option<u32>,
     session_id: Option<&str>,
     user_id: Option<&str>,
     // Ephemeral contextual user-role messages (runtime/date/skills/etc.).
@@ -568,6 +608,8 @@ pub async fn execute_autonomous_agent_with_session(
     supports_vision: bool,
     // Whether to enable thinking/reasoning mode (server-driven)
     enable_thinking: bool,
+    // Optional reasoning effort for providers that expose thinking strength.
+    reasoning_effort: Option<&str>,
     // Whether the model supports function calling / tool use (default true)
     supports_function_calling: bool,
     // Whether the model supports image output (Gemini responseModalities)
@@ -650,7 +692,9 @@ pub async fn execute_autonomous_agent_with_session(
 
     // Compression is now purely token-based (triggered mid-loop by needs_compression_by_tokens).
     // Message-count trigger removed — it fired too early for tool-heavy agents (~20 msgs = ~8K tokens).
-    let compression_service = CompressionService::for_model(model);
+    let compression_service =
+        CompressionService::for_model_with_context_window(model, context_window_tokens);
+    let mut last_context_usage: Option<ContextUsage> = None;
 
     session_manager
         .update_messages(&session.id, &session.messages)
@@ -736,11 +780,15 @@ pub async fn execute_autonomous_agent_with_session(
     // context updates do not mutate the system prompt prefix.
     // We keep a copy of these messages for reinjection after compression.
     let mut contextual_messages = contextual_user_messages.unwrap_or_default();
+    if let Some(todo_context) = build_latest_todo_context_message(&llm_messages) {
+        contextual_messages.push(todo_context);
+    }
+    // Preserve non-workdir dynamic context for reinjection after compression.
+    // Workdir is added separately below and inside reinject_context_after_compression.
+    let saved_contextual_messages = contextual_messages.clone();
     if let Some(workdir) = session_workdir.as_deref() {
         contextual_messages.push(build_workdir_context_message(workdir));
     }
-    // Preserve for reinjection after compression
-    let saved_contextual_messages = contextual_messages.clone();
     if !contextual_messages.is_empty() {
         let context_items: Vec<Message> =
             contextual_messages.into_iter().map(Message::user).collect();
@@ -988,6 +1036,8 @@ pub async fn execute_autonomous_agent_with_session(
                         temperature,
                         max_tokens,
                         stream_callback.as_ref(),
+                        enable_thinking,
+                        reasoning_effort,
                     )
                     .await
             }
@@ -1016,6 +1066,7 @@ pub async fn execute_autonomous_agent_with_session(
                         max_tokens,
                         stream_callback.as_ref(),
                         enable_thinking,
+                        reasoning_effort,
                     )
                     .await
             }
@@ -1155,6 +1206,8 @@ pub async fn execute_autonomous_agent_with_session(
                                         temperature,
                                         max_tokens,
                                         stream_callback.as_ref(),
+                                        enable_thinking,
+                                        reasoning_effort,
                                     )
                                     .await?
                             }
@@ -1183,6 +1236,7 @@ pub async fn execute_autonomous_agent_with_session(
                                         max_tokens,
                                         stream_callback.as_ref(),
                                         enable_thinking,
+                                        reasoning_effort,
                                     )
                                     .await?
                             }
@@ -1213,6 +1267,12 @@ pub async fn execute_autonomous_agent_with_session(
 
         // Total input = input_tokens + cache_creation + cache_read (actual context window usage)
         let current_input_tokens = response.usage.total_input_tokens();
+        last_context_usage = Some(ContextUsage {
+            total_tokens: response.usage.total_tokens(),
+            max_tokens: compression_service.config.context_window_tokens,
+            raw_max_tokens: compression_service.config.context_window_tokens,
+            auto_compact_token_limit: compression_service.token_threshold(),
+        });
 
         // Update context_tokens for heartbeat reporting
         if let Some(ref ct) = context_tokens {
@@ -1385,6 +1445,8 @@ pub async fn execute_autonomous_agent_with_session(
                                 temperature,
                                 max_tokens,
                                 stream_callback.as_ref(),
+                                false,
+                                None,
                             )
                             .await
                     }
@@ -1413,6 +1475,7 @@ pub async fn execute_autonomous_agent_with_session(
                                 max_tokens,
                                 stream_callback.as_ref(),
                                 false, // force plain text fallback without thinking
+                                None,
                             )
                             .await
                     }
@@ -2225,6 +2288,8 @@ pub async fn execute_autonomous_agent_with_session(
                         temperature,
                         max_tokens,
                         stream_callback.as_ref(),
+                        false,
+                        None,
                     )
                     .await
             }
@@ -2253,6 +2318,7 @@ pub async fn execute_autonomous_agent_with_session(
                         max_tokens,
                         stream_callback.as_ref(),
                         false, // no thinking for summary
+                        None,
                     )
                     .await
             }
@@ -2320,6 +2386,7 @@ pub async fn execute_autonomous_agent_with_session(
         iteration_count: iteration,
         intermediate_messages,
         total_usage: accumulated_usage,
+        context_usage: last_context_usage,
     })
 }
 
@@ -2444,7 +2511,8 @@ async fn execute_tool_raw(
             prompt,
             context,
             ctx,
-            1, // depth=1 (sub-agent level)
+            1,    // depth=1 (sub-agent level)
+            None, // legacy ad-hoc subagent path: synthetic session id
         )
         .await;
     }
@@ -2502,6 +2570,89 @@ All file operations (read, write, edit, shell commands) should target this direc
 - The `workdir` parameter is automatically injected into tool calls; use relative paths.",
         workdir
     )
+}
+
+fn build_latest_todo_context_message(llm_messages: &[Message]) -> Option<String> {
+    let todos = latest_todos_from_messages(llm_messages)?;
+    let mut lines = Vec::new();
+
+    for todo in todos {
+        let Some(content) = todo_content(todo) else {
+            continue;
+        };
+        let status = todo_status(todo);
+        let marker = match status.as_deref() {
+            Some("completed") => "[x]",
+            Some("in_progress") => "[~]",
+            _ => "[ ]",
+        };
+        lines.push(format!("- {} {}", marker, content));
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "## Current Todo List\n\n\
+This is dynamic runtime context from the latest `update_plan` call. Treat it as the current plan state. \
+If the plan changes, call `update_plan` with the full updated todos array.\n\n{}",
+        lines.join("\n")
+    ))
+}
+
+fn latest_todos_from_messages(llm_messages: &[Message]) -> Option<&[serde_json::Value]> {
+    for message in llm_messages.iter().rev() {
+        let MessageContent::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks.iter().rev() {
+            let ContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
+            let normalized = name.trim().to_ascii_lowercase();
+            if normalized != "update_plan" && normalized != "todowrite" {
+                continue;
+            }
+            if let Some(todos) = ["todos", "newTodos", "items", "plan"]
+                .iter()
+                .find_map(|key| input.get(*key).and_then(|value| value.as_array()))
+            {
+                return Some(todos);
+            }
+        }
+    }
+    None
+}
+
+fn todo_content(todo: &serde_json::Value) -> Option<String> {
+    todo.get("content")
+        .or_else(|| todo.get("task"))
+        .or_else(|| todo.get("title"))
+        .or_else(|| todo.get("step"))
+        .or_else(|| todo.get("text"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn todo_status(todo: &serde_json::Value) -> Option<String> {
+    if let Some(status) = todo.get("status").and_then(|value| value.as_str()) {
+        return Some(
+            match status.trim().to_ascii_lowercase().as_str() {
+                "completed" | "complete" | "done" | "success" | "succeeded" => "completed",
+                "in_progress" | "in-progress" | "inprogress" | "running" | "active" => {
+                    "in_progress"
+                }
+                _ => "pending",
+            }
+            .to_string(),
+        );
+    }
+    todo.get("done")
+        .and_then(|value| value.as_bool())
+        .map(|done| if done { "completed" } else { "pending" }.to_string())
 }
 
 fn insert_context_messages_before_latest_user(
@@ -2731,6 +2882,7 @@ pub async fn execute_agent_with_queue(
                             iteration_count: 0,
                             intermediate_messages: Vec::new(),
                             total_usage: Usage::zero(),
+                            context_usage: None,
                         });
                     }
                 }
@@ -2769,6 +2921,7 @@ pub async fn execute_agent_with_queue(
         tools,
         temperature,
         max_tokens,
+        None,
         Some(session_id),
         user_id,
         contextual_user_messages,
@@ -2790,6 +2943,7 @@ pub async fn execute_agent_with_queue(
         crate::llm_profile::ApiFormat::Anthropic, // Default for queue path
         false, // No vision for queue path
         false, // No thinking for queue path
+        None,  // No reasoning effort for queue path
         true,  // Supports function calling for queue path
         false, // No image output for queue path
         None,  // No images for queue path
@@ -2849,6 +3003,30 @@ mod tests {
         }
     }
 
+    fn make_assistant_with_plan(id: &str, todos: serde_json::Value) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "update_plan".to_string(),
+                input: json!({ "todos": todos }),
+                gemini_thought_signature: None,
+            }]),
+        }
+    }
+
+    fn make_assistant_with_plan_input(id: &str, input: serde_json::Value) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "update_plan".to_string(),
+                input,
+                gemini_thought_signature: None,
+            }]),
+        }
+    }
+
     fn make_user_with_tool_result(tool_use_id: &str) -> Message {
         Message {
             role: MessageRole::User,
@@ -2858,6 +3036,48 @@ mod tests {
                 is_error: false,
             }]),
         }
+    }
+
+    #[test]
+    fn latest_todo_context_uses_newest_update_plan() {
+        let msgs = vec![
+            make_assistant_with_plan(
+                "plan-old",
+                json!([{ "content": "Old step", "status": "pending" }]),
+            ),
+            make_user_text("continue"),
+            make_assistant_with_plan(
+                "plan-new",
+                json!([
+                    { "content": "Done step", "status": "completed" },
+                    { "content": "Current step", "status": "in_progress" },
+                    { "content": "Next step", "status": "pending" }
+                ]),
+            ),
+        ];
+
+        let context = build_latest_todo_context_message(&msgs).expect("todo context");
+        assert!(context.contains("- [x] Done step"));
+        assert!(context.contains("- [~] Current step"));
+        assert!(context.contains("- [ ] Next step"));
+        assert!(!context.contains("Old step"));
+    }
+
+    #[test]
+    fn latest_todo_context_accepts_plan_alias_and_title_items() {
+        let msgs = vec![make_assistant_with_plan_input(
+            "plan-alias",
+            json!({
+                "plan": [
+                    { "title": "Title item", "status": "running" },
+                    { "step": "Step item", "status": "pending" }
+                ]
+            }),
+        )];
+
+        let context = build_latest_todo_context_message(&msgs).expect("todo context");
+        assert!(context.contains("Title item"));
+        assert!(context.contains("Step item"));
     }
 
     #[test]

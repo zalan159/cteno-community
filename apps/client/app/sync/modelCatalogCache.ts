@@ -1,7 +1,7 @@
 import { MMKV } from 'react-native-mmkv';
 
 const mmkv = new MMKV({ id: 'model-catalog-cache' });
-const KEY = 'vendor-model-catalogs-v2';
+const KEY = 'vendor-model-catalogs-v4';
 
 export type CachedVendorName = 'cteno' | 'claude' | 'codex' | 'gemini';
 
